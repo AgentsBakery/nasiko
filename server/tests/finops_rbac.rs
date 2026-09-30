@@ -584,3 +584,68 @@ async fn workflow_view_scoped_to_caller() {
 
     server.cleanup().await;
 }
+
+// ─── insights ────────────────────────────────────────────────────────────────
+
+async fn post_insights(server: &common::TestServer, token: &str) -> (u16, Value) {
+    let res = server
+        .client
+        .post(server.url("/api/observability/finops/insights"))
+        .bearer_auth(token)
+        .json(&json!({"kpi": {}, "agent_costs": []}))
+        .send()
+        .await
+        .unwrap();
+    let status = res.status().as_u16();
+    let text = res.text().await.unwrap();
+    let body = serde_json::from_str(&text).unwrap_or(Value::String(text));
+    (status, body)
+}
+
+#[tokio::test]
+#[serial]
+async fn insights_forbidden_for_non_superuser() {
+    let server = common::TestServer::start().await;
+    let w = seed_world(&server).await;
+
+    let (s, body) = post_insights(&server, &w.alice_token()).await;
+    assert_eq!(s, 403, "{body}");
+    assert_eq!(body["code"], "superuser_required");
+
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn insights_not_configured_returns_available_false_for_superuser() {
+    let server = common::TestServer::start_with(|c| {
+        c.openai_api_key = None;
+    })
+    .await;
+    let w = seed_world(&server).await;
+
+    let (s, body) = post_insights(&server, &w.admin_token()).await;
+    assert_eq!(s, 200, "{body}");
+    assert_eq!(body["data"]["available"], false);
+    assert_eq!(body["data"]["reason"], "llm_not_configured");
+    assert_eq!(body["data"]["insights"], json!([]));
+    assert_eq!(body["status_code"], 200);
+
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn insights_empty_key_is_not_configured() {
+    let server = common::TestServer::start_with(|c| {
+        c.openai_api_key = Some(String::new());
+    })
+    .await;
+    let w = seed_world(&server).await;
+
+    let (s, body) = post_insights(&server, &w.admin_token()).await;
+    assert_eq!(s, 200, "{body}");
+    assert_eq!(body["data"]["available"], false);
+
+    server.cleanup().await;
+}
