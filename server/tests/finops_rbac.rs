@@ -517,10 +517,16 @@ async fn same_name_agents_do_not_leak() {
     )
     .await;
     assert_eq!(s, 200);
+    // alice's own "helper" is still listed, but carries none of the spend.
+    assert_close(
+        sum_f64(&attr["data"]["rows"], "total_cost"),
+        0.0,
+        "same-name attributions cost",
+    );
     assert_eq!(
-        attr["data"]["rows"],
-        json!([]),
-        "same-name rows leaked: {attr}"
+        sum_f64(&attr["data"]["rows"], "operations"),
+        0.0,
+        "same-name attributions operations leaked: {attr}"
     );
 
     server.cleanup().await;

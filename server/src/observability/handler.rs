@@ -460,6 +460,7 @@ pub async fn get_agent_stats(
         (status = 200, description = "FinOps dashboard data", body = crate::observability::service::FinopsDashboardResponse),
         (status = 400, description = "Malformed filter (range/view/agent_id)"),
         (status = 401, description = "Missing or invalid session"),
+        (status = 404, description = "Agent not found or not accessible"),
     ),
 )]
 #[instrument(skip(state, user_scope))]

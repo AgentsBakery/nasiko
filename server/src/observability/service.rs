@@ -1148,6 +1148,17 @@ fn user_filter_binds(user_ids: Option<&[uuid::Uuid]>) -> (bool, Vec<uuid::Uuid>)
     (!ids.is_empty(), ids)
 }
 
+/// Owner scope for `maf_executions`: `None` (unrestricted) when the agent scope
+/// is unrestricted (superuser), else the caller's UUID, failing closed to the
+/// nil UUID when `caller_id` does not parse.
+fn workflow_caller_scope(
+    caller_id: &str,
+    accessible_agent_ids: Option<&[uuid::Uuid]>,
+) -> Option<uuid::Uuid> {
+    accessible_agent_ids?;
+    Some(caller_id.parse::<uuid::Uuid>().unwrap_or(uuid::Uuid::nil()))
+}
+
 impl ObservabilityService {
     pub fn from_state(state: &crate::state::AppState) -> Self {
         Self {
@@ -2092,7 +2103,7 @@ impl ObservabilityService {
     #[allow(clippy::too_many_arguments)]
     pub async fn get_finops_dashboard(
         &self,
-        _user_id: &str,
+        user_id: &str,
         _role: Option<&str>,
         _department_id: Option<&str>,
         _team_id: Option<&str>,
@@ -2109,6 +2120,10 @@ impl ObservabilityService {
         view: &str,
     ) -> Result<FinopsDashboardResponse, ObservabilityError> {
         let parsed_owner_id = owner_id.and_then(|s| s.parse::<uuid::Uuid>().ok());
+        // SQL-level agent scope for every trace_usage aggregate below. The Rust
+        // `agents.retain` only filters per-agent rows; fleet-wide scalars
+        // (estimated_cost, unpriced_calls, 24h ops) need the predicate in SQL.
+        let names = self.accessible_agent_names(accessible_agent_ids).await?;
         let accessible: Option<HashSet<uuid::Uuid>> =
             accessible_agent_ids.map(|ids| ids.iter().copied().collect());
         let all_agents = self.get_agent_names(parsed_owner_id).await?;
@@ -2230,7 +2245,8 @@ impl ObservabilityService {
 
         // Shared WHERE fragment: agent, model, provider, user_id filters.
         // $1/$2 = time window, $3 = agent, $4 = model, $5 = provider,
-        // $6 = has_user_filter (bool), $7 = user_id_list (uuid[]).
+        // $6 = has_user_filter (bool), $7 = user_id_list (uuid[]),
+        // $8 = accessible agent names (text[], NULL = unrestricted).
         const TRACE_USAGE_AGG_QUERY: &str = r#"SELECT agent_name,
                       COUNT(*)::BIGINT AS operations,
                       COALESCE(SUM(input_tokens), 0)::BIGINT AS input_tokens,
@@ -2250,6 +2266,7 @@ impl ObservabilityService {
                  AND ($4::TEXT IS NULL OR model = $4)
                  AND ($5::TEXT IS NULL OR provider = $5)
                  AND (NOT $6::BOOL OR user_id = ANY($7::UUID[]))
+                 AND ($8::TEXT[] IS NULL OR agent_name = ANY($8::TEXT[]))
                GROUP BY agent_name"#;
 
         // 1. Current window
@@ -2261,6 +2278,7 @@ impl ObservabilityService {
             .bind(provider_filter)
             .bind(has_user_filter)
             .bind(&user_id_list)
+            .bind(&names)
             .fetch_all(&self.db)
             .await
             .map_err(|e| ObservabilityError::Internal(e.to_string()))?;
@@ -2274,6 +2292,7 @@ impl ObservabilityService {
             .bind(provider_filter)
             .bind(has_user_filter)
             .bind(&user_id_list)
+            .bind(&names)
             .fetch_all(&self.db)
             .await
             .map_err(|e| ObservabilityError::Internal(e.to_string()))?;
@@ -2292,6 +2311,7 @@ impl ObservabilityService {
                  AND ($3::TEXT IS NULL OR model = $3)
                  AND ($4::TEXT IS NULL OR provider = $4)
                  AND (NOT $5::BOOL OR user_id = ANY($6::UUID[]))
+                 AND ($7::TEXT[] IS NULL OR agent_name = ANY($7::TEXT[]))
                GROUP BY agent_name"#,
         )
         .bind(last_24h)
@@ -2300,6 +2320,7 @@ impl ObservabilityService {
         .bind(provider_filter)
         .bind(has_user_filter)
         .bind(&user_id_list)
+        .bind(&names)
         .fetch_all(&self.db)
         .await
         .map_err(|e| ObservabilityError::Internal(e.to_string()))?;
@@ -2315,6 +2336,7 @@ impl ObservabilityService {
                  AND ($4::TEXT IS NULL OR model = $4)
                  AND ($5::TEXT IS NULL OR provider = $5)
                  AND (NOT $6::BOOL OR user_id = ANY($7::UUID[]))
+                 AND ($8::TEXT[] IS NULL OR agent_name = ANY($8::TEXT[]))
                  AND COALESCE(cost_usd, 0) = 0
                  AND (COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)) > 0"#,
         )
@@ -2325,6 +2347,7 @@ impl ObservabilityService {
         .bind(provider_filter)
         .bind(has_user_filter)
         .bind(&user_id_list)
+        .bind(&names)
         .fetch_one(&self.db)
         .await
         .map_err(|e| ObservabilityError::Internal(e.to_string()))?;
@@ -2538,7 +2561,12 @@ impl ObservabilityService {
 
         let attributions = if view == "workflow" {
             let rows = self
-                .get_workflow_finops_rows(start, now, agent_name)
+                .get_workflow_finops_rows(
+                    start,
+                    now,
+                    agent_name,
+                    workflow_caller_scope(user_id, accessible_agent_ids),
+                )
                 .await
                 .unwrap_or_else(|e| {
                     tracing::warn!(error = %e, "workflow finops aggregation failed");
@@ -2960,11 +2988,18 @@ impl ObservabilityService {
     /// Single Postgres GROUP BY, no Tempo calls — MAF already persists
     /// per-step cost/tokens (see `oss/orchestrator/src/maf`), so workflow
     /// attribution is naturally fast without any live trace aggregation.
+    ///
+    /// `caller_scope` is `None` for superusers (fleet-wide) and `Some(user)`
+    /// otherwise. By decision (01-CONTEXT post-research decisions) the workflow
+    /// view is owner-only for non-superusers (`maf_executions.user_id =
+    /// caller`), not agent-grant based; a non-UUID caller fails closed to
+    /// `Uuid::nil()`, which matches no rows.
     async fn get_workflow_finops_rows(
         &self,
         start: DateTime<Utc>,
         end: DateTime<Utc>,
         agent_name: Option<&str>,
+        caller_scope: Option<uuid::Uuid>,
     ) -> Result<Vec<WorkflowFinopsRow>, ObservabilityError> {
         #[derive(sqlx::FromRow)]
         struct ExecRow {
@@ -2987,11 +3022,13 @@ impl ObservabilityService {
                          SELECT 1 FROM jsonb_array_elements(e.step_results) elem
                          WHERE elem->>'agent_name' = $3
                      )
-                 )"#,
+                 )
+                 AND ($4::UUID IS NULL OR e.user_id = $4)"#,
         )
         .bind(start)
         .bind(end)
         .bind(agent_name)
+        .bind(caller_scope)
         .fetch_all(&self.db)
         .await
         .map_err(|e| ObservabilityError::Internal(e.to_string()))?;
@@ -3106,7 +3143,12 @@ impl ObservabilityService {
 
         if view == "workflow" {
             let mut rows = self
-                .get_workflow_finops_rows(start, end, agent_name)
+                .get_workflow_finops_rows(
+                    start,
+                    end,
+                    agent_name,
+                    workflow_caller_scope(caller_id, accessible_agent_ids),
+                )
                 .await?;
             sort_workflow_rows(&mut rows, sort_by, desc);
             Ok(FinopsAttributionsResponse {
