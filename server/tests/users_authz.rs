@@ -534,3 +534,49 @@ async fn admin_can_update_settings() {
 
     server.cleanup().await;
 }
+
+// ─── GET /api/observability/resources ───────────────────────────────────────
+
+// `require_admin` resolves through `AuthService::can_manage_pool`, which is
+// allow-all in OSS, so the route also needs the real admin predicate.
+#[tokio::test]
+#[serial]
+async fn member_cannot_read_platform_resources() {
+    let server = common::TestServer::start().await;
+    let root = init_admin(&server).await;
+    let alice = create_user(&server, &root, "alice", None).await;
+
+    let res = common::as_member(
+        server.client.get(server.url("/api/observability/resources")),
+        &alice,
+        "alice",
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_forbidden(res, "admin_required").await;
+
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn admin_can_read_platform_resources() {
+    let server = common::TestServer::start().await;
+    let root = init_admin(&server).await;
+    let carol = create_user(&server, &root, "carol", Some("admin")).await;
+
+    for (id, name, is_su) in [(&root, "admin", true), (&carol, "carol", false)] {
+        let rb = server.client.get(server.url("/api/observability/resources"));
+        let rb = if is_su {
+            common::as_superuser(rb, id, name)
+        } else {
+            common::as_member(rb, id, name)
+        };
+        let res = rb.send().await.unwrap();
+        assert_ne!(res.status(), 403, "{name} must pass the admin gate");
+        assert_ne!(res.status(), 401, "{name} must pass the admin gate");
+    }
+
+    server.cleanup().await;
+}
