@@ -97,6 +97,8 @@ import '/common/design-system/app-segmented-control/app-segmented-control.js';
 import '/common/design-system/app-select/app-select.js';
 import '/common/design-system/app-table/app-table.js';
 import { call } from '../core/data-sources.js';
+import { authService } from '/common/services/auth-service.js';
+import { insightsRequestBody, insightsViewModel } from '/common/utils/finops-insights.js';
 import { errorStateHtml } from '/common/design-system/app-empty-state/error-state.js';
 
 document.adoptedStyleSheets = [...document.adoptedStyleSheets, styles];
@@ -442,6 +444,16 @@ class TokenopsPage extends HTMLElement {
         </section>
       </div>
 
+      <section class="panel" id="insights-panel" hidden>
+        <div class="panel-head">
+          <h2 class="panel-title">Insights</h2>
+          <app-button id="insights-btn" variant="secondary" size="md">Generate insights</app-button>
+        </div>
+        <div id="insights-body" aria-live="polite">
+          <p>Generate an LLM summary of the spend shown above.</p>
+        </div>
+      </section>
+
       <div class="section-head">
         <h2 class="section-title">Attributions</h2>
       </div>
@@ -542,6 +554,12 @@ class TokenopsPage extends HTMLElement {
       this.#load();
     });
     this.querySelector('#export-btn').addEventListener('click', () => this.#exportCsv());
+
+    // Cosmetic gate only: the endpoint itself answers 403 to non-superusers.
+    authService.fetchCurrentUser().catch(() => null).then(() => {
+      if (authService.isSuperuser()) this.querySelector('#insights-panel').hidden = false;
+    });
+    this.querySelector('#insights-btn').addEventListener('click', () => this.#generateInsights());
 
     this.#load();
     this.#loadFilterOptions();
@@ -1158,6 +1176,34 @@ class TokenopsPage extends HTMLElement {
       return (b[spec.field] ?? 0) - (a[spec.field] ?? 0);
     });
     return rows;
+  }
+
+  /** On-demand only: spends the platform LLM key, so never called from a load path. */
+  async #generateInsights() {
+    const btn = this.querySelector('#insights-btn');
+    const out = this.querySelector('#insights-body');
+    const rows = this.#attrView === 'agent' ? this.#attributions : this.#agents;
+    const body = insightsRequestBody(this.#kpis, rows);
+    btn.setAttribute('disabled', '');
+    btn.setAttribute('loading', '');
+    try {
+      const resp = await call('fetchFinopsInsights', { kpi: body.kpi, agentCosts: body.agent_costs });
+      const vm = insightsViewModel(resp);
+      if (vm.kind === 'bullets') {
+        out.innerHTML = `<ul>${vm.items.map((i) => `<li>${escHtml(i)}</li>`).join('')}</ul>`;
+      } else if (vm.kind === 'not_configured') {
+        out.innerHTML = `<p>${escHtml(vm.message)}</p>`;
+      } else {
+        out.innerHTML = '<p>No insights returned.</p>';
+      }
+    } catch (err) {
+      const msg = err instanceof ApiError ? err.message : 'Could not generate insights';
+      out.innerHTML = `<p>${escHtml(msg)}</p>`;
+      toast.error(msg);
+    } finally {
+      btn.removeAttribute('disabled');
+      btn.removeAttribute('loading');
+    }
   }
 
   #exportCsv() {

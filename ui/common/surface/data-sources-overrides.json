@@ -30,7 +30,9 @@
       "fetchFinopsAttributions"
     ]
   },
-  "withheld": {},
+  "withheld": {
+    "fetchFinopsInsights": "Superuser-only, cost-incurring POST that sends spend data to an LLM; not a generatable read source."
+  },
   "sources": {
     "fetchTokenopsDashboard": {
       "description": "Fleet-wide FinOps for a time window: a ten-metric KPI strip with server-computed deltas, per-agent rows, and a pre-computed top-5 spend split at data.spend_by_agent ready to feed a donut without any client-side aggregation. Real backend: GET /api/observability/finops/dashboard.",
@@ -112,7 +114,9 @@
             "active_agents": "number",
             "total_agents": "number",
             "total_container_hours": "number",
-            "unpriced_calls": "number"
+            "unpriced_calls": "number",
+            "estimated_cost": "number",
+            "unknown_confidence_calls": "number"
           },
           "spend_by_agent": {
             "slices": [

@@ -98,7 +98,9 @@
               "active_agents": "number",
               "total_agents": "number",
               "total_container_hours": "number",
-              "unpriced_calls": "number"
+              "unpriced_calls": "number",
+              "estimated_cost": "number",
+              "unknown_confidence_calls": "number"
             },
             "spend_by_agent": {
               "slices": [
@@ -548,7 +550,9 @@
               "active_agents": "number",
               "total_agents": "number",
               "total_container_hours": "number",
-              "unpriced_calls": "number"
+              "unpriced_calls": "number",
+              "estimated_cost": "number",
+              "unknown_confidence_calls": "number"
             },
             "spend_by_agent": {
               "slices": [
@@ -1033,5 +1037,7 @@
       }
     ]
   },
-  "withheld": {}
+  "withheld": {
+    "fetchFinopsInsights": "Superuser-only, cost-incurring POST that sends spend data to an LLM; not a generatable read source."
+  }
 }

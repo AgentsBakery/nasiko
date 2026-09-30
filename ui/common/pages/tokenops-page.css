@@ -163,6 +163,11 @@
     flex-direction: column;
   }
 
+  /* `.panel` sets display:flex, which would otherwise beat the hidden attribute. */
+  .panel[hidden] { display: none; }
+
+  #insights-panel { margin-block: var(--s-16); }
+
   .panel-head {
     display: flex;
     align-items: center;

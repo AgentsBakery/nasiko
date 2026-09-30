@@ -12,12 +12,14 @@
  * really do filter `trace_usage` on every endpoint below except
  * `spend-calendar`'s neighbours that never declared them; `org_unit` is
  * EE-only (resolved to `user_id`s by the EE FinOps scope resolver's
- * middleware) and reaches only `dashboard` — none of the other four handlers
- * read the `FinopsUserScope` extension it injects, so it is a no-op on them.
+ * middleware). All five read handlers honour the `FinopsUserScope` extension
+ * and scope results to the caller's accessible agents. `fetchFinopsInsights`
+ * is the exception to "read": a superuser-only POST that spends the platform
+ * LLM key, withheld from generated surfaces.
  * OSS ignores `org_unit` outright (no org hierarchy).
  */
 
-import { fetchApi } from '/common/services/api.js';
+import { fetchApi, postJson } from '/common/services/api.js';
 import { registerAll } from '/common/core/data-sources.js';
 
 const fetchUsageSummary = async () => {
@@ -127,8 +129,12 @@ const fetchUsageByModel = async (query, page, limit) => {
   return fetchApi(`/usage/by-model?${params}`);
 };
 
+const fetchFinopsInsights = async ({ kpi, agentCosts } = {}) => {
+  return postJson(`${FINOPS_BASE}/insights`, { kpi: kpi ?? {}, agent_costs: agentCosts ?? [] });
+};
+
 registerAll({
   fetchUsageSummary, fetchTokenopsDashboard, fetchSpendTimeseries,
   fetchSpendCalendar, fetchSpendCalendarDay, fetchFinopsAttributions,
-  fetchUsageHistory, fetchUsageByAgent, fetchUsageByModel,
+  fetchUsageHistory, fetchUsageByAgent, fetchUsageByModel, fetchFinopsInsights,
 }, { replace: true });
