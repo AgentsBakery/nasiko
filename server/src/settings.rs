@@ -1,4 +1,10 @@
-use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
+use axum::{
+    Json, Router,
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::get,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::Claims;
@@ -110,14 +116,11 @@ async fn update_settings(
     State(state): State<AppState>,
     claims: Claims,
     Json(body): Json<SettingsUpdate>,
-) -> impl IntoResponse {
-    let identity: nasiko_auth::Identity = claims.into();
-    if !state.auth.can_manage_users(&identity).await {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"error": "requires admin role"})),
-        )
-            .into_response();
+) -> Response {
+    // Handler-level check: OSS `can_manage_users` is allow-all, so the outer
+    // auth layer alone would let any member rewrite platform settings.
+    if let Err(r) = crate::users::authz::require_admin_caller(&state, &claims).await {
+        return r;
     }
     let result = sqlx::query_as::<_, Settings>(
         r#"INSERT INTO settings (
