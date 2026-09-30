@@ -1137,6 +1137,17 @@ pub enum EnsureSessionOutcome {
     Conflict,
 }
 
+/// `(has_user_filter, user_id_list)` binds for the `NOT $n::BOOL OR user_id =
+/// ANY($m::UUID[])` idiom. An empty slice means "no filter" here (EE org-unit
+/// scope); agent scoping must NOT use this idiom, see `accessible_agent_names`.
+fn user_filter_binds(user_ids: Option<&[uuid::Uuid]>) -> (bool, Vec<uuid::Uuid>) {
+    let ids: Vec<uuid::Uuid> = user_ids
+        .filter(|ids| !ids.is_empty())
+        .map(|ids| ids.to_vec())
+        .unwrap_or_default();
+    (!ids.is_empty(), ids)
+}
+
 impl ObservabilityService {
     pub fn from_state(state: &crate::state::AppState) -> Self {
         Self {
@@ -2051,6 +2062,31 @@ impl ObservabilityService {
         })
     }
 
+    /// Names of the live agents the caller may read `trace_usage` rows for.
+    ///
+    /// `None` in means unrestricted (superuser) and `None` out means "no
+    /// predicate". `Some(ids)` yields the agent names for which *every* live
+    /// agent carrying that name is in `ids` (`bool_and`): agent names are
+    /// unique per owner only and `trace_usage` is keyed by name, so a name
+    /// shared with an inaccessible agent would otherwise disclose that
+    /// agent's spend. An empty result is a real, empty allow-list: bound as
+    /// `= ANY('{}')` it matches nothing.
+    async fn accessible_agent_names(
+        &self,
+        ids: Option<&[uuid::Uuid]>,
+    ) -> Result<Option<Vec<String>>, ObservabilityError> {
+        let Some(ids) = ids else { return Ok(None) };
+        let names: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM agents WHERE deleted_at IS NULL \
+             GROUP BY name HAVING bool_and(id = ANY($1))",
+        )
+        .bind(ids)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| ObservabilityError::Internal(e.to_string()))?;
+        Ok(Some(names))
+    }
+
     // ── 6. finops/dashboard ───────────────────────────────────────────────────
 
     #[allow(clippy::too_many_arguments)]
@@ -2552,6 +2588,7 @@ impl ObservabilityService {
 
     // ── 6b. finops/spend-timeseries ───────────────────────────────────────────
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_finops_spend_timeseries(
         &self,
         start_time: Option<&str>,
@@ -2560,8 +2597,12 @@ impl ObservabilityService {
         agent_name: Option<&str>,
         model: Option<&str>,
         provider: Option<&str>,
+        user_ids: Option<&[uuid::Uuid]>,
+        accessible_agent_ids: Option<&[uuid::Uuid]>,
     ) -> Result<FinopsSpendTimeseriesResponse, ObservabilityError> {
         let (start, end, bucket) = resolve_window(start_time, end_time, range)?;
+        let names = self.accessible_agent_names(accessible_agent_ids).await?;
+        let (has_user_filter, user_id_list) = user_filter_binds(user_ids);
         let trunc = match bucket {
             TimeBucket::Hour => "hour",
             TimeBucket::Day => "day",
@@ -2598,6 +2639,8 @@ impl ObservabilityService {
                      AND ($3::TEXT IS NULL OR agent_name = $3)
                      AND ($4::TEXT IS NULL OR model = $4)
                      AND ($5::TEXT IS NULL OR provider = $5)
+                     AND (NOT $6::BOOL OR user_id = ANY($7::UUID[]))
+                     AND ($8::TEXT[] IS NULL OR agent_name = ANY($8::TEXT[]))
                    GROUP BY bucket_start, agent_name
                ),
                ranked AS (
@@ -2615,6 +2658,8 @@ impl ObservabilityService {
                      AND ($3::TEXT IS NULL OR agent_name = $3)
                      AND ($4::TEXT IS NULL OR model = $4)
                      AND ($5::TEXT IS NULL OR provider = $5)
+                     AND (NOT $6::BOOL OR user_id = ANY($7::UUID[]))
+                     AND ($8::TEXT[] IS NULL OR agent_name = ANY($8::TEXT[]))
                    GROUP BY bucket_start
                )
                SELECT r.bucket_start,
@@ -2638,6 +2683,9 @@ impl ObservabilityService {
             .bind(agent_name)
             .bind(model)
             .bind(provider)
+            .bind(has_user_filter)
+            .bind(&user_id_list)
+            .bind(&names)
             .fetch_all(&self.db)
             .await
             .map_err(|e| ObservabilityError::Internal(e.to_string()))?;
@@ -2667,6 +2715,7 @@ impl ObservabilityService {
 
     // ── 6c. finops/spend-calendar ─────────────────────────────────────────────
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_finops_spend_calendar(
         &self,
         month: &str,
@@ -2674,7 +2723,11 @@ impl ObservabilityService {
         agent_name: Option<&str>,
         model: Option<&str>,
         provider: Option<&str>,
+        user_ids: Option<&[uuid::Uuid]>,
+        accessible_agent_ids: Option<&[uuid::Uuid]>,
     ) -> Result<FinopsSpendCalendarResponse, ObservabilityError> {
+        let names = self.accessible_agent_names(accessible_agent_ids).await?;
+        let (has_user_filter, user_id_list) = user_filter_binds(user_ids);
         let month_start = chrono::NaiveDateTime::parse_from_str(
             &format!("{month}-01 00:00:00"),
             "%Y-%m-%d %H:%M:%S",
@@ -2705,6 +2758,8 @@ impl ObservabilityService {
                  AND ($3::TEXT IS NULL OR agent_name = $3)
                  AND ($4::TEXT IS NULL OR model = $4)
                  AND ($5::TEXT IS NULL OR provider = $5)
+                 AND (NOT $6::BOOL OR user_id = ANY($7::UUID[]))
+                 AND ($8::TEXT[] IS NULL OR agent_name = ANY($8::TEXT[]))
                GROUP BY DATE(started_at)
                ORDER BY date"#,
         )
@@ -2713,6 +2768,9 @@ impl ObservabilityService {
         .bind(agent_name)
         .bind(model)
         .bind(provider)
+        .bind(has_user_filter)
+        .bind(&user_id_list)
+        .bind(&names)
         .fetch_all(&self.db)
         .await
         .map_err(|e| ObservabilityError::Internal(e.to_string()))?;
@@ -2760,13 +2818,18 @@ impl ObservabilityService {
 
     // ── 6d. finops/spend-calendar/day ─────────────────────────────────────────
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_finops_spend_calendar_day(
         &self,
         date: &str,
         agent_name: Option<&str>,
         model: Option<&str>,
         provider: Option<&str>,
+        user_ids: Option<&[uuid::Uuid]>,
+        accessible_agent_ids: Option<&[uuid::Uuid]>,
     ) -> Result<FinopsDayDrilldownResponse, ObservabilityError> {
+        let names = self.accessible_agent_names(accessible_agent_ids).await?;
+        let (has_user_filter, user_id_list) = user_filter_binds(user_ids);
         let day_start =
             chrono::NaiveDateTime::parse_from_str(&format!("{date} 00:00:00"), "%Y-%m-%d %H:%M:%S")
                 .map(|d| d.and_utc())
@@ -2789,6 +2852,8 @@ impl ObservabilityService {
                  AND ($3::TEXT IS NULL OR agent_name = $3)
                  AND ($4::TEXT IS NULL OR model = $4)
                  AND ($5::TEXT IS NULL OR provider = $5)
+                 AND (NOT $6::BOOL OR user_id = ANY($7::UUID[]))
+                 AND ($8::TEXT[] IS NULL OR agent_name = ANY($8::TEXT[]))
                GROUP BY hour, agent_name
                ORDER BY hour"#,
         )
@@ -2797,6 +2862,9 @@ impl ObservabilityService {
         .bind(agent_name)
         .bind(model)
         .bind(provider)
+        .bind(has_user_filter)
+        .bind(&user_id_list)
+        .bind(&names)
         .fetch_all(&self.db)
         .await
         .map_err(|e| ObservabilityError::Internal(e.to_string()))?;
@@ -3012,9 +3080,9 @@ impl ObservabilityService {
     /// sort/pagination so a table sort/page click doesn't re-run the
     /// KPI/timeseries work.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub async fn get_finops_attributions(
         &self,
+        caller_id: &str,
         start_time: Option<&str>,
         end_time: Option<&str>,
         agent_name: Option<&str>,
@@ -3025,6 +3093,8 @@ impl ObservabilityService {
         sort_dir: Option<&str>,
         limit: Option<i64>,
         offset: Option<i64>,
+        user_ids: Option<&[uuid::Uuid]>,
+        accessible_agent_ids: Option<&[uuid::Uuid]>,
     ) -> Result<FinopsAttributionsResponse, ObservabilityError> {
         let start = parse_iso_or_default(start_time, 30);
         let end = end_time
@@ -3049,8 +3119,19 @@ impl ObservabilityService {
         } else {
             let dashboard = self
                 .get_finops_dashboard(
-                    "", None, None, None, start_time, end_time, agent_name, model, provider, None,
-                    None, None, "agent",
+                    caller_id,
+                    None,
+                    None,
+                    None,
+                    start_time,
+                    end_time,
+                    agent_name,
+                    model,
+                    provider,
+                    user_ids,
+                    accessible_agent_ids,
+                    None,
+                    "agent",
                 )
                 .await?;
             let mut rows = dashboard.data.agents;

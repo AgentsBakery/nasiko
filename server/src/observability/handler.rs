@@ -565,12 +565,15 @@ fn resolve_range_params(
     responses(
         (status = 200, description = "Spend time series", body = crate::observability::service::FinopsSpendTimeseriesResponse),
         (status = 400, description = "Malformed filter"),
+        (status = 401, description = "Missing or invalid session"),
+        (status = 404, description = "Agent not found or not accessible"),
     ),
 )]
-#[instrument(skip(state))]
+#[instrument(skip(state, user_scope))]
 pub async fn get_finops_spend_timeseries(
     State(state): State<AppState>,
-    _claims: Claims,
+    claims: Claims,
+    user_scope: Option<Extension<FinopsUserScope>>,
     Query(params): Query<FinopsFilterParams>,
 ) -> Response {
     if let Err(r) = validate_range(params.range.as_deref()) {
@@ -580,6 +583,13 @@ pub async fn get_finops_spend_timeseries(
         Ok(n) => n,
         Err(r) => return r,
     };
+    if let Some(name) = agent_name.as_deref()
+        && !super::routes::agent_name_fully_accessible(&state, &claims, name).await
+    {
+        return (StatusCode::NOT_FOUND, "agent not found").into_response();
+    }
+    let user_ids = user_scope.map(|Extension(s)| s.0);
+    let accessible_agent_ids = accessible_agent_ids(&state, &claims).await;
     match svc(&state)
         .get_finops_spend_timeseries(
             params.start_time.as_deref(),
@@ -588,6 +598,8 @@ pub async fn get_finops_spend_timeseries(
             agent_name.as_deref(),
             params.model.as_deref(),
             params.provider.as_deref(),
+            user_ids.as_deref(),
+            accessible_agent_ids.as_deref(),
         )
         .await
     {
@@ -607,12 +619,15 @@ pub async fn get_finops_spend_timeseries(
     responses(
         (status = 200, description = "Spend calendar", body = crate::observability::service::FinopsSpendCalendarResponse),
         (status = 400, description = "Malformed month/filter"),
+        (status = 401, description = "Missing or invalid session"),
+        (status = 404, description = "Agent not found or not accessible"),
     ),
 )]
-#[instrument(skip(state))]
+#[instrument(skip(state, user_scope))]
 pub async fn get_finops_spend_calendar(
     State(state): State<AppState>,
-    _claims: Claims,
+    claims: Claims,
+    user_scope: Option<Extension<FinopsUserScope>>,
     Query(params): Query<FinopsSpendCalendarParams>,
 ) -> Response {
     if let Err(r) = validate_range(params.range.as_deref()) {
@@ -622,6 +637,13 @@ pub async fn get_finops_spend_calendar(
         Ok(n) => n,
         Err(r) => return r,
     };
+    if let Some(name) = agent_name.as_deref()
+        && !super::routes::agent_name_fully_accessible(&state, &claims, name).await
+    {
+        return (StatusCode::NOT_FOUND, "agent not found").into_response();
+    }
+    let user_ids = user_scope.map(|Extension(s)| s.0);
+    let accessible_agent_ids = accessible_agent_ids(&state, &claims).await;
     match svc(&state)
         .get_finops_spend_calendar(
             &params.month,
@@ -629,6 +651,8 @@ pub async fn get_finops_spend_calendar(
             agent_name.as_deref(),
             params.model.as_deref(),
             params.provider.as_deref(),
+            user_ids.as_deref(),
+            accessible_agent_ids.as_deref(),
         )
         .await
     {
@@ -648,24 +672,36 @@ pub async fn get_finops_spend_calendar(
     responses(
         (status = 200, description = "Hourly spend for one day", body = crate::observability::service::FinopsDayDrilldownResponse),
         (status = 400, description = "Malformed date/filter"),
+        (status = 401, description = "Missing or invalid session"),
+        (status = 404, description = "Agent not found or not accessible"),
     ),
 )]
-#[instrument(skip(state))]
+#[instrument(skip(state, user_scope))]
 pub async fn get_finops_spend_calendar_day(
     State(state): State<AppState>,
-    _claims: Claims,
+    claims: Claims,
+    user_scope: Option<Extension<FinopsUserScope>>,
     Query(params): Query<FinopsDayDrilldownParams>,
 ) -> Response {
     let agent_name = match resolve_agent_filter(&state.db, params.agent_id.as_deref()).await {
         Ok(n) => n,
         Err(r) => return r,
     };
+    if let Some(name) = agent_name.as_deref()
+        && !super::routes::agent_name_fully_accessible(&state, &claims, name).await
+    {
+        return (StatusCode::NOT_FOUND, "agent not found").into_response();
+    }
+    let user_ids = user_scope.map(|Extension(s)| s.0);
+    let accessible_agent_ids = accessible_agent_ids(&state, &claims).await;
     match svc(&state)
         .get_finops_spend_calendar_day(
             &params.date,
             agent_name.as_deref(),
             params.model.as_deref(),
             params.provider.as_deref(),
+            user_ids.as_deref(),
+            accessible_agent_ids.as_deref(),
         )
         .await
     {
@@ -687,12 +723,15 @@ pub async fn get_finops_spend_calendar_day(
     responses(
         (status = 200, description = "Attribution rows", body = crate::observability::service::FinopsAttributionsResponse),
         (status = 400, description = "Malformed filter"),
+        (status = 401, description = "Missing or invalid session"),
+        (status = 404, description = "Agent not found or not accessible"),
     ),
 )]
-#[instrument(skip(state))]
+#[instrument(skip(state, user_scope))]
 pub async fn get_finops_attributions(
     State(state): State<AppState>,
-    _claims: Claims,
+    claims: Claims,
+    user_scope: Option<Extension<FinopsUserScope>>,
     Query(params): Query<FinopsAttributionsParams>,
 ) -> Response {
     if let Err(r) = validate_range(params.range.as_deref()) {
@@ -706,13 +745,21 @@ pub async fn get_finops_attributions(
         Ok(n) => n,
         Err(r) => return r,
     };
+    if let Some(name) = agent_name.as_deref()
+        && !super::routes::agent_name_fully_accessible(&state, &claims, name).await
+    {
+        return (StatusCode::NOT_FOUND, "agent not found").into_response();
+    }
     let (start_time, end_time) =
         match resolve_range_params(&params.start_time, &params.end_time, &params.range) {
             Ok(v) => v,
             Err(r) => return r,
         };
+    let user_ids = user_scope.map(|Extension(s)| s.0);
+    let accessible_agent_ids = accessible_agent_ids(&state, &claims).await;
     match svc(&state)
         .get_finops_attributions(
+            &claims.sub,
             start_time.as_deref(),
             end_time.as_deref(),
             agent_name.as_deref(),
@@ -723,6 +770,8 @@ pub async fn get_finops_attributions(
             params.sort_dir.as_deref(),
             params.limit,
             params.offset,
+            user_ids.as_deref(),
+            accessible_agent_ids.as_deref(),
         )
         .await
     {
