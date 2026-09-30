@@ -3530,6 +3530,44 @@ mod tests {
 
     use super::*;
 
+    // ─── cache savings ─────────────────────────────────────────────────────
+
+    async fn offline_quote(model: &str) -> nasiko_pricing::PriceQuote {
+        nasiko_pricing::PricingEngine::offline()
+            .price(
+                Some("anthropic"),
+                model,
+                nasiko_pricing::RawUsage::default(),
+                nasiko_pricing::PromptConvention::Exclusive,
+                Utc::now(),
+            )
+            .await
+            .quote
+    }
+
+    #[tokio::test]
+    async fn cache_savings_is_input_minus_cache_read_rate() {
+        let quote = offline_quote("claude-sonnet-4").await;
+        let expected = quote.input_per_1m - quote.cache_read_per_1m;
+        assert!((cache_savings_usd(&quote, 1_000_000) - expected).abs() < 1e-9);
+        assert!((expected - 2.70).abs() < 1e-9, "static book rates changed");
+    }
+
+    #[tokio::test]
+    async fn cache_savings_is_zero_for_unknown_model() {
+        let quote = offline_quote("totally-unknown-model-xyz").await;
+        assert_eq!(quote.source, nasiko_pricing::PriceSource::Default);
+        assert_eq!(cache_savings_usd(&quote, 1_000_000), 0.0);
+    }
+
+    #[tokio::test]
+    async fn cache_savings_clamps_negative_spread_and_zero_tokens() {
+        let mut quote = offline_quote("claude-sonnet-4").await;
+        assert_eq!(cache_savings_usd(&quote, 0), 0.0);
+        quote.cache_read_per_1m = quote.input_per_1m + 1.0;
+        assert_eq!(cache_savings_usd(&quote, 1_000_000), 0.0);
+    }
+
     #[test]
     fn session_trace_window_is_anchored_to_historical_session() {
         let created = Utc.with_ymd_and_hms(2025, 1, 2, 3, 4, 5).unwrap();

@@ -649,3 +649,184 @@ async fn insights_empty_key_is_not_configured() {
 
     server.cleanup().await;
 }
+
+// ─── cache savings ───────────────────────────────────────────────────────────
+
+const CACHED_MODEL: &str = "claude-sonnet-4";
+const UNKNOWN_MODEL: &str = "totally-unknown-model-xyz";
+
+async fn dashboard_kpis(server: &common::TestServer, token: &str) -> Value {
+    let (s, body) = get(
+        server,
+        "/api/observability/finops/dashboard?range=7d",
+        token,
+    )
+    .await;
+    assert_eq!(s, 200, "{body}");
+    body["data"]["kpis"].clone()
+}
+
+fn kpi_current(kpis: &Value, name: &str) -> f64 {
+    kpis[name]["current"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("kpis.{name}.current missing: {kpis}"))
+}
+
+/// Savings per 1M cached tokens exactly as the test DB prices the model: the
+/// seeded `model_pricing` row wins over the static book.
+async fn expected_savings_per_1m(server: &common::TestServer) -> f64 {
+    let (input, read): (f64, f64) = sqlx::query_as(
+        "SELECT input_price_per_1m::FLOAT8, cache_read_price_per_1m::FLOAT8 \
+         FROM model_pricing WHERE provider = 'anthropic' AND model = $1 \
+         AND effective_until IS NULL",
+    )
+    .bind(CACHED_MODEL)
+    .fetch_one(&server.db)
+    .await
+    .expect("seeded claude-sonnet-4 pricing");
+    input - read
+}
+
+#[tokio::test]
+#[serial]
+async fn dashboard_reports_cache_savings() {
+    let server = common::TestServer::start().await;
+    let w = seed_world(&server).await;
+    let agent = seed_agent(&server, w.bob, "cacher").await;
+    seed_spend(
+        &server,
+        agent,
+        "cacher",
+        w.bob,
+        CACHED_MODEL,
+        1.0,
+        1_000_000,
+    )
+    .await;
+
+    let kpis = dashboard_kpis(&server, &w.admin_token()).await;
+    assert_close(
+        kpi_current(&kpis, "cache_read_tokens"),
+        1_000_000.0,
+        "cache_read_tokens",
+    );
+    assert_close(
+        kpi_current(&kpis, "cache_savings_usd"),
+        expected_savings_per_1m(&server).await,
+        "cache_savings_usd",
+    );
+
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn cache_savings_unknown_model_is_zero() {
+    let server = common::TestServer::start().await;
+    let w = seed_world(&server).await;
+    let agent = seed_agent(&server, w.bob, "cacher").await;
+    seed_spend(&server, agent, "cacher", w.bob, UNKNOWN_MODEL, 1.0, 500_000).await;
+
+    let kpis = dashboard_kpis(&server, &w.admin_token()).await;
+    assert_close(
+        kpi_current(&kpis, "cache_savings_usd"),
+        0.0,
+        "unknown savings",
+    );
+    assert_close(
+        kpi_current(&kpis, "cache_read_tokens"),
+        500_000.0,
+        "unknown model tokens still counted",
+    );
+
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn cache_savings_scoped_to_caller() {
+    let server = common::TestServer::start().await;
+    let w = seed_world(&server).await;
+    let per_1m = expected_savings_per_1m(&server).await;
+    // bob's agent-b carries the cached tokens; alice's agent-a has none.
+    seed_spend(
+        &server,
+        w.agent_b,
+        "agent-b",
+        w.bob,
+        CACHED_MODEL,
+        1.0,
+        1_000_000,
+    )
+    .await;
+
+    let alice = dashboard_kpis(&server, &w.alice_token()).await;
+    assert_close(
+        kpi_current(&alice, "cache_savings_usd"),
+        0.0,
+        "alice savings",
+    );
+    assert_close(
+        kpi_current(&alice, "cache_read_tokens"),
+        0.0,
+        "alice tokens",
+    );
+
+    let admin = dashboard_kpis(&server, &w.admin_token()).await;
+    assert_close(
+        kpi_current(&admin, "cache_savings_usd"),
+        per_1m,
+        "admin savings",
+    );
+
+    // Same-name case: only bob's "helper" is cached; alice owns a "helper" too,
+    // so the name is shared with an inaccessible agent and must not disclose it.
+    let alice_helper = seed_agent(&server, w.alice, "helper").await;
+    let bob_helper = seed_agent(&server, w.bob, "helper").await;
+    seed_spend(
+        &server,
+        alice_helper,
+        "helper",
+        w.alice,
+        CACHED_MODEL,
+        0.0,
+        0,
+    )
+    .await;
+    seed_spend(
+        &server,
+        bob_helper,
+        "helper",
+        w.bob,
+        CACHED_MODEL,
+        1.0,
+        1_000_000,
+    )
+    .await;
+
+    let alice = dashboard_kpis(&server, &w.alice_token()).await;
+    assert_close(
+        kpi_current(&alice, "cache_read_tokens"),
+        0.0,
+        "same-name tokens",
+    );
+    assert_close(
+        kpi_current(&alice, "cache_savings_usd"),
+        0.0,
+        "same-name savings",
+    );
+
+    let admin = dashboard_kpis(&server, &w.admin_token()).await;
+    assert_close(
+        kpi_current(&admin, "cache_read_tokens"),
+        2_000_000.0,
+        "admin sees both cached rows",
+    );
+    assert_close(
+        kpi_current(&admin, "cache_savings_usd"),
+        2.0 * per_1m,
+        "admin savings total",
+    );
+
+    server.cleanup().await;
+}
