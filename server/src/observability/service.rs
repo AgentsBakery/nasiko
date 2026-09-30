@@ -897,6 +897,12 @@ pub struct FinopsKpis {
     pub total_tool_calls: KpiValue,
     pub latency_p95_ms: KpiValue,
     pub latency_p99_ms: KpiValue,
+    /// Dollars prompt caching saved: cached-read tokens priced at the input
+    /// rate minus the cache-read rate, per (provider, model). Models with no
+    /// known price contribute 0.
+    pub cache_savings_usd: KpiValue,
+    /// Cached-read prompt tokens behind `cache_savings_usd`.
+    pub cache_read_tokens: KpiValue,
 }
 
 // ─── Spend over time ────────────────────────────────────────────────────────────
@@ -1136,6 +1142,7 @@ pub struct ObservabilityService {
     db: PgPool,
     http_client: reqwest::Client,
     config: Arc<Config>,
+    pricing: Arc<nasiko_pricing::PricingEngine>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1167,6 +1174,18 @@ fn workflow_caller_scope(
     Some(caller_id.parse::<uuid::Uuid>().unwrap_or(uuid::Uuid::nil()))
 }
 
+/// Dollars saved by serving `cache_read_tokens` from the provider cache instead
+/// of paying the full input rate: `tokens / 1M * (input - cache_read)`, never
+/// negative. A quote whose `source` is `PriceSource::Default` was fabricated for
+/// an unknown model, so no known rate means 0 savings rather than a guess. Gate
+/// on `source`, not `cache_source`: unknown models get `cache_source = Ratio`.
+fn cache_savings_usd(quote: &nasiko_pricing::PriceQuote, cache_read_tokens: u64) -> f64 {
+    if quote.source == nasiko_pricing::PriceSource::Default {
+        return 0.0;
+    }
+    cache_read_tokens as f64 / 1_000_000.0 * (quote.input_per_1m - quote.cache_read_per_1m).max(0.0)
+}
+
 impl ObservabilityService {
     pub fn from_state(state: &crate::state::AppState) -> Self {
         Self {
@@ -1174,6 +1193,7 @@ impl ObservabilityService {
             db: state.db.clone(),
             http_client: state.http_client.clone(),
             config: state.config.clone(),
+            pricing: state.pricing.clone(),
         }
     }
 
@@ -2106,6 +2126,80 @@ impl ObservabilityService {
         Ok(Some(names))
     }
 
+    /// Cache savings and cached-read token count for one window, priced through
+    /// the shared pricing engine (rates are never derived in SQL).
+    ///
+    /// Both agent predicates are required: `agent_name_set` ($8) is the
+    /// dashboard's filtered live-agent set, so the figures cover exactly the
+    /// agents behind the other KPIs; `names` ($9) is `accessible_agent_names`,
+    /// whose `bool_and` same-name guard the agent set alone does not carry.
+    ///
+    /// Pricing is evaluated at the window end rather than per call: a rate
+    /// change inside the window shifts the figure slightly (accepted approximation).
+    #[allow(clippy::too_many_arguments)]
+    async fn window_cache_savings(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        agent_name: Option<&str>,
+        model: Option<&str>,
+        provider: Option<&str>,
+        has_user_filter: bool,
+        user_id_list: &[uuid::Uuid],
+        agent_name_set: &[String],
+        names: &Option<Vec<String>>,
+    ) -> Result<(f64, i64), ObservabilityError> {
+        let rows: Vec<(Option<String>, Option<String>, i64)> = sqlx::query_as(
+            r#"SELECT model, provider,
+                      COALESCE(SUM(cache_read_tokens), 0)::BIGINT AS cache_read_tokens
+               FROM trace_usage
+               WHERE started_at >= $1 AND started_at < $2
+                 AND ($3::TEXT IS NULL OR agent_name = $3)
+                 AND ($4::TEXT IS NULL OR model = $4)
+                 AND ($5::TEXT IS NULL OR provider = $5)
+                 AND (NOT $6::BOOL OR user_id = ANY($7::UUID[]))
+                 AND agent_name = ANY($8::TEXT[])
+                 AND ($9::TEXT[] IS NULL OR agent_name = ANY($9::TEXT[]))
+                 AND cache_read_tokens > 0
+               GROUP BY model, provider"#,
+        )
+        .bind(start)
+        .bind(end)
+        .bind(agent_name)
+        .bind(model)
+        .bind(provider)
+        .bind(has_user_filter)
+        .bind(user_id_list)
+        .bind(agent_name_set)
+        .bind(names)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| ObservabilityError::Internal(e.to_string()))?;
+
+        let mut savings = 0.0;
+        let mut tokens = 0i64;
+        for (model, provider, cache_read) in rows {
+            tokens += cache_read;
+            // No model means no rate: the tokens count, the savings stay 0.
+            let Some(model) = model else { continue };
+            let priced = self
+                .pricing
+                .price(
+                    provider.as_deref(),
+                    &model,
+                    nasiko_pricing::RawUsage {
+                        cache_read: cache_read as u64,
+                        ..Default::default()
+                    },
+                    nasiko_pricing::PromptConvention::Exclusive,
+                    end,
+                )
+                .await;
+            savings += cache_savings_usd(&priced.quote, cache_read as u64);
+        }
+        Ok((savings, tokens))
+    }
+
     // ── 6. finops/dashboard ───────────────────────────────────────────────────
 
     #[allow(clippy::too_many_arguments)]
@@ -2505,6 +2599,38 @@ impl ObservabilityService {
         } else {
             0.0
         };
+        let agent_name_set: Vec<String> = agents
+            .iter()
+            .map(|(_, name, _, _)| name.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let (cur_cache_savings, cur_cache_tokens) = self
+            .window_cache_savings(
+                start,
+                now,
+                agent_filter,
+                model_filter,
+                provider_filter,
+                has_user_filter,
+                &user_id_list,
+                &agent_name_set,
+                &names,
+            )
+            .await?;
+        let (prev_cache_savings, prev_cache_tokens) = self
+            .window_cache_savings(
+                prev_start,
+                prev_end,
+                agent_filter,
+                model_filter,
+                provider_filter,
+                has_user_filter,
+                &user_id_list,
+                &agent_name_set,
+                &names,
+            )
+            .await?;
         let kpis = FinopsKpis {
             total_spend: KpiValue::new(round6(grand_cost), round6(prev_grand_cost)),
             total_tokens: KpiValue::new(grand_total_tokens as f64, prev_grand_total_tokens as f64),
@@ -2526,6 +2652,8 @@ impl ObservabilityService {
                 avg_latency(&latency_samples_p99),
                 avg_latency(&prev_latency_samples_p99),
             ),
+            cache_savings_usd: KpiValue::new(round6(cur_cache_savings), round6(prev_cache_savings)),
+            cache_read_tokens: KpiValue::new(cur_cache_tokens as f64, prev_cache_tokens as f64),
         };
 
         const TOP_N: usize = 5;
@@ -3509,6 +3637,8 @@ fn empty_finops_response(total_container_hours: f64) -> FinopsDashboardResponse 
                 total_tool_calls: KpiValue::new(0.0, 0.0),
                 latency_p95_ms: KpiValue::new(0.0, 0.0),
                 latency_p99_ms: KpiValue::new(0.0, 0.0),
+                cache_savings_usd: KpiValue::new(0.0, 0.0),
+                cache_read_tokens: KpiValue::new(0.0, 0.0),
             },
             attributions: FinopsAttributions::Agent { rows: vec![] },
             spend_by_agent: SpendByAgentBreakdown {
