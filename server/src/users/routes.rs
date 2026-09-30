@@ -11,6 +11,7 @@ use sqlx::FromRow;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
+use super::authz;
 use crate::Paginated;
 use crate::auth::Claims;
 use crate::state::AppState;
@@ -170,13 +171,18 @@ pub(crate) struct UserListResponse {
     tag = "users",
     params(ListQuery),
     responses(
+        (status = 403, description = "Caller is not an admin (admin_required) or target is a superuser (superuser_required)"),
         (status = 200, description = "Users, newest first", body = UserListResponse),
     ),
 )]
 pub(crate) async fn list_users(
     State(state): State<AppState>,
+    claims: Claims,
     Query(q): Query<ListQuery>,
 ) -> impl IntoResponse {
+    if let Err(r) = authz::require_admin_caller(&state, &claims).await {
+        return r;
+    }
     let users: Result<Vec<UserRow>, _> = if let Some(ref search) = q.q {
         let pattern = format!("%{}%", search);
         sqlx::query_as::<_, UserRow>(
@@ -252,14 +258,21 @@ pub(crate) async fn list_users(
         ("id" = Uuid, Path, description = "User id"),
     ),
     responses(
+        (status = 403, description = "Caller is not an admin (admin_required) or target is a superuser (superuser_required)"),
         (status = 200, description = "User", body = UserRow),
         (status = 404, description = "No such user"),
     ),
 )]
 pub(crate) async fn get_user(
     State(state): State<AppState>,
+    claims: Claims,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
+    if claims.sub != id.to_string()
+        && let Err(r) = authz::require_admin_caller(&state, &claims).await
+    {
+        return r;
+    }
     let result: Result<Option<UserRow>, _> = sqlx::query_as::<_, UserRow>(
         r#"SELECT u.id, u.username, u.email, u.display_name, u.is_superuser,
                   u.is_active, u.role::text as role,
@@ -317,14 +330,24 @@ pub(crate) struct CreateUserResponse {
     tag = "users",
     request_body = CreateUser,
     responses(
+        (status = 403, description = "Caller is not an admin (admin_required) or target is a superuser (superuser_required)"),
         (status = 201, description = "User created", body = CreateUserResponse),
         (status = 409, description = "Username or email already exists"),
     ),
 )]
 pub(crate) async fn create_user(
     State(state): State<AppState>,
+    claims: Claims,
     Json(body): Json<CreateUser>,
 ) -> impl IntoResponse {
+    if let Err(r) = authz::require_admin_caller(&state, &claims).await {
+        return r;
+    }
+    if body.is_superuser
+        && let Err(r) = authz::require_superuser_caller(&claims)
+    {
+        return r;
+    }
     let access_key = nasiko_auth::generate_access_key();
     let access_secret = nasiko_auth::generate_access_secret();
     let access_secret_hash = match nasiko_auth::hash_password_async(&access_secret).await {
@@ -407,7 +430,9 @@ pub struct ChangeRoleRequest {
     pub role: String,
 }
 
-/// Update a user's own-editable fields (superuser-only; EE overrides this
+/// Update a user. Admins may update others (superuser targets need a superuser
+/// caller); anyone may update their own username/email/display_name only.
+/// (EE overrides this
 /// route to additionally accept `department_id`/`team_id` — see
 /// the EE `ee_update_user` override). An `is_active: false`
 /// transition here runs the same self-deactivate/last-admin guards as the
@@ -421,6 +446,7 @@ pub struct ChangeRoleRequest {
     ),
     request_body = UpdateUser,
     responses(
+        (status = 403, description = "Caller is not an admin (admin_required) or target is a superuser (superuser_required)"),
         (status = 200, description = "Updated user", body = UserRow),
         (status = 400, description = "Empty username/email or password too short"),
         (status = 403, description = "Cannot deactivate your own account"),
@@ -434,6 +460,26 @@ pub async fn update_user(
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateUser>,
 ) -> impl IntoResponse {
+    match authz::caller_is_admin(&state, &claims).await {
+        Err(r) => return r,
+        // Non-admins may only edit their own profile fields; role, activation
+        // and password changes go through admin routes or the self-service
+        // change-password route (which verifies the current password).
+        Ok(false) => {
+            let own_profile_only = claims.sub == id.to_string()
+                && body.role.is_none()
+                && body.is_active.is_none()
+                && body.password.is_none();
+            if !own_profile_only {
+                return authz::admin_required();
+            }
+        }
+        Ok(true) => {
+            if let Err(r) = authz::require_superuser_for_target(&state, &claims, id).await {
+                return r;
+            }
+        }
+    }
     // Validate inputs up front
     if body.username.as_deref() == Some("") {
         return (StatusCode::BAD_REQUEST, "username cannot be empty").into_response();
@@ -585,6 +631,7 @@ pub async fn update_user(
         ("id" = Uuid, Path, description = "User id"),
     ),
     responses(
+        (status = 403, description = "Caller is not an admin (admin_required) or target is a superuser (superuser_required)"),
         (status = 204, description = "Deleted"),
         (status = 403, description = "Cannot delete your own account"),
         (status = 409, description = "Cannot delete the last admin"),
@@ -597,6 +644,12 @@ pub(crate) async fn delete_user(
     claims: Claims,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
+    if let Err(r) = authz::require_admin_caller(&state, &claims).await {
+        return r;
+    }
+    if let Err(r) = authz::require_superuser_for_target(&state, &claims, id).await {
+        return r;
+    }
     // Prevent self-deletion.
     if claims.sub == id.to_string() {
         return (
@@ -665,6 +718,7 @@ pub(crate) async fn delete_user(
         ("id" = Uuid, Path, description = "User id"),
     ),
     responses(
+        (status = 403, description = "Caller is not an admin (admin_required) or target is a superuser (superuser_required)"),
         (status = 204, description = "Deactivated"),
         (status = 403, description = "Cannot deactivate your own account"),
         (status = 404, description = "No such user"),
@@ -676,6 +730,12 @@ pub(crate) async fn deactivate(
     claims: Claims,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
+    if let Err(r) = authz::require_admin_caller(&state, &claims).await {
+        return r;
+    }
+    if let Err(r) = authz::require_superuser_for_target(&state, &claims, id).await {
+        return r;
+    }
     // Prevent self-deactivation.
     if claims.sub == id.to_string() {
         return (
@@ -723,14 +783,22 @@ pub(crate) async fn deactivate(
         ("id" = Uuid, Path, description = "User id"),
     ),
     responses(
+        (status = 403, description = "Caller is not an admin (admin_required) or target is a superuser (superuser_required)"),
         (status = 204, description = "Reinstated"),
         (status = 404, description = "No such user"),
     ),
 )]
 pub(crate) async fn reinstate(
     State(state): State<AppState>,
+    claims: Claims,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
+    if let Err(r) = authz::require_admin_caller(&state, &claims).await {
+        return r;
+    }
+    if let Err(r) = authz::require_superuser_for_target(&state, &claims, id).await {
+        return r;
+    }
     match sqlx::query("UPDATE users SET is_active = true WHERE id = $1 AND deleted_at IS NULL")
         .bind(id)
         .execute(&state.db)
@@ -770,13 +838,21 @@ pub(crate) struct RegenerateCredentialsResponse {
         ("id" = Uuid, Path, description = "User id"),
     ),
     responses(
+        (status = 403, description = "Caller is not an admin (admin_required) or target is a superuser (superuser_required)"),
         (status = 200, description = "New credentials", body = RegenerateCredentialsResponse),
     ),
 )]
 pub(crate) async fn regenerate_credentials(
     State(state): State<AppState>,
+    claims: Claims,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
+    if let Err(r) = authz::require_admin_caller(&state, &claims).await {
+        return r;
+    }
+    if let Err(r) = authz::require_superuser_for_target(&state, &claims, id).await {
+        return r;
+    }
     let access_key = nasiko_auth::generate_access_key();
     let access_secret = nasiko_auth::generate_access_secret();
     let access_secret_hash = match nasiko_auth::hash_password_async(&access_secret).await {
@@ -862,6 +938,7 @@ async fn valid_user_roles(state: &AppState) -> Result<Vec<String>, sqlx::Error> 
     ),
     request_body = ChangeRoleRequest,
     responses(
+        (status = 403, description = "Caller is not an admin (admin_required) or target is a superuser (superuser_required)"),
         (status = 204, description = "Role changed (or unchanged, a no-op)"),
         (status = 400, description = "Invalid role"),
         (status = 403, description = "Cannot change your own role"),
@@ -882,6 +959,12 @@ pub async fn change_role(
             Json(serde_json::json!({"error": "cannot change your own role"})),
         )
             .into_response();
+    }
+    if let Err(r) = authz::require_admin_caller(&state, &claims).await {
+        return r;
+    }
+    if let Err(r) = authz::require_superuser_for_target(&state, &claims, id).await {
+        return r;
     }
 
     let new_role = req.role.trim().to_lowercase();
@@ -983,10 +1066,17 @@ pub(crate) struct AdminListResponse {
     path = "/api/users/admins",
     tag = "users",
     responses(
+        (status = 403, description = "Caller is not an admin (admin_required) or target is a superuser (superuser_required)"),
         (status = 200, description = "Admin users", body = AdminListResponse),
     ),
 )]
-pub(crate) async fn list_admins(State(state): State<AppState>) -> impl IntoResponse {
+pub(crate) async fn list_admins(
+    State(state): State<AppState>,
+    claims: Claims,
+) -> impl IntoResponse {
+    if let Err(r) = authz::require_admin_caller(&state, &claims).await {
+        return r;
+    }
     match sqlx::query_as::<_, AdminUser>(
         "SELECT id, username, email, is_active, created_at FROM users WHERE role = 'admin' AND deleted_at IS NULL ORDER BY username",
     )
@@ -1014,13 +1104,20 @@ pub(crate) async fn list_admins(State(state): State<AppState>) -> impl IntoRespo
         ("id" = Uuid, Path, description = "User id"),
     ),
     responses(
+        (status = 403, description = "Caller is not an admin (admin_required) or target is a superuser (superuser_required)"),
         (status = 200, description = "Accessible agents", body = AccessibleAgentsResponse),
     ),
 )]
 pub(crate) async fn accessible_agents_for_user(
     State(state): State<AppState>,
+    claims: Claims,
     Path(user_id): Path<Uuid>,
 ) -> impl IntoResponse {
+    if claims.sub != user_id.to_string()
+        && let Err(r) = authz::require_admin_caller(&state, &claims).await
+    {
+        return r;
+    }
     accessible_agents_impl(&state.db, user_id).await
 }
 
