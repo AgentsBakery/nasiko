@@ -342,7 +342,7 @@ async fn admin_non_superuser_can_manage_members() {
         &carol,
         "carol",
     )
-    .json(&json!({"role": "team_member"}))
+    .json(&json!({"role": "admin"}))
     .send()
     .await
     .unwrap();
