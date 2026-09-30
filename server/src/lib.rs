@@ -11,6 +11,7 @@ pub mod agent_lifecycle;
 pub mod agent_proxy;
 pub mod agents;
 pub mod auth;
+pub mod budgets;
 pub mod build;
 pub mod capabilities;
 pub mod catalog;
@@ -195,6 +196,13 @@ where
     // `protected`'s outer layer), no per-route role check needed.
     let pool_routes = Router::new().nest("/pool", pool::degradable_router());
 
+    // Budget administration. `require_user_manager` is allow-all in OSS, so
+    // each handler also checks the admin role.
+    let budget_admin_routes = budgets::admin_router().layer(middleware::from_fn_with_state(
+        state.clone(),
+        auth::rbac::require_user_manager,
+    ));
+
     // User management: admin role or superuser.
     let user_routes = user_router.layer(middleware::from_fn_with_state(
         state.clone(),
@@ -268,6 +276,8 @@ where
         .merge(container_routes)
         .merge(pool_routes)
         .merge(user_routes)
+        .merge(budget_admin_routes)
+        .merge(budgets::me_router())
         .merge(build_routes)
         .merge(degradable_routes)
         .merge(chat::router())

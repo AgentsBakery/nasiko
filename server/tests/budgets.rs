@@ -89,9 +89,19 @@ async fn get_key(key: &str) -> Option<i64> {
     conn.get(key).await.expect("get")
 }
 
-fn admin(server: &TestServer, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-    let _ = server;
-    common::as_superuser(rb, &Uuid::new_v4().to_string(), "root")
+/// `require_auth` resolves the caller from `users`, so the superuser needs a row.
+async fn seed_root(server: &TestServer) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO users (username, email, is_superuser) VALUES ('budgets-root', \
+         'budgets-root@budgets.test', true) RETURNING id",
+    )
+    .fetch_one(&server.db)
+    .await
+    .expect("seed root")
+}
+
+fn admin(root: Uuid, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    common::as_superuser(rb, &root.to_string(), "budgets-root")
 }
 
 fn member(rb: reqwest::RequestBuilder, id: Uuid, name: &str) -> reqwest::RequestBuilder {
@@ -99,23 +109,23 @@ fn member(rb: reqwest::RequestBuilder, id: Uuid, name: &str) -> reqwest::Request
 }
 
 /// Create a budget as a superuser; returns the raw response.
-async fn post_budget(server: &TestServer, body: Value) -> reqwest::Response {
-    admin(server, server.client.post(server.url("/api/budgets")))
+async fn post_budget(server: &TestServer, root: Uuid, body: Value) -> reqwest::Response {
+    admin(root, server.client.post(server.url("/api/budgets")))
         .json(&body)
         .send()
         .await
         .expect("post budget")
 }
 
-async fn create_budget(server: &TestServer, body: Value) -> Value {
-    let resp = post_budget(server, body).await;
+async fn create_budget(server: &TestServer, root: Uuid, body: Value) -> Value {
+    let resp = post_budget(server, root, body).await;
     assert_eq!(resp.status(), 201, "create budget");
     resp.json::<Value>().await.unwrap()["data"].clone()
 }
 
-async fn get_budget(server: &TestServer, id: &str) -> Value {
+async fn get_budget(server: &TestServer, root: Uuid, id: &str) -> Value {
     let resp = admin(
-        server,
+        root,
         server.client.get(server.url(&format!("/api/budgets/{id}"))),
     )
     .send()
@@ -151,9 +161,10 @@ async fn event_kinds(server: &TestServer, budget_id: &str) -> Vec<String> {
 #[serial]
 async fn admin_can_crud_budgets() {
     let server = TestServer::start().await;
+    let root = seed_root(&server).await;
     let user = seed_user(&server, "crud-user", "member").await;
 
-    let resp = post_budget(&server, user_budget("crud budget", user, 10.0)).await;
+    let resp = post_budget(&server, root, user_budget("crud budget", user, 10.0)).await;
     assert_eq!(resp.status(), 201);
     let created = resp.json::<Value>().await.unwrap()["data"].clone();
     let id = created["id"].as_str().expect("id").to_owned();
@@ -161,12 +172,12 @@ async fn admin_can_crud_budgets() {
     assert_eq!(created["downgrade_ceiling_pct"], 125);
     assert_eq!(created["enabled"], true);
 
-    let fetched = get_budget(&server, &id).await;
+    let fetched = get_budget(&server, root, &id).await;
     assert_eq!(fetched["name"], "crud budget");
     assert!((fetched["limit_usd"].as_f64().unwrap() - 10.0).abs() < EPS);
 
     let resp = admin(
-        &server,
+        root,
         server.client.put(server.url(&format!("/api/budgets/{id}"))),
     )
     .json(&json!({"limit_usd": 20.0, "enabled": false}))
@@ -179,7 +190,7 @@ async fn admin_can_crud_budgets() {
     assert_eq!(updated["enabled"], false);
 
     let resp = admin(
-        &server,
+        root,
         server
             .client
             .delete(server.url(&format!("/api/budgets/{id}"))),
@@ -190,7 +201,7 @@ async fn admin_can_crud_budgets() {
     assert_eq!(resp.status(), 204);
 
     let resp = admin(
-        &server,
+        root,
         server.client.get(server.url(&format!("/api/budgets/{id}"))),
     )
     .send()
@@ -225,8 +236,9 @@ async fn role_admin_non_superuser_can_crud() {
 #[serial]
 async fn member_gets_403_on_admin_routes() {
     let server = TestServer::start().await;
+    let root = seed_root(&server).await;
     let m = seed_user(&server, "plain-member", "member").await;
-    let created = create_budget(&server, user_budget("member-gate", m, 5.0)).await;
+    let created = create_budget(&server, root, user_budget("member-gate", m, 5.0)).await;
     let id = created["id"].as_str().unwrap();
 
     let calls = [
@@ -285,6 +297,7 @@ async fn member_gets_403_on_admin_routes() {
 #[serial]
 async fn validation_rejects_bad_input() {
     let server = TestServer::start().await;
+    let root = seed_root(&server).await;
     let u = seed_user(&server, "valid-user", "member").await;
     let base = user_budget("v", u, 5.0);
 
@@ -316,19 +329,19 @@ async fn validation_rejects_bad_input() {
         ),
     ];
     for (body, code) in cases {
-        let resp = post_budget(&server, body.clone()).await;
+        let resp = post_budget(&server, root, body.clone()).await;
         assert_eq!(resp.status(), 400, "{body}");
         assert_eq!(resp.json::<Value>().await.unwrap()["code"], code, "{body}");
     }
 
-    let created = create_budget(&server, base.clone()).await;
+    let created = create_budget(&server, root, base.clone()).await;
     let id = created["id"].as_str().unwrap();
     for body in [
         json!({"scope": "agent"}),
         json!({"target_id": Uuid::new_v4()}),
     ] {
         let resp = admin(
-            &server,
+            root,
             server.client.put(server.url(&format!("/api/budgets/{id}"))),
         )
         .json(&body)
@@ -348,16 +361,18 @@ async fn validation_rejects_bad_input() {
 #[serial]
 async fn me_is_scoped_to_caller() {
     let server = TestServer::start().await;
+    let root = seed_root(&server).await;
     let alice = seed_user(&server, "me-alice", "member").await;
     let bob = seed_user(&server, "me-bob", "member").await;
     let alice_agent = seed_agent(&server, alice, "me-alice-agent").await;
     let bob_agent = seed_agent(&server, bob, "me-bob-agent").await;
 
-    create_budget(&server, user_budget("alice-user", alice, 10.0)).await;
-    create_budget(&server, user_budget("bob-user", bob, 10.0)).await;
+    create_budget(&server, root, user_budget("alice-user", alice, 10.0)).await;
+    create_budget(&server, root, user_budget("bob-user", bob, 10.0)).await;
     for (name, agent) in [("alice-agent", alice_agent), ("bob-agent", bob_agent)] {
         create_budget(
             &server,
+            root,
             json!({"name": name, "scope": "agent", "target_id": agent,
                    "period": "daily", "limit_usd": 3.0, "action": "downgrade"}),
         )
@@ -365,6 +380,7 @@ async fn me_is_scoped_to_caller() {
     }
     create_budget(
         &server,
+        root,
         json!({"name": "platform-wide", "scope": "platform",
                "period": "weekly", "limit_usd": 1000.0, "action": "block"}),
     )
@@ -409,6 +425,7 @@ async fn me_is_scoped_to_caller() {
 #[serial]
 async fn status_reflects_token_usage_and_rebuilds_on_missing_key() {
     let server = TestServer::start().await;
+    let root = seed_root(&server).await;
     let user = seed_user(&server, "status-user", "member").await;
     let now = Utc::now();
     let start = month_start(now);
@@ -417,15 +434,15 @@ async fn status_reflects_token_usage_and_rebuilds_on_missing_key() {
 
     seed_usage(&server, user, None, "direct_llm", 1.5, in_period).await;
     seed_usage(&server, user, None, "embedding", 0.5, in_period).await;
-    seed_usage(&server, user, None, "orchestrator", 100.0, in_period).await;
-    seed_usage(&server, user, None, "direct_llm", 100.0, last_month).await;
+    seed_usage(&server, user, None, "orchestrator", 50.0, in_period).await;
+    seed_usage(&server, user, None, "direct_llm", 50.0, last_month).await;
 
-    let created = create_budget(&server, user_budget("status budget", user, 4.0)).await;
+    let created = create_budget(&server, root, user_budget("status budget", user, 4.0)).await;
     let id = created["id"].as_str().unwrap().to_owned();
     let key = spend_key(id.parse().unwrap(), period_bounds(Period::Monthly, now).0);
     del_key(&key).await;
 
-    let view = get_budget(&server, &id).await;
+    let view = get_budget(&server, root, &id).await;
     assert!((view["spend_usd"].as_f64().unwrap() - 2.0).abs() < EPS);
     assert!((view["pct_used"].as_f64().unwrap() - 50.0).abs() < EPS);
     assert_eq!(view["state"], "ok");
@@ -441,6 +458,7 @@ async fn status_reflects_token_usage_and_rebuilds_on_missing_key() {
 #[serial]
 async fn rebuild_emits_threshold_events() {
     let server = TestServer::start().await;
+    let root = seed_root(&server).await;
     let soft_user = seed_user(&server, "events-soft", "member").await;
     let hard_user = seed_user(&server, "events-hard", "member").await;
     let now = Utc::now();
@@ -450,15 +468,15 @@ async fn rebuild_emits_threshold_events() {
     seed_usage(&server, soft_user, None, "direct_llm", 3.5, in_period).await;
     seed_usage(&server, hard_user, None, "direct_llm", 5.0, in_period).await;
 
-    let soft = create_budget(&server, user_budget("events soft", soft_user, 4.0)).await;
+    let soft = create_budget(&server, root, user_budget("events soft", soft_user, 4.0)).await;
     let soft_id = soft["id"].as_str().unwrap().to_owned();
-    let hard = create_budget(&server, user_budget("events hard", hard_user, 4.0)).await;
+    let hard = create_budget(&server, root, user_budget("events hard", hard_user, 4.0)).await;
     let hard_id = hard["id"].as_str().unwrap().to_owned();
     for id in [&soft_id, &hard_id] {
         del_key(&spend_key(id.parse().unwrap(), start)).await;
     }
 
-    get_budget(&server, &soft_id).await;
+    get_budget(&server, root, &soft_id).await;
     assert_eq!(event_kinds(&server, &soft_id).await, ["soft_threshold"]);
     let event_start: DateTime<Utc> =
         sqlx::query_scalar("SELECT period_start FROM budget_events WHERE budget_id = $1::uuid")
@@ -469,10 +487,10 @@ async fn rebuild_emits_threshold_events() {
     assert_eq!(event_start, start);
 
     // Key now present: a second read must not add anything.
-    get_budget(&server, &soft_id).await;
+    get_budget(&server, root, &soft_id).await;
     assert_eq!(event_kinds(&server, &soft_id).await, ["soft_threshold"]);
 
-    get_budget(&server, &hard_id).await;
+    get_budget(&server, root, &hard_id).await;
     assert_eq!(
         event_kinds(&server, &hard_id).await,
         ["hard_limit", "soft_threshold"]
@@ -484,6 +502,7 @@ async fn rebuild_emits_threshold_events() {
 #[serial]
 async fn status_states() {
     let server = TestServer::start().await;
+    let root = seed_root(&server).await;
     let now = Utc::now();
     let start = month_start(now);
     let in_period = start + chrono::Duration::seconds(5);
@@ -501,6 +520,7 @@ async fn status_states() {
         seed_usage(&server, user, None, "direct_llm", spend, in_period).await;
         let created = create_budget(
             &server,
+            root,
             json!({"name": name, "scope": "user", "target_id": user,
                    "period": "monthly", "limit_usd": 4.0, "action": action,
                    "enabled": enabled}),
@@ -508,7 +528,7 @@ async fn status_states() {
         .await;
         let id = created["id"].as_str().unwrap();
         del_key(&spend_key(id.parse().unwrap(), start)).await;
-        let view = get_budget(&server, id).await;
+        let view = get_budget(&server, root, id).await;
         assert_eq!(view["state"], expected, "{name}");
     }
     server.cleanup().await;

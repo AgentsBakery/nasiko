@@ -21,6 +21,12 @@ use crate::state::AppState;
         version = "0.1.0"
     ),
     paths(
+        crate::budgets::routes::list_budgets,
+        crate::budgets::routes::create_budget,
+        crate::budgets::routes::get_budget,
+        crate::budgets::routes::update_budget,
+        crate::budgets::routes::delete_budget,
+        crate::budgets::routes::my_budgets,
         crate::secrets::routes::list_secrets,
         crate::secrets::routes::create_secret,
         crate::secrets::routes::get_secret,
@@ -103,6 +109,9 @@ use crate::state::AppState;
         crate::observability::routes::agent_logs_stream,
     ),
     components(schemas(
+        crate::budgets::models::CreateBudgetRequest,
+        crate::budgets::models::UpdateBudgetRequest,
+        crate::budgets::models::BudgetView,
         crate::secrets::routes::SecretEntry,
         crate::secrets::routes::CreateSecret,
         crate::secrets::routes::UpdateSecret,

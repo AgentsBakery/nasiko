@@ -62,6 +62,9 @@ pub struct AppState {
     /// to price something receives the same instance — and so the resolved-rate
     /// and cache-ratio caches inside it are shared rather than rebuilt per call.
     pub pricing: Arc<nasiko_pricing::PricingEngine>,
+    /// Budget definitions and spend counters, shared with the LLM router so the
+    /// `/api/budgets` status and router enforcement read the same Redis counters.
+    pub budgets: Arc<nasiko_llm_router::budget::BudgetEngine>,
     /// Point-in-time CPU/memory/disk usage for the control plane, the agents and
     /// the supporting infra. Docker-backed in the Compose topology; the EE
     /// composition root replaces it for Kubernetes, the same way it replaces
@@ -199,6 +202,10 @@ impl AppState {
         // session_traces resolver maps session ↔ trace both ways for agents
         // that never set session.id on their spans.
         let pricing = Arc::new(nasiko_pricing::PricingEngine::new(db.clone()));
+        let budgets = Arc::new(nasiko_llm_router::budget::BudgetEngine::new(
+            db.clone(),
+            Some(redis.clone()),
+        ));
 
         let observability: Arc<dyn ObservabilityProvider> = {
             use crate::observability::session_resolver::PgSessionIdResolver;
@@ -266,6 +273,7 @@ impl AppState {
 
         let state = Self {
             pricing,
+            budgets,
             runtime,
             db,
             redis,
