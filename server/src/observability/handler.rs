@@ -790,16 +790,29 @@ pub async fn get_finops_attributions(
     tag = "observability",
     request_body = crate::observability::service::InsightsRequest,
     responses(
-        (status = 200, description = "Up to 3 insight bullet points", body = crate::observability::service::InsightsResponseEnvelope),
-        (status = 500, description = "LLM call failed"),
+        (status = 200, description = "Up to 3 insight bullet points; `available: false` with reason `llm_not_configured` when no LLM is configured", body = crate::observability::service::InsightsResponseEnvelope),
+        (status = 401, description = "Missing or invalid session"),
+        (status = 403, description = "Superuser only"),
+        (status = 500, description = "Upstream LLM call failed"),
     ),
 )]
 #[instrument(skip(state, body))]
 pub async fn get_finops_insights(
     State(state): State<AppState>,
-    _claims: Claims,
+    claims: Claims,
     Json(body): Json<InsightsRequest>,
-) -> impl IntoResponse {
+) -> Response {
+    // Spends the platform LLM key, so superuser-only; checked before any LLM call.
+    if !claims.is_superuser {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "insights require an administrator",
+                "code": "superuser_required",
+            })),
+        )
+            .into_response();
+    }
     match svc(&state).get_finops_insights(&body).await {
         Ok(resp) => Json(resp).into_response(),
         Err(e) => obs_err(e),

@@ -1066,7 +1066,15 @@ pub struct InsightsResponseEnvelope {
 #[derive(Serialize, ToSchema)]
 pub struct InsightsData {
     pub insights: Vec<String>,
+    /// `false` when no LLM is configured; `reason` then says why.
+    pub available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
+
+/// Caller-supplied `agent_costs` entries forwarded to the LLM prompt; bounds
+/// prompt size (and spend) regardless of what the client sends.
+const MAX_INSIGHT_AGENT_COSTS: usize = 50;
 
 // finops/agent-hours
 
@@ -3194,12 +3202,33 @@ impl ObservabilityService {
         &self,
         payload: &InsightsRequest,
     ) -> Result<InsightsResponseEnvelope, ObservabilityError> {
+        let api_key = self
+            .config
+            .openai_api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty());
+        let Some(api_key) = api_key else {
+            return Ok(InsightsResponseEnvelope {
+                data: InsightsData {
+                    insights: vec![],
+                    available: false,
+                    reason: Some("llm_not_configured".into()),
+                },
+                status_code: 200,
+                message: "No LLM configured".into(),
+            });
+        };
         let base_url = self
             .config
             .openai_base_url
             .as_deref()
             .unwrap_or("https://api.openai.com/v1");
-        let api_key = self.config.openai_api_key.as_deref().unwrap_or_default();
+        let agent_costs: Vec<&Value> = payload
+            .agent_costs
+            .iter()
+            .take(MAX_INSIGHT_AGENT_COSTS)
+            .collect();
 
         let prompt = format!(
             r#"You are a FinOps analyst reviewing AI agent usage metrics for the last 30 days.
@@ -3212,7 +3241,7 @@ Each bullet must:
 Cover: (1) highest cost driver, (2) efficiency observation, (3) one actionable cost-reduction recommendation.
 
 Data: {}"#,
-            serde_json::json!({ "kpi": payload.kpi, "agent_costs": payload.agent_costs })
+            serde_json::json!({ "kpi": payload.kpi, "agent_costs": agent_costs })
         );
 
         let body = serde_json::json!({
@@ -3255,7 +3284,11 @@ Data: {}"#,
             .collect();
 
         Ok(InsightsResponseEnvelope {
-            data: InsightsData { insights },
+            data: InsightsData {
+                insights,
+                available: true,
+                reason: None,
+            },
             status_code: 200,
             message: "Insights generated successfully".into(),
         })
