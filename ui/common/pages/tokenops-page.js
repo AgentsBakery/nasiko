@@ -289,7 +289,7 @@ function kpiHtml({ label, value, sub, delta, dir, trend }) {
 }
 
 /** Four cells of the real geometry, so the strip does not resize on data. */
-const KPI_SKELETON = Array.from({ length: 4 }, () => `
+const KPI_SKELETON = Array.from({ length: 5 }, () => `
   <div class="kpi">
     <div class="kpi-chip is-neutral"><span class="kpi-skel kpi-skel--chip"></span></div>
     <div class="kpi-text">
@@ -917,6 +917,8 @@ class TokenopsPage extends HTMLElement {
     const tokens = kpi('total_tokens', undefined);
     const costPerOp = kpi('cost_per_operation', s.average_cost ?? 0);
     const latency = kpi('avg_latency_ms', undefined);
+    const cacheSave = kpi('cache_savings_usd', 0);
+    const cacheTok = kpi('cache_read_tokens', 0);
 
     const confidence = [
       s.estimated_cost > 0 ? `${fmtMoney(s.estimated_cost)} estimated` : '',
@@ -935,6 +937,9 @@ class TokenopsPage extends HTMLElement {
       { label: 'Avg latency', value: fmtLatencyShort(latency.current),
         sub: `${s.active_agents ?? 0} of ${s.total_agents ?? 0} agents active`,
         ...deltaChip(latency.change_pct, 'down') },
+      { label: 'Cache savings', value: fmtMoney(cacheSave.current),
+        sub: `${fmtTokens(cacheTok.current)} cached tokens`,
+        ...deltaChip(cacheSave.change_pct, 'up') },
     ];
 
     const strip = this.querySelector('#kpi-strip');

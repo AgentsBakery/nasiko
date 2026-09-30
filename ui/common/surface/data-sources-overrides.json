@@ -41,7 +41,7 @@
         "summary",
         "breakdown"
       ],
-      "$shapeSource": "Read field-by-field off FinopsDashboardData and its structs in oss/server/src/observability/service.rs:787 (FinopsKpis:879, FinopsSummary:800, AgentFinopsRow:813, SpendByAgentBreakdown:980, SpendPieSlice, FinopsTokenUsage). The hand-written shape had drifted badly after 6987b124 and 3678327c: `spend_by_agent` was absent entirely, `kpis` was missing six of its ten metrics, `agents[]` was missing four, and — the one that actively misled — `token_usage` declared avg_latency_ms, container_hours and version, none of which the struct has. A model binding to a field that does not exist gets nothing and no diagnostic; the renderer can only check what the DSL says against the catalog, never against the response.",
+      "$shapeSource": "Read field-by-field off FinopsDashboardData and its structs in oss/server/src/observability/service.rs:787 (FinopsKpis:879, FinopsSummary:800, AgentFinopsRow:813, SpendByAgentBreakdown:980, SpendPieSlice, FinopsTokenUsage). The hand-written shape had drifted badly after 6987b124 and 3678327c: `spend_by_agent` was absent entirely, `kpis` was missing six of its ten metrics (FinopsKpis now has twelve, adding cache_savings_usd and cache_read_tokens), `agents[]` was missing four, and — the one that actively misled — `token_usage` declared avg_latency_ms, container_hours and version, none of which the struct has. A model binding to a field that does not exist gets nothing and no diagnostic; the renderer can only check what the DSL says against the catalog, never against the response.",
       "argHints": {
         "range": "\"24h\" | \"7d\" | \"30d\" — wins over startTime/endTime when both are sent",
         "startTime": "ISO 8601 string, optional",
@@ -101,6 +101,16 @@
               "change_pct": "number|null"
             },
             "latency_p99_ms": {
+              "current": "number",
+              "previous": "number",
+              "change_pct": "number|null"
+            },
+            "cache_savings_usd": {
+              "current": "number",
+              "previous": "number",
+              "change_pct": "number|null"
+            },
+            "cache_read_tokens": {
               "current": "number",
               "previous": "number",
               "change_pct": "number|null"

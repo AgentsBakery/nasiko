@@ -88,6 +88,16 @@
                 "current": "number",
                 "previous": "number",
                 "change_pct": "number|null"
+              },
+              "cache_savings_usd": {
+                "current": "number",
+                "previous": "number",
+                "change_pct": "number|null"
+              },
+              "cache_read_tokens": {
+                "current": "number",
+                "previous": "number",
+                "change_pct": "number|null"
               }
             },
             "summary": {
@@ -537,6 +547,16 @@
                 "change_pct": "number|null"
               },
               "latency_p99_ms": {
+                "current": "number",
+                "previous": "number",
+                "change_pct": "number|null"
+              },
+              "cache_savings_usd": {
+                "current": "number",
+                "previous": "number",
+                "change_pct": "number|null"
+              },
+              "cache_read_tokens": {
                 "current": "number",
                 "previous": "number",
                 "change_pct": "number|null"
