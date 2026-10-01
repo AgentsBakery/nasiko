@@ -207,6 +207,16 @@ where
         auth::rbac::require_user_manager,
     ));
 
+    // Channel test sends are outbound HTTP to an admin-chosen host; the
+    // per-caller cap bounds port-scan and amplification use.
+    let notify_test_limiter = RateLimiter::new(
+        notifications::TEST_SENDS_PER_WINDOW,
+        notifications::TEST_WINDOW,
+    );
+    let notification_admin_routes = notifications::admin_router(notify_test_limiter).layer(
+        middleware::from_fn_with_state(state.clone(), auth::rbac::require_user_manager),
+    );
+
     let budget_admin_routes = budgets::admin_router().layer(middleware::from_fn_with_state(
         state.clone(),
         auth::rbac::require_user_manager,
@@ -287,6 +297,7 @@ where
         .merge(user_routes)
         .merge(budget_admin_routes)
         .merge(alert_admin_routes)
+        .merge(notification_admin_routes)
         .merge(budgets::me_router())
         .merge(build_routes)
         .merge(degradable_routes)

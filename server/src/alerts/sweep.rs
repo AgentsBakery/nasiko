@@ -11,11 +11,17 @@ use uuid::Uuid;
 use super::engine;
 use super::models::NotifyEvent;
 
+/// Finished outbox rows (delivered or failed) are kept this long as delivery history.
+const OUTBOX_RETENTION_DAYS: i32 = 30;
+/// Rows deleted per sweep, so a large backlog never holds one long delete.
+const OUTBOX_PURGE_BATCH: i64 = 1000;
+
 /// Run every sweep step; returns the number of alerts resolved.
 pub async fn tick_resolve_sweep(db: &PgPool, now: DateTime<Utc>) -> Result<usize, sqlx::Error> {
     let mut tx = db.begin().await?;
     let mut resolved = 0;
     resolved += resolve_budget_alerts(&mut tx, now).await?;
+    purge_old_outbox(&mut tx).await?;
     tx.commit().await?;
     Ok(resolved)
 }
@@ -42,4 +48,21 @@ async fn resolve_budget_alerts(
         engine::enqueue(conn, *id, NotifyEvent::Resolved).await?;
     }
     Ok(ids.len())
+}
+
+/// Outbox retention: drop finished rows past `OUTBOX_RETENTION_DAYS`. Pending
+/// and sending rows are never touched, however old.
+async fn purge_old_outbox(conn: &mut PgConnection) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query(
+        "DELETE FROM notification_outbox WHERE id IN ( \
+             SELECT id FROM notification_outbox \
+             WHERE status IN ('delivered', 'failed') \
+               AND created_at < now() - $1::int * interval '1 day' \
+             LIMIT $2)",
+    )
+    .bind(OUTBOX_RETENTION_DAYS)
+    .bind(OUTBOX_PURGE_BATCH)
+    .execute(conn)
+    .await?;
+    Ok(res.rows_affected())
 }

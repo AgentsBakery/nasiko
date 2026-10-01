@@ -12,6 +12,7 @@ use nasiko_config::AlertsConfig;
 use sqlx::PgPool;
 use tokio::time::MissedTickBehavior;
 
+use crate::notifications::dispatch::{DispatchDeps, tick_outbox_dispatch};
 use crate::state::AppState;
 
 pub mod budget_events;
@@ -42,6 +43,19 @@ pub fn spawn_workers(db: PgPool, cfg: AlertsConfig) {
             move || {
                 let db = db.clone();
                 async move { tick_budget_events(&db, Utc::now()).await.map(|_| ()) }
+            },
+        ));
+    }
+    if cfg.outbox_secs > 0 {
+        let db = db.clone();
+        let deps = DispatchDeps::from_config(&cfg);
+        tokio::spawn(run_every(
+            "outbox_dispatch",
+            Duration::from_secs(cfg.outbox_secs),
+            move || {
+                let db = db.clone();
+                let deps = deps.clone();
+                async move { tick_outbox_dispatch(&db, &deps).await.map(|_| ()) }
             },
         ));
     }

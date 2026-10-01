@@ -962,7 +962,9 @@ async fn private_server() -> TestServer {
 
 /// Headers and body of the most recent request a mock matched.
 #[derive(Clone, Default)]
-struct Captured(std::sync::Arc<std::sync::Mutex<Option<(Vec<(String, String)>, Vec<u8>)>>>);
+struct Captured(std::sync::Arc<std::sync::Mutex<Option<CapturedRequest>>>);
+
+type CapturedRequest = (Vec<(String, String)>, Vec<u8>);
 
 impl Captured {
     fn matcher(&self) -> impl Fn(&mockito::Request) -> bool + Send + Sync + 'static {
@@ -973,7 +975,7 @@ impl Captured {
                 .iter()
                 .map(|(k, v)| (k.as_str().to_owned(), v.to_str().unwrap_or("").to_owned()))
                 .collect();
-            let body = req.body().map(|b| b.clone()).unwrap_or_default();
+            let body = req.body().cloned().unwrap_or_default();
             *slot.lock().unwrap() = Some((headers, body));
             true
         }
@@ -1839,15 +1841,56 @@ async fn member_gets_403_on_channel_routes() {
         ("GET", "/api/notification-deliveries".to_owned()),
     ];
     for (method, path) in calls {
+        // Typed bodies are parsed before the handler runs, so send valid ones.
+        let body = match (method, path.as_str()) {
+            ("POST", p) if p == base => {
+                json!({"name": "n", "kind": "webhook", "url": "https://example.com/x"})
+            }
+            ("PUT", p) if p.ends_with("/routes") => json!({"routes": []}),
+            _ => json!({}),
+        };
         let rb = server
             .client
             .request(method.parse().unwrap(), server.url(&path));
         let resp = member(rb, user, "chan-member")
-            .json(&json!({}))
+            .json(&body)
             .send()
             .await
             .unwrap();
         assert_eq!(resp.status(), 403, "{method} {path}");
     }
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn sweep_purges_only_old_finished_outbox_rows() {
+    let server = TestServer::start().await;
+    let channel = seed_channel(&server, "retention", true).await;
+    let mut ids = Vec::new();
+    for (status, age) in [
+        ("delivered", "31 days"),
+        ("failed", "31 days"),
+        ("pending", "31 days"),
+        ("delivered", "1 day"),
+    ] {
+        let id: Uuid = sqlx::query_scalar(&format!(
+            "INSERT INTO notification_outbox (channel_id, event, payload, status, created_at) \
+             VALUES ($1, 'opened', '{{}}'::jsonb, '{status}', now() - interval '{age}') \
+             RETURNING id"
+        ))
+        .bind(channel)
+        .fetch_one(&server.db)
+        .await
+        .unwrap();
+        ids.push(id);
+    }
+    tick_resolve_sweep(&server.db, Utc::now()).await.unwrap();
+    let left: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM notification_outbox")
+        .fetch_all(&server.db)
+        .await
+        .unwrap();
+    assert_eq!(left.len(), 2);
+    assert!(left.contains(&ids[2]) && left.contains(&ids[3]));
     server.cleanup().await;
 }

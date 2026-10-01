@@ -386,21 +386,25 @@ pub async fn tick_outbox_dispatch(
     if claimed.is_empty() {
         return Ok(stats);
     }
-    let crypto = SecretsCrypto::try_for_system().ok();
-    let crypto = crypto.as_ref();
-
-    let finished: Vec<_> = futures::stream::iter(claimed.iter())
-        .map(|row| async move {
-            let outcome = process(deps, crypto, row).await;
-            let applied = finish_row(
-                db,
-                row.id,
-                row.claimed_at,
-                &outcome.result,
-                outcome.attempts,
-            )
-            .await;
-            (row, outcome, applied)
+    // Owned, Arc-shared inputs keep the stream's futures free of borrowed
+    // lifetimes (borrowed closures trip rustc's higher-ranked Send inference).
+    let shared = std::sync::Arc::new((deps.clone(), SecretsCrypto::try_for_system().ok()));
+    let finished: Vec<_> = futures::stream::iter(claimed)
+        .map(|row| {
+            let db = db.clone();
+            let shared = shared.clone();
+            async move {
+                let outcome = process(&shared.0, shared.1.as_ref(), &row).await;
+                let applied = finish_row(
+                    &db,
+                    row.id,
+                    row.claimed_at,
+                    &outcome.result,
+                    outcome.attempts,
+                )
+                .await;
+                (row, outcome, applied)
+            }
         })
         .buffer_unordered(SEND_CONCURRENCY)
         .collect()
