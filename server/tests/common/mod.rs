@@ -214,6 +214,11 @@ pub struct TestServer {
     /// observations (`set_instances`) and drive the hours meter directly.
     #[allow(dead_code)]
     pub runtime: Arc<FakeRuntime>,
+    /// Connection URL of this test's database, for tests that need extra
+    /// connections outside the single-connection `db` pool (concurrency and
+    /// lock-ordering scenarios).
+    #[allow(dead_code)]
+    pub db_url: String,
     db_name: String,
     admin_pool: PgPool,
 }
@@ -306,7 +311,7 @@ impl TestServer {
         AppState::run_migrations(&db).await;
 
         let s3_ep = s3_endpoint();
-        let mut config = test_config(db_url, redis_url(), s3_ep.clone());
+        let mut config = test_config(db_url.clone(), redis_url(), s3_ep.clone());
         configure(&mut config);
 
         let jwt_secret = std::env::var("JWT_SECRET").expect("JWT_SECRET must be set");
@@ -335,6 +340,7 @@ impl TestServer {
             client: reqwest::Client::new(),
             db: db.clone(),
             runtime: fake_handle,
+            db_url,
             db_name,
             admin_pool: admin,
         }
