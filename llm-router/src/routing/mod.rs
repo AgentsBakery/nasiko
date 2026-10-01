@@ -395,13 +395,23 @@ fn query_preview(q: &str) -> String {
 /// registry's Tier3 for the provider, else the configured model as a last resort. Never
 /// pins: the caller does not write the cache for this decision.
 async fn small_talk_model(registry: &dyn TierRegistry, inputs: &RouteInputs<'_>) -> String {
-    if let Some(m) = inputs.tier3_model {
-        return m.to_string();
+    cheapest_model(registry, inputs.provider, inputs.tier3_model)
+        .await
+        .unwrap_or_else(|| inputs.fallback_model.to_string())
+}
+
+/// The cheapest model configured for `provider`: the per-config `tier3_model` override,
+/// else the registry's Tier3. Shared by small-talk routing and the budget downgrade so
+/// both agree on what "cheapest" means; `None` when neither is configured.
+pub async fn cheapest_model(
+    registry: &dyn TierRegistry,
+    provider: &str,
+    tier3_model: Option<&str>,
+) -> Option<String> {
+    if let Some(m) = tier3_model {
+        return Some(m.to_string());
     }
-    if let Some(m) = registry.model_for(inputs.provider, Tier::Tier3).await {
-        return m;
-    }
-    inputs.fallback_model.to_string()
+    registry.model_for(provider, Tier::Tier3).await
 }
 
 /// Best-effort plain text of the latest `user` message — the classifier's `query` input.

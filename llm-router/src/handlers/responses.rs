@@ -16,7 +16,10 @@ use futures::StreamExt;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::chat::{RequestSignals, RoutedRequest, authenticate_request, resolve_routed_request};
+use super::chat::{
+    RequestSignals, RoutedRequest, apply_budget_downgrade, apply_downgrade_headers,
+    authenticate_request, resolve_routed_request,
+};
 use crate::LlmRouterCtx;
 use crate::budget;
 use crate::error::GatewayError;
@@ -119,7 +122,7 @@ async fn responses_core(
         is_tool_continuation: is_tool_continuation(body.get("input")),
         query,
     };
-    let routed = resolve_routed_request(
+    let mut routed = resolve_routed_request(
         ctx,
         store,
         headers,
@@ -151,98 +154,124 @@ async fn responses_core(
         ?budget_decision,
         "responses_core: budget decision"
     );
-    let attempts = fallback::build_attempts(&routed.resolved, &ctx.cfg);
-    let native_primary = routed.resolved.provider == "openai";
-    let mut translated = if native_primary {
-        None
-    } else {
-        Some(parse_request(&body)?)
+    let downgrade_headers = match apply_budget_downgrade(
+        ctx,
+        &mut routed.resolved,
+        &budget_decision,
+        &routed.agent_id,
+    )
+    .await
+    {
+        Some((headers, record)) => {
+            routed.budget_downgrade = Some(record);
+            Some(headers)
+        }
+        None => None,
     };
-    let mut last_response = None;
-    let mut last_error = None;
-    for attempt in attempts {
-        let native = native_primary && attempt.provider == "openai";
-        if !native {
-            let parsed = match translated.as_ref() {
-                Some(parsed) => parsed,
-                None => {
-                    translated = Some(parse_request(&body)?);
-                    translated.as_ref().expect("inserted above")
+    // One block so every success path (translated, native, streaming) passes through the
+    // single header-stamping point below instead of each `return` repeating it.
+    let outcome: Result<Response, GatewayError> = async {
+        let attempts = fallback::build_attempts(&routed.resolved, &ctx.cfg);
+        let native_primary = routed.resolved.provider == "openai";
+        let mut translated = if native_primary {
+            None
+        } else {
+            Some(parse_request(&body)?)
+        };
+        let mut last_response = None;
+        let mut last_error = None;
+        for attempt in attempts {
+            let native = native_primary && attempt.provider == "openai";
+            if !native {
+                let parsed = match translated.as_ref() {
+                    Some(parsed) => parsed,
+                    None => {
+                        translated = Some(parse_request(&body)?);
+                        translated.as_ref().expect("inserted above")
+                    }
+                };
+                let started = Instant::now();
+                match translated_attempt(ctx, &routed, &attempt, parsed, started).await {
+                    Ok(response) => return Ok(response),
+                    Err(TranslatedAttemptError::Terminal(response)) => return Ok(*response),
+                    Err(TranslatedAttemptError::Configuration(error)) => return Err(error),
+                    Err(TranslatedAttemptError::Retry(error)) => {
+                        last_error = Some(error.into());
+                        continue;
+                    }
+                }
+            }
+
+            let object = body.as_object_mut().expect("Responses body was validated");
+            object.insert("model".into(), Value::String(attempt.model.clone()));
+            if let Some(temperature) = attempt.temperature {
+                object.insert("temperature".into(), json!(temperature));
+            }
+            if let Some(max_tokens) = attempt.max_tokens {
+                object.insert("max_output_tokens".into(), json!(max_tokens));
+            }
+            let started = Instant::now();
+            let mut guard = AttemptGuard::new(ctx, &routed, &attempt, started, stream);
+            let mut request = ctx
+                .http
+                .post(format!(
+                    "{}/responses",
+                    ctx.cfg.openai_api_base.trim_end_matches('/')
+                ))
+                .bearer_auth(&attempt.api_key)
+                .json(&body);
+            request = forward_request_headers(request, headers);
+            let upstream = match request.send().await {
+                Ok(upstream) => upstream,
+                Err(error) => {
+                    guard.fail("send", &error);
+                    let retryable = is_retryable_transport_error(&error);
+                    let error = GatewayError::Upstream(error.to_string());
+                    if retryable {
+                        last_error = Some(error);
+                        continue;
+                    }
+                    return Err(error);
                 }
             };
-            let started = Instant::now();
-            match translated_attempt(ctx, &routed, &attempt, parsed, started).await {
-                Ok(response) => return Ok(response),
-                Err(TranslatedAttemptError::Terminal(response)) => return Ok(*response),
-                Err(TranslatedAttemptError::Configuration(error)) => return Err(error),
-                Err(TranslatedAttemptError::Retry(error)) => {
-                    last_error = Some(error.into());
+            let status = upstream.status();
+            if !status.is_success() {
+                guard.fail_status(status.as_u16());
+                let response = passthrough_error(upstream).await?;
+                if status.as_u16() == 429 || status.is_server_error() {
+                    last_response = Some(response);
                     continue;
                 }
+                return Ok(response);
             }
+            let status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK);
+            return if stream {
+                guard.disarm();
+                stream_response(ctx, upstream, routed, attempt.clone(), started, status)
+            } else {
+                nonstream_response(
+                    ctx,
+                    upstream,
+                    routed,
+                    attempt.clone(),
+                    started,
+                    status,
+                    guard,
+                )
+                .await
+            };
         }
-
-        let object = body.as_object_mut().expect("Responses body was validated");
-        object.insert("model".into(), Value::String(attempt.model.clone()));
-        if let Some(temperature) = attempt.temperature {
-            object.insert("temperature".into(), json!(temperature));
-        }
-        if let Some(max_tokens) = attempt.max_tokens {
-            object.insert("max_output_tokens".into(), json!(max_tokens));
-        }
-        let started = Instant::now();
-        let mut guard = AttemptGuard::new(ctx, &routed, &attempt, started, stream);
-        let mut request = ctx
-            .http
-            .post(format!(
-                "{}/responses",
-                ctx.cfg.openai_api_base.trim_end_matches('/')
-            ))
-            .bearer_auth(&attempt.api_key)
-            .json(&body);
-        request = forward_request_headers(request, headers);
-        let upstream = match request.send().await {
-            Ok(upstream) => upstream,
-            Err(error) => {
-                guard.fail("send", &error);
-                let retryable = is_retryable_transport_error(&error);
-                let error = GatewayError::Upstream(error.to_string());
-                if retryable {
-                    last_error = Some(error);
-                    continue;
-                }
-                return Err(error);
-            }
-        };
-        let status = upstream.status();
-        if !status.is_success() {
-            guard.fail_status(status.as_u16());
-            let response = passthrough_error(upstream).await?;
-            if status.as_u16() == 429 || status.is_server_error() {
-                last_response = Some(response);
-                continue;
-            }
-            return Ok(response);
-        }
-        let status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK);
-        return if stream {
-            guard.disarm();
-            stream_response(ctx, upstream, routed, attempt.clone(), started, status)
-        } else {
-            nonstream_response(
-                ctx,
-                upstream,
-                routed,
-                attempt.clone(),
-                started,
-                status,
-                guard,
-            )
-            .await
-        };
+        last_response.map(Ok).unwrap_or_else(|| {
+            Err(last_error
+                .unwrap_or_else(|| GatewayError::Upstream("no Responses attempts".into())))
+        })
     }
-    last_response.map(Ok).unwrap_or_else(|| {
-        Err(last_error.unwrap_or_else(|| GatewayError::Upstream("no Responses attempts".into())))
+    .await;
+    outcome.map(|mut response| {
+        if let Some(h) = &downgrade_headers {
+            apply_downgrade_headers(&mut response, h);
+        }
+        response
     })
 }
 
@@ -812,6 +841,7 @@ impl AttemptGuard {
                 compress_metadata: None,
                 // /v1/responses does not share chat_core, so IP-1/IP-2 never run here (PRD §9).
                 brevity_metadata: None,
+                budget_downgrade: routed.budget_downgrade.clone(),
             }),
         }
     }
@@ -888,6 +918,7 @@ fn log_response_usage(
             // Never compressed: this surface does not go through `chat_core`.
             compress_metadata: None,
             brevity_metadata: None,
+            budget_downgrade: routed.budget_downgrade,
         },
     );
 }
@@ -1527,6 +1558,7 @@ mod tests {
             resolved: attempt.clone(),
             flow_id: None,
             attribution_source: None,
+            budget_downgrade: None,
         };
         let parsed = parse_request(&json!({"input":"hi"})).unwrap();
         let result = translated_attempt(&context, &routed, &attempt, &parsed, Instant::now()).await;
@@ -1911,6 +1943,7 @@ mod tests {
             },
             flow_id: None,
             attribution_source: None,
+            budget_downgrade: None,
         };
         let mut guard =
             AttemptGuard::new(&context, &routed, &routed.resolved, Instant::now(), false);

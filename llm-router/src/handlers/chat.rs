@@ -41,6 +41,78 @@ pub(crate) struct RoutedRequest {
     pub resolved: crate::resolver::ResolvedConfig,
     pub flow_id: Option<String>,
     pub attribution_source: Option<routing::attribution::AttributionSource>,
+    /// `metadata.budget_downgrade` for the usage row when a downgrade budget swapped the
+    /// model (set by [`apply_budget_downgrade`] after routing, never by `resolve_routed_request`).
+    pub budget_downgrade: Option<Value>,
+}
+
+/// Response header naming the downgrade budget that swapped the model.
+pub(crate) const BUDGET_DOWNGRADED_HEADER: &str = "x-nasiko-budget-downgraded";
+/// Response header carrying the model the caller asked for before the downgrade.
+pub(crate) const ORIGINAL_MODEL_HEADER: &str = "x-nasiko-original-model";
+
+/// What the caller is told when its call was served on the cheapest model.
+#[derive(Clone)]
+pub(crate) struct DowngradeHeaders {
+    pub budget_id: Uuid,
+    pub original_model: String,
+}
+
+pub(crate) fn apply_downgrade_headers(resp: &mut Response, h: &DowngradeHeaders) {
+    // A UUID and a model id are always valid header values; skip silently otherwise
+    // rather than failing a call that already succeeded.
+    if let Ok(v) = h.budget_id.to_string().parse() {
+        resp.headers_mut().insert(BUDGET_DOWNGRADED_HEADER, v);
+    }
+    if let Ok(v) = h.original_model.parse() {
+        resp.headers_mut().insert(ORIGINAL_MODEL_HEADER, v);
+    }
+}
+
+/// Apply a `Downgrade` decision: swap `resolved` to the cheapest configured model and
+/// clear the fallbacks (a fallback could otherwise land on a pricier model and defeat the
+/// budget). Runs after `resolve_routed_request`, so the sticky routing cache never sees the
+/// downgraded model. Returns the response headers and the usage metadata, or `None` when
+/// the decision is not a downgrade, no cheaper model is configured, or the call is already
+/// on the cheapest one (served as-is; the ceiling still blocks via `decide`).
+pub(crate) async fn apply_budget_downgrade(
+    ctx: &LlmRouterCtx,
+    resolved: &mut crate::resolver::ResolvedConfig,
+    decision: &budget::BudgetDecision,
+    agent_id: &str,
+) -> Option<(DowngradeHeaders, Value)> {
+    let budget::BudgetDecision::Downgrade(info) = decision else {
+        return None;
+    };
+    let cheap = routing::cheapest_model(
+        ctx.tier_registry.as_ref(),
+        &resolved.provider,
+        resolved.tier3_model.as_deref(),
+    )
+    .await?;
+    if cheap == resolved.model {
+        return None;
+    }
+    let original = std::mem::replace(&mut resolved.model, cheap);
+    resolved.litellm_model = format!("{}/{}", resolved.provider, resolved.model);
+    resolved.fallback_models.clear();
+    tracing::info!(
+        target: "nasiko::llm_router::budget",
+        %agent_id, budget_id = %info.budget_id, from = %original, to = %resolved.model,
+        "budget downgrade: serving on the cheapest tier model"
+    );
+    let record = serde_json::json!({
+        "budget_id": info.budget_id,
+        "from_model": original,
+        "to_model": resolved.model,
+    });
+    Some((
+        DowngradeHeaders {
+            budget_id: info.budget_id,
+            original_model: original,
+        },
+        record,
+    ))
 }
 
 /// Prompt-derived signals `resolve_routed_request` needs beyond the resolved config,
@@ -204,9 +276,10 @@ async fn chat_core(
     let RoutedRequest {
         agent_id,
         owner_id,
-        resolved,
+        mut resolved,
         flow_id,
         attribution_source,
+        budget_downgrade: _,
     } = routed;
 
     // ── budget seam ───────────────────────────────────────────────────────────────────────
@@ -230,6 +303,11 @@ async fn chat_core(
         ?budget_decision,
         "chat_core: budget decision"
     );
+    let (downgrade_headers, budget_downgrade) =
+        match apply_budget_downgrade(ctx, &mut resolved, &budget_decision, &agent_id).await {
+            Some((headers, record)) => (Some(headers), Some(record)),
+            None => (None, None),
+        };
 
     // ── compression seam ──────────────────────────────────────────────────────────────────
     // After `resolve_routed_request`, not before it: `RequestSignals` (built at :159 from
@@ -378,7 +456,14 @@ async fn chat_core(
             platform_paid,
             compress_metadata: compression.to_metadata(),
             brevity_metadata: brevity_metadata.clone(),
+            budget_downgrade,
             span: llm_span.clone(),
+        })
+        .map(|mut resp| {
+            if let Some(h) = &downgrade_headers {
+                apply_downgrade_headers(&mut resp, h);
+            }
+            resp
         });
     }
 
@@ -413,10 +498,15 @@ async fn chat_core(
             platform_paid,
             compress_metadata: compression.to_metadata(),
             brevity_metadata: brevity_metadata.clone(),
+            budget_downgrade,
         },
     );
 
-    Ok(Json(inbound.render_chat_response(resp)).into_response())
+    let mut response = Json(inbound.render_chat_response(resp)).into_response();
+    if let Some(h) = &downgrade_headers {
+        apply_downgrade_headers(&mut response, h);
+    }
+    Ok(response)
 }
 
 pub(crate) async fn resolve_routed_request(
@@ -533,6 +623,7 @@ pub(crate) async fn resolve_routed_request(
         resolved,
         flow_id,
         attribution_source,
+        budget_downgrade: None,
     })
 }
 
@@ -583,6 +674,7 @@ struct StreamChatArgs<'a> {
     /// all, so every trace-derived figure counted it as free.
     span: tracing::Span,
     brevity_metadata: Option<serde_json::Value>,
+    budget_downgrade: Option<serde_json::Value>,
 }
 
 /// Stream provider chunks back as OpenAI SSE: `data: <chunk>\n\n` … `data: [DONE]\n\n`.
@@ -605,6 +697,7 @@ fn stream_chat(args: StreamChatArgs<'_>) -> Result<Response, GatewayError> {
         compress_metadata,
         span,
         brevity_metadata,
+        budget_downgrade,
     } = args;
     let state = Arc::new(Mutex::new(StreamState::default()));
     let guard = UsageGuard {
@@ -623,6 +716,7 @@ fn stream_chat(args: StreamChatArgs<'_>) -> Result<Response, GatewayError> {
         platform_paid,
         compress_metadata,
         brevity_metadata,
+        budget_downgrade,
     };
 
     let body_stream = async_stream::stream! {
@@ -693,12 +787,14 @@ struct UsageGuard {
     /// Taken in `drop`, which runs exactly once.
     compress_metadata: Option<serde_json::Value>,
     brevity_metadata: Option<serde_json::Value>,
+    budget_downgrade: Option<serde_json::Value>,
 }
 
 impl Drop for UsageGuard {
     fn drop(&mut self) {
         let compress_metadata = self.compress_metadata.take();
         let brevity_metadata = self.brevity_metadata.take();
+        let budget_downgrade = self.budget_downgrade.take();
         let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         record_span_usage(&self.span, st.usage.as_ref());
         usage::spawn_log(
@@ -722,6 +818,7 @@ impl Drop for UsageGuard {
                 platform_paid: self.platform_paid,
                 compress_metadata,
                 brevity_metadata,
+                budget_downgrade,
             },
         );
     }
@@ -864,6 +961,7 @@ mod tests {
                 // This test covers span lifetime, not compression.
                 compress_metadata: None,
                 brevity_metadata: None,
+                budget_downgrade: None,
             };
             drop(guard);
         });

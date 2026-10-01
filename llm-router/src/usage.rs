@@ -59,6 +59,10 @@ pub struct UsageRecord {
     /// having: IP-1 leaves a row only when it acted, so a missing block is ambiguous between
     /// "off" and "nothing to do". This one always says which.
     pub brevity_metadata: Option<serde_json::Value>,
+    /// Pre-serialized `metadata.budget_downgrade` block `{budget_id, from_model, to_model}`,
+    /// set when a downgrade budget swapped this call's model. `None` leaves the row's
+    /// metadata byte-identical to what it was before budgets existed.
+    pub budget_downgrade: Option<serde_json::Value>,
 }
 
 /// Spawn the usage write so it never blocks the response.
@@ -146,6 +150,7 @@ pub async fn log_usage(
         cache_creation: serde_json::to_value(&cache_details).unwrap_or(serde_json::Value::Null),
         compress: record.compress_metadata,
         brevity: record.brevity_metadata,
+        budget_downgrade: record.budget_downgrade,
     });
 
     // Counters are bumped before the INSERT so a sequential follow-up call sees
@@ -217,6 +222,8 @@ struct MetadataInputs {
     compress: Option<serde_json::Value>,
     /// Always `Some` once the brevity layer exists: it records "skipped, and why" too.
     brevity: Option<serde_json::Value>,
+    /// `None` unless a downgrade budget swapped the model.
+    budget_downgrade: Option<serde_json::Value>,
 }
 
 /// The row's `metadata` JSONB.
@@ -236,6 +243,9 @@ fn build_metadata(inputs: MetadataInputs) -> serde_json::Value {
     }
     if let Some(brevity) = inputs.brevity {
         metadata["brevity"] = brevity;
+    }
+    if let Some(downgrade) = inputs.budget_downgrade {
+        metadata["budget_downgrade"] = downgrade;
     }
     metadata
 }
@@ -257,6 +267,7 @@ mod tests {
             cache_creation: serde_json::Value::Null,
             compress: None,
             brevity: None,
+            budget_downgrade: None,
         }
     }
 
@@ -281,6 +292,19 @@ mod tests {
             })
         );
         assert_eq!(build_metadata(inputs(false))["key_source"], "user_secret");
+    }
+
+    #[test]
+    fn budget_downgrade_is_added_under_its_own_key() {
+        let record = serde_json::json!({
+            "budget_id": "b", "from_model": "gpt-4o", "to_model": "gpt-4o-mini"
+        });
+        let metadata = build_metadata(MetadataInputs {
+            budget_downgrade: Some(record.clone()),
+            ..inputs(true)
+        });
+        assert_eq!(metadata["budget_downgrade"], record);
+        assert_eq!(metadata["key_source"], "platform");
     }
 
     #[test]

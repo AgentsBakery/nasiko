@@ -118,6 +118,7 @@ async fn embeddings_core(
             compress_metadata: None,
             // Embeddings are not chat completions; IP-2 never runs here.
             brevity_metadata: None,
+            budget_downgrade: None,
             platform_paid: resolved.platform_paid,
         },
     );
