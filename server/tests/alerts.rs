@@ -17,7 +17,7 @@ mod common;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use chrono::{DateTime, Datelike, SecondsFormat, TimeZone, Utc};
+use chrono::{DateTime, Datelike, SecondsFormat, TimeZone, Timelike, Utc};
 use common::TestServer;
 use nasiko_server::alerts::engine::{RESOLVE_BETWEEN_RAISE_STEPS, raise, resolve};
 use nasiko_server::alerts::models::{AlertKind, AlertScope, NewAlert, RaiseOutcome, Severity};
@@ -2935,5 +2935,427 @@ async fn sweep_purges_only_old_llm_call_failures() {
         .await
         .unwrap();
     assert_eq!(left, 1);
+    server.cleanup().await;
+}
+
+// ─── spend spikes ────────────────────────────────────────────────────────────
+
+use nasiko_server::alerts::{SpikeSettings, tick_spike};
+
+const SPIKE_SETTINGS: SpikeSettings = SpikeSettings {
+    sigma: 3.0,
+    floor_usd: 5.0,
+};
+
+/// Current hour + 5 minutes: `latest` is then the previous complete hour.
+fn spike_now() -> DateTime<Utc> {
+    let now = Utc::now();
+    let hour_start = Utc
+        .with_ymd_and_hms(now.year(), now.month(), now.day(), now.hour(), 0, 0)
+        .unwrap();
+    hour_start + chrono::Duration::minutes(5)
+}
+
+fn hour_of(t: DateTime<Utc>) -> DateTime<Utc> {
+    t - chrono::Duration::minutes(5)
+}
+
+fn hour_key(h: DateTime<Utc>) -> String {
+    h.format("%Y-%m-%dT%H:00Z").to_string()
+}
+
+async fn spike_usage(
+    server: &TestServer,
+    user: Uuid,
+    agent: Option<Uuid>,
+    op: &str,
+    cost: f64,
+    at: DateTime<Utc>,
+) {
+    sqlx::query(
+        "INSERT INTO token_usage (user_id, agent_id, operation_type, provider, model, cost_usd, created_at) \
+         VALUES ($1, $2, $3, 'openai', 'gpt-4o-mini', $4::float8::numeric, $5)",
+    )
+    .bind(user)
+    .bind(agent)
+    .bind(op)
+    .bind(cost)
+    .bind(at)
+    .execute(&server.db)
+    .await
+    .expect("seed spike usage");
+}
+
+/// One row per hour for `hours` complete hours before `latest`, mid-hour.
+async fn seed_baseline(
+    server: &TestServer,
+    user: Uuid,
+    agent: Uuid,
+    latest: DateTime<Utc>,
+    hours: i64,
+    cost: f64,
+) {
+    for i in 1..=hours {
+        let at = latest - chrono::Duration::hours(i) + chrono::Duration::minutes(10);
+        spike_usage(server, user, Some(agent), "direct_llm", cost, at).await;
+    }
+}
+
+async fn spike_alerts(server: &TestServer) -> Vec<Value> {
+    sqlx::query_scalar::<_, Value>(
+        "SELECT to_jsonb(a) FROM alerts a WHERE kind = 'spend_spike' ORDER BY dedup_key",
+    )
+    .fetch_all(&server.db)
+    .await
+    .expect("spike alerts")
+}
+
+#[tokio::test]
+#[serial]
+async fn spike_raises_for_agent_and_platform() {
+    let server = TestServer::start().await;
+    let (user, a) = member_agent(&server, "spike-a").await;
+    let now = spike_now();
+    let latest = hour_of(now) - chrono::Duration::hours(1);
+    seed_baseline(&server, user, a, latest, 30, 1.0).await;
+    for _ in 0..3 {
+        let at = latest + chrono::Duration::minutes(20);
+        spike_usage(&server, user, Some(a), "direct_llm", 20.0, at).await;
+    }
+
+    assert_eq!(
+        tick_spike(&server.db, &SPIKE_SETTINGS, now).await.unwrap(),
+        2
+    );
+    let key = hour_key(latest);
+    let agent_alert = alert_by_key(&server, &format!("spike:agent:{a}:{key}")).await;
+    assert_eq!(agent_alert.len(), 1);
+    let al = &agent_alert[0];
+    assert_eq!(al["status"], "open");
+    assert_eq!(al["severity"], "critical");
+    assert_eq!(al["scope"], "agent");
+    assert_eq!(al["scope_ref"], a.to_string());
+    assert_eq!(al["link"], format!("/tokenops?agent={a}&range=24h"));
+    for k in [
+        "hour_start",
+        "spend_usd",
+        "threshold_usd",
+        "baseline_mean",
+        "baseline_std",
+    ] {
+        assert!(!al["details"][k].is_null(), "details.{k}");
+    }
+    assert!((al["details"]["spend_usd"].as_f64().unwrap() - 60.0).abs() < 1e-6);
+
+    let platform = alert_by_key(&server, &format!("spike:platform:all:{key}")).await;
+    assert_eq!(platform.len(), 1);
+    assert_eq!(platform[0]["scope"], "platform");
+    assert!(platform[0]["scope_ref"].is_null());
+    assert_eq!(platform[0]["link"], "/tokenops?range=24h");
+
+    tick_spike(&server.db, &SPIKE_SETTINGS, now).await.unwrap();
+    assert_eq!(spike_alerts(&server).await.len(), 2);
+    let again = alert_by_key(&server, &format!("spike:agent:{a}:{key}")).await;
+    assert_eq!(again[0]["occurrences"], 2);
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn spike_respects_floor_and_cold_start() {
+    let server = TestServer::start().await;
+    let (user_b, b) = member_agent(&server, "spike-b").await;
+    let (user_c, c) = member_agent(&server, "spike-c").await;
+    let now = spike_now();
+    let latest = hour_of(now) - chrono::Duration::hours(1);
+    let at = latest + chrono::Duration::minutes(20);
+
+    seed_baseline(&server, user_b, b, latest, 30, 0.01).await;
+    spike_usage(&server, user_b, Some(b), "direct_llm", 4.0, at).await;
+    seed_baseline(&server, user_c, c, latest, 10, 1.0).await;
+    spike_usage(&server, user_c, Some(c), "direct_llm", 50.0, at).await;
+
+    tick_spike(&server.db, &SPIKE_SETTINGS, now).await.unwrap();
+    let agent_scoped: Vec<_> = spike_alerts(&server)
+        .await
+        .into_iter()
+        .filter(|a| a["scope"] == "agent")
+        .collect();
+    assert!(agent_scoped.is_empty(), "{agent_scoped:?}");
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn embedding_rows_count_other_operations_do_not() {
+    let server = TestServer::start().await;
+    let (user, a) = member_agent(&server, "spike-op").await;
+    let now = spike_now();
+    let latest = hour_of(now) - chrono::Duration::hours(1);
+    seed_baseline(&server, user, a, latest, 30, 1.0).await;
+    let at = latest + chrono::Duration::minutes(20);
+
+    spike_usage(&server, user, Some(a), "orchestrator", 90.0, at).await;
+    tick_spike(&server.db, &SPIKE_SETTINGS, now).await.unwrap();
+    assert!(spike_alerts(&server).await.is_empty());
+
+    spike_usage(&server, user, Some(a), "embedding", 50.0, at).await;
+    tick_spike(&server.db, &SPIKE_SETTINGS, now).await.unwrap();
+    let key = format!("spike:agent:{a}:{}", hour_key(latest));
+    let alert = alert_by_key(&server, &key).await;
+    assert_eq!(alert.len(), 1);
+    assert!((alert[0]["details"]["spend_usd"].as_f64().unwrap() - 50.0).abs() < 1e-6);
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn spike_resolves_next_quiet_hour_or_after_24h() {
+    let server = TestServer::start().await;
+    let (user, a) = member_agent(&server, "spike-res").await;
+    let ch = seed_channel(&server, "spike-ch", true).await;
+    seed_route(&server, ch, Some("spend_spike"), "info").await;
+    let now = spike_now();
+    let latest = hour_of(now) - chrono::Duration::hours(1);
+    seed_baseline(&server, user, a, latest, 30, 1.0).await;
+    let at = latest + chrono::Duration::minutes(20);
+    spike_usage(&server, user, Some(a), "direct_llm", 60.0, at).await;
+    tick_spike(&server.db, &SPIKE_SETTINGS, now).await.unwrap();
+
+    let next_hour = hour_of(now);
+    spike_usage(
+        &server,
+        user,
+        Some(a),
+        "direct_llm",
+        1.0,
+        next_hour + chrono::Duration::minutes(10),
+    )
+    .await;
+    let later = now + chrono::Duration::hours(1);
+    tick_spike(&server.db, &SPIKE_SETTINGS, later)
+        .await
+        .unwrap();
+    let key = format!("spike:agent:{a}:{}", hour_key(latest));
+    assert_eq!(alert_by_key(&server, &key).await[0]["status"], "resolved");
+    let events: Vec<String> = outbox(&server)
+        .await
+        .iter()
+        .map(|o| o["event"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(events.iter().any(|e| e == "resolved"), "{events:?}");
+
+    // A stale open spike alert is closed by the sweep after 24h.
+    let stale_key = "spike:agent:stale:old";
+    sqlx::query(
+        "INSERT INTO alerts (kind, severity, scope, dedup_key, status, title, message, link, details, first_seen_at) \
+         VALUES ('spend_spike', 'warning', 'platform', $1, 'open', 't', 'm', '/tokenops', '{}', now() - interval '25 hours')",
+    )
+    .bind(stale_key)
+    .execute(&server.db)
+    .await
+    .unwrap();
+    tick_resolve_sweep(&server.db, Utc::now()).await.unwrap();
+    assert_eq!(
+        alert_by_key(&server, stale_key).await[0]["status"],
+        "resolved"
+    );
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn spike_resolves_when_next_hour_has_no_rows() {
+    let server = TestServer::start().await;
+    let (user, a) = member_agent(&server, "spike-quiet").await;
+    let now = spike_now();
+    let latest = hour_of(now) - chrono::Duration::hours(1);
+    seed_baseline(&server, user, a, latest, 30, 1.0).await;
+    spike_usage(
+        &server,
+        user,
+        Some(a),
+        "direct_llm",
+        60.0,
+        latest + chrono::Duration::minutes(20),
+    )
+    .await;
+    tick_spike(&server.db, &SPIKE_SETTINGS, now).await.unwrap();
+    assert_eq!(spike_alerts(&server).await.len(), 2);
+
+    // Whole platform silent in the next hour.
+    tick_spike(
+        &server.db,
+        &SPIKE_SETTINGS,
+        now + chrono::Duration::hours(1),
+    )
+    .await
+    .unwrap();
+    let all = spike_alerts(&server).await;
+    assert_eq!(all.len(), 2);
+    assert!(all.iter().all(|a| a["status"] == "resolved"), "{all:?}");
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn spike_skips_when_lock_held() {
+    let server = TestServer::start().await;
+    let (user, a) = member_agent(&server, "spike-lock").await;
+    let now = spike_now();
+    let latest = hour_of(now) - chrono::Duration::hours(1);
+    seed_baseline(&server, user, a, latest, 30, 1.0).await;
+    spike_usage(
+        &server,
+        user,
+        Some(a),
+        "direct_llm",
+        60.0,
+        latest + chrono::Duration::minutes(20),
+    )
+    .await;
+
+    let mut other = sqlx::PgConnection::connect(&server.db_url).await.unwrap();
+    sqlx::query("BEGIN").execute(&mut other).await.unwrap();
+    let got: bool =
+        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtext('alerts:spike'))")
+            .fetch_one(&mut other)
+            .await
+            .unwrap();
+    assert!(got);
+    assert_eq!(
+        tick_spike(&server.db, &SPIKE_SETTINGS, now).await.unwrap(),
+        0
+    );
+    assert!(spike_alerts(&server).await.is_empty());
+
+    sqlx::query("ROLLBACK").execute(&mut other).await.unwrap();
+    assert!(tick_spike(&server.db, &SPIKE_SETTINGS, now).await.unwrap() > 0);
+    drop(other);
+    server.cleanup().await;
+}
+
+async fn raise_marker(
+    server: &TestServer,
+    agent: Option<Uuid>,
+    hour: DateTime<Utc>,
+    title: &str,
+) -> Uuid {
+    let (scope, scope_ref, key) = match agent {
+        Some(id) => (
+            AlertScope::Agent,
+            Some(id.to_string()),
+            format!("spike:agent:{id}:{}", hour_key(hour)),
+        ),
+        None => (
+            AlertScope::Platform,
+            None,
+            format!("spike:platform:all:{}", hour_key(hour)),
+        ),
+    };
+    let mut conn = sqlx::PgConnection::connect(&server.db_url).await.unwrap();
+    let outcome = raise(
+        &mut conn,
+        &NewAlert {
+            kind: AlertKind::SpendSpike,
+            severity: Severity::Warning,
+            scope,
+            scope_ref,
+            dedup_key: key,
+            title: title.to_owned(),
+            message: "m".into(),
+            link: "/tokenops".into(),
+            details: json!({
+                "hour_start": hour.to_rfc3339_opts(SecondsFormat::Secs, true),
+                "spend_usd": 12.5, "threshold_usd": 3.0,
+            }),
+        },
+    )
+    .await
+    .unwrap();
+    match outcome {
+        RaiseOutcome::Opened(id) => id,
+        other => panic!("expected Opened, got {other:?}"),
+    }
+}
+
+async fn markers(
+    server: &TestServer,
+    who: Option<(Uuid, &str, bool)>,
+    query: &[(&str, String)],
+) -> (u16, Value) {
+    let mut rb = server.client.get(server.url("/api/alerts/spike-markers"));
+    rb = match who {
+        Some((id, name, true)) => common::as_superuser(rb, &id.to_string(), name),
+        Some((id, name, false)) => member(rb, id, name),
+        None => rb,
+    };
+    let resp = rb.query(query).send().await.expect("markers");
+    let status = resp.status().as_u16();
+    (status, resp.json().await.unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+#[serial]
+async fn spike_markers_scoping() {
+    let server = TestServer::start().await;
+    let root = seed_root(&server).await;
+    let (viewer, a) = member_agent(&server, "mark-a").await;
+    let (_other, b) = member_agent(&server, "mark-b").await;
+    let hour = hour_of(spike_now()) - chrono::Duration::hours(2);
+    let id_a = raise_marker(&server, Some(a), hour, "A spike").await;
+    raise_marker(&server, Some(b), hour, "B spike").await;
+    raise_marker(&server, None, hour, "Platform spike").await;
+    raise_marker(
+        &server,
+        Some(a),
+        hour - chrono::Duration::days(3),
+        "Old A spike",
+    )
+    .await;
+
+    let root_who = Some((root, "alerts-root", true));
+    let (status, body) = markers(&server, root_who, &[("range", "7d".into())]).await;
+    assert_eq!(status, 200);
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 4, "{body}");
+    for m in data {
+        assert!(DateTime::parse_from_rfc3339(m["hour_start"].as_str().unwrap()).is_ok());
+    }
+    let first = data
+        .iter()
+        .find(|m| m["alert_id"] == id_a.to_string())
+        .unwrap();
+    assert_eq!(first["scope"], "agent");
+    assert_eq!(first["agent_id"], a.to_string());
+    assert_eq!(first["severity"], "warning");
+    assert_eq!(first["title"], "A spike");
+    assert!((first["spend_usd"].as_f64().unwrap() - 12.5).abs() < 1e-9);
+    assert!((first["threshold_usd"].as_f64().unwrap() - 3.0).abs() < 1e-9);
+
+    // Window: the 3-day-old marker is outside range=24h... and so is everything
+    // older than a day, so only the 2h-old ones remain.
+    let (_, body) = markers(&server, root_who, &[("range", "24h".into())]).await;
+    assert_eq!(body["data"].as_array().unwrap().len(), 3);
+
+    let me = Some((viewer, "mark-a", false));
+    let (status, body) = markers(&server, me, &[("range", "7d".into())]).await;
+    assert_eq!(status, 200);
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 2, "{body}");
+    assert!(data.iter().all(|m| m["agent_id"] == a.to_string()));
+
+    let (status, _) = markers(&server, me, &[("agent_id", b.to_string())]).await;
+    assert_eq!(status, 404);
+
+    let (status, body) = markers(&server, root_who, &[("agent_id", a.to_string())]).await;
+    assert_eq!(status, 200);
+    let data = body["data"].as_array().unwrap();
+    assert!(!data.is_empty() && data.iter().all(|m| m["agent_id"] == a.to_string()));
+
+    let (status, _) = markers(&server, None, &[]).await;
+    assert_eq!(status, 401);
+    let (status, _) = markers(&server, root_who, &[("range", "9y".into())]).await;
+    assert_eq!(status, 400);
     server.cleanup().await;
 }
