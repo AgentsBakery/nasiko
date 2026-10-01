@@ -181,3 +181,18 @@ test('scopeRefLabel resolves agent names and shortens unknown ids', () => {
   assert.equal(A.scopeRefLabel('model', 'gpt-4o', names), 'gpt-4o');
   assert.equal(A.scopeRefLabel('platform', null, names), '');
 });
+
+test('isInternalLink accepts only single-slash internal paths', () => {
+  assert.equal(A.isInternalLink('/x'), true);
+  assert.equal(A.isInternalLink('//evil'), false);
+  assert.equal(A.isInternalLink('https://x'), false);
+  assert.equal(A.isInternalLink(null), false);
+});
+
+test('budgetUrl returns the internal budget path or null', () => {
+  assert.equal(A.budgetUrl({ details: { budget_url: '/budgets' } }), '/budgets');
+  assert.equal(A.budgetUrl({}), null);
+  assert.equal(A.budgetUrl(null), null);
+  assert.equal(A.budgetUrl({ details: { budget_url: 'https://evil' } }), null);
+  assert.equal(A.budgetUrl({ details: { budget_url: '//evil' } }), null);
+});

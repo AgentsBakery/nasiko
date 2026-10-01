@@ -7,6 +7,8 @@
 //! `budget_events` row exactly once. Router enforcement sections are appended
 //! under their own banners by later plans.
 //!
+//! The `end-to-end` section chains router block -> alert -> signed webhook.
+//!
 //! Requires infra (Postgres, Redis, S3 emulator):
 //!   cargo test -p nasiko-server --test budgets -- --test-threads=1
 
@@ -14,11 +16,16 @@ mod common;
 
 use chrono::{DateTime, Datelike, TimeZone, Utc};
 use common::TestServer;
+use hmac::{Hmac, Mac};
+use nasiko_config::AlertsConfig;
 use nasiko_llm_router::budget::keys::spend_key;
 use nasiko_llm_router::budget::period::{Period, period_bounds};
+use nasiko_server::alerts::tick_budget_events;
+use nasiko_server::notifications::dispatch::{DispatchDeps, tick_outbox_dispatch};
 use redis::AsyncCommands;
 use serde_json::{Value, json};
 use serial_test::serial;
+use sha2::Sha256;
 use uuid::Uuid;
 
 const EPS: f64 = 1e-6;
@@ -416,6 +423,74 @@ async fn me_is_scoped_to_caller() {
             assert!(row.get("spend_usd").is_some());
         }
     }
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn me_includes_accessible_agent_budgets_redacted() {
+    let server = TestServer::start().await;
+    let root = seed_root(&server).await;
+    let alice = seed_user(&server, "acc-alice", "member").await;
+    let bob = seed_user(&server, "acc-bob", "member").await;
+    let carol = seed_user(&server, "acc-carol", "member").await;
+    let agent = seed_agent(&server, alice, "acc-shared-agent").await;
+    sqlx::query(
+        "INSERT INTO agent_grants (agent_id, grant_type, grantee_id) VALUES ($1, 'user', $2)",
+    )
+    .bind(agent)
+    .bind(bob.to_string())
+    .execute(&server.db)
+    .await
+    .expect("seed grant");
+    create_budget(
+        &server,
+        root,
+        json!({"name": "shared-agent", "scope": "agent", "target_id": agent,
+               "period": "daily", "limit_usd": 3.0, "action": "block"}),
+    )
+    .await;
+
+    let me_rows = |id: Uuid, name: &'static str| {
+        let server = &server;
+        async move {
+            let resp = member(server.client.get(server.url("/api/budgets/me")), id, name)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            resp.json::<Value>().await.unwrap()["data"]
+                .as_array()
+                .unwrap()
+                .clone()
+        }
+    };
+
+    let bob_rows = me_rows(bob, "acc-bob").await;
+    let row = bob_rows
+        .iter()
+        .find(|r| r["name"] == "shared-agent")
+        .expect("grantee sees the agent budget");
+    for k in ["limit_usd", "spend_usd", "projected_usd"] {
+        assert!(row.get(k).is_none(), "grantee row leaks {k}");
+    }
+    for k in ["period", "pct_used", "state", "resets_at"] {
+        assert!(row.get(k).is_some(), "grantee row missing {k}");
+    }
+
+    let alice_rows = me_rows(alice, "acc-alice").await;
+    let row = alice_rows
+        .iter()
+        .find(|r| r["name"] == "shared-agent")
+        .expect("owner sees the agent budget");
+    assert!(row.get("limit_usd").is_some());
+    assert!(row.get("spend_usd").is_some());
+
+    let carol_rows = me_rows(carol, "acc-carol").await;
+    assert!(
+        carol_rows.iter().all(|r| r["name"] != "shared-agent"),
+        "unrelated member must not see the agent budget"
+    );
     server.cleanup().await;
 }
 
@@ -1841,5 +1916,150 @@ async fn event_period_start() {
             .await
             .expect("event row");
     assert_eq!(period_start, period_bounds(Period::Monthly, Utc::now()).0);
+    server.cleanup().await;
+}
+
+// ─── end-to-end: block -> alert -> signed webhook ────────────────────────────
+
+const E2E_HMAC_SECRET: &str = "e2e-secret";
+
+type CapturedRequest = (Vec<(String, String)>, Vec<u8>);
+
+/// Headers and body of the last request the webhook mock matched.
+fn capture_slot() -> std::sync::Arc<std::sync::Mutex<Option<CapturedRequest>>> {
+    std::sync::Arc::new(std::sync::Mutex::new(None))
+}
+
+#[tokio::test]
+#[serial]
+async fn block_to_signed_webhook_end_to_end() {
+    let _upstream = stub_upstream_big_usage().await;
+    let server = TestServer::start_with(|c| c.alerts.allow_private_urls = true).await;
+    let root = seed_root(&server).await;
+
+    let slot = capture_slot();
+    let matcher_slot = slot.clone();
+    let mut receiver = mockito::Server::new_async().await;
+    let hook = receiver
+        .mock("POST", "/hook")
+        .match_request(move |req| {
+            let headers = req
+                .headers()
+                .iter()
+                .map(|(k, v)| (k.as_str().to_owned(), v.to_str().unwrap_or("").to_owned()))
+                .collect();
+            *matcher_slot.lock().unwrap() =
+                Some((headers, req.body().cloned().unwrap_or_default()));
+            true
+        })
+        .with_status(200)
+        .expect(1)
+        .create_async()
+        .await;
+
+    let resp = admin(
+        root,
+        server.client.post(server.url("/api/notification-channels")),
+    )
+    .json(&json!({
+        "name": "e2e-hook", "kind": "webhook",
+        "url": format!("{}/hook", receiver.url()), "hmac_secret": E2E_HMAC_SECRET,
+    }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 201, "create channel");
+    let channel: Uuid = resp.json::<Value>().await.unwrap()["data"]["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    // Only budget_hard is routed so a soft_threshold event cannot add a second POST.
+    let resp = admin(
+        root,
+        server
+            .client
+            .put(server.url(&format!("/api/notification-channels/{channel}/routes"))),
+    )
+    .json(&json!({"routes": [{"alert_kind": "budget_hard", "min_severity": "info"}]}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200, "put routes");
+
+    let c = caller(&server, "e2e-user").await;
+    let id = create_budget(&server, root, user_budget("e2e", c.user, 0.0001)).await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    assert_eq!(chat(&server, &c).await.status(), 200, "first call passes");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        let view = get_budget(&server, root, &id).await;
+        if view["spend_usd"].as_f64().unwrap_or(0.0) >= view["limit_usd"].as_f64().unwrap() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "counter did not reflect the call within 1s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(chat(&server, &c).await.status(), 429, "next call blocked");
+    assert_eq!(wait_event_count(&server, &id, "hard_limit", 1).await, 1);
+
+    assert!(tick_budget_events(&server.db, Utc::now()).await.unwrap() >= 1);
+    let alerts: Vec<Value> =
+        sqlx::query_scalar("SELECT to_jsonb(a) FROM alerts a WHERE kind = 'budget_hard'")
+            .fetch_all(&server.db)
+            .await
+            .unwrap();
+    assert_eq!(alerts.len(), 1);
+    let alert = &alerts[0];
+    assert_eq!(alert["status"], "open");
+    assert!(alert["dedup_key"].as_str().unwrap().ends_with(":hard"));
+    assert_eq!(alert["link"], "/tokenops?range=30d");
+    assert_eq!(alert["details"]["budget_url"], "/budgets");
+
+    let outbox_ids: Vec<Uuid> =
+        sqlx::query_scalar("SELECT id FROM notification_outbox WHERE channel_id = $1")
+            .bind(channel)
+            .fetch_all(&server.db)
+            .await
+            .unwrap();
+    assert_eq!(outbox_ids.len(), 1, "exactly one outbox row");
+
+    let mut cfg = AlertsConfig::disabled();
+    cfg.allow_private_urls = true;
+    let stats = tick_outbox_dispatch(&server.db, &DispatchDeps::from_config(&cfg))
+        .await
+        .unwrap();
+    assert_eq!((stats.claimed, stats.delivered), (1, 1));
+    hook.assert_async().await;
+
+    let (headers, body) = slot.lock().unwrap().clone().expect("webhook captured");
+    let header = |name: &str| {
+        headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    };
+    let ts: i64 = header("x-nasiko-timestamp").unwrap().parse().unwrap();
+    let mut mac = Hmac::<Sha256>::new_from_slice(E2E_HMAC_SECRET.as_bytes()).unwrap();
+    mac.update(format!("{ts}.").as_bytes());
+    mac.update(&body);
+    let expected = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+    assert_eq!(header("x-nasiko-signature"), Some(expected));
+
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["alert"]["kind"], "budget_hard");
+    assert_eq!(v["alert"]["link"], "/tokenops?range=30d");
+    let status: String = sqlx::query_scalar("SELECT status FROM notification_outbox WHERE id = $1")
+        .bind(outbox_ids[0])
+        .fetch_one(&server.db)
+        .await
+        .unwrap();
+    assert_eq!(status, "delivered");
     server.cleanup().await;
 }

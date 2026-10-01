@@ -203,7 +203,8 @@ async fn budget_soft_event_raises_one_warning_alert() {
     assert_eq!(a["scope"], "user");
     assert_eq!(a["scope_ref"], user.to_string());
     assert_eq!(a["status"], "open");
-    assert_eq!(a["link"], "/budgets");
+    assert_eq!(a["link"], "/tokenops?range=30d");
+    assert_eq!(a["details"]["budget_url"], "/budgets");
     assert_eq!(a["occurrences"], 1);
     assert_eq!(
         a["dedup_key"],
@@ -231,6 +232,75 @@ async fn budget_soft_event_raises_one_warning_alert() {
         rows,
         "second tick changes nothing"
     );
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn agent_budget_alert_links_tokenops_agent_view() {
+    let server = TestServer::start().await;
+    let root = seed_root(&server).await;
+    let owner = seed_user(&server, "link-owner", "member").await;
+    let agent: Uuid =
+        sqlx::query_scalar("INSERT INTO agents (name, owner_id) VALUES ($1, $2) RETURNING id")
+            .bind("link-agent")
+            .bind(owner)
+            .fetch_one(&server.db)
+            .await
+            .expect("seed agent");
+    let agent_budget = create_budget(
+        &server,
+        root,
+        json!({"name": "agent daily", "scope": "agent", "target_id": agent,
+               "period": "daily", "limit_usd": 5.0, "action": "block"}),
+    )
+    .await;
+    let platform_budget = create_budget(
+        &server,
+        root,
+        json!({"name": "platform weekly", "scope": "platform",
+               "period": "weekly", "limit_usd": 50.0, "action": "block"}),
+    )
+    .await;
+
+    let now = Utc::now();
+    let day_start = Utc
+        .with_ymd_and_hms(now.year(), now.month(), now.day(), 0, 0, 0)
+        .unwrap();
+    let week_start =
+        day_start - chrono::Duration::days(now.weekday().num_days_from_monday().into());
+    insert_event(
+        &server,
+        agent_budget["id"].as_str().unwrap(),
+        day_start,
+        "soft_threshold",
+        4.5,
+        5.0,
+    )
+    .await;
+    insert_event(
+        &server,
+        platform_budget["id"].as_str().unwrap(),
+        week_start,
+        "soft_threshold",
+        45.0,
+        50.0,
+    )
+    .await;
+    assert_eq!(tick_budget_events(&server.db, now).await.unwrap(), 2);
+
+    let rows = alert_rows(&server).await;
+    let link_of = |scope: &str| {
+        rows.iter()
+            .find(|r| r["scope"] == scope)
+            .unwrap_or_else(|| panic!("no {scope} alert"))["link"]
+            .clone()
+    };
+    assert_eq!(
+        link_of("agent"),
+        format!("/tokenops?agent={agent}&range=24h")
+    );
+    assert_eq!(link_of("platform"), "/tokenops?range=7d");
     server.cleanup().await;
 }
 
@@ -1370,7 +1440,7 @@ async fn budget_alert_delivered_with_hmac() {
     let v: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["event"], "opened");
     assert_eq!(v["alert"]["kind"], "budget_soft");
-    assert_eq!(v["alert"]["link"], "/budgets");
+    assert_eq!(v["alert"]["link"], "/tokenops?range=30d");
     assert!(v["sent_at"].is_string());
 
     assert_eq!(row["status"], "delivered");
