@@ -18,11 +18,13 @@ use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 use serde_json::Value;
 use tracing::Instrument;
+use uuid::Uuid;
 
 use futures::stream::BoxStream;
 
 use crate::LlmRouterCtx;
 use crate::auth::verify_agent_jwt;
+use crate::budget;
 use crate::error::GatewayError;
 use crate::inbound::{ChatStreamRenderer, InboundFormat, inbound_for};
 use crate::ir::{ChatChunk, Usage};
@@ -207,6 +209,28 @@ async fn chat_core(
         attribution_source,
     } = routed;
 
+    // ── budget seam ───────────────────────────────────────────────────────────────────────
+    // The one place chat, messages and gemini (stream and non-stream) are gated, and it runs
+    // before the compress seam and any `fallback::execute_*`, so a blocked call never reaches
+    // a provider. `owner_id` is the BILLED user (the flow's user, or the JWT owner for coding
+    // agents), which is exactly whose user budget the usage row will later count against.
+    let budget_subject = budget::BudgetSubject {
+        user_id: Uuid::parse_str(&owner_id).ok(),
+        agent_id: Uuid::parse_str(&agent_id).ok(),
+        downgrade: if resolved.pinned_model.is_some() {
+            budget::DowngradePolicy::BlockInstead
+        } else {
+            budget::DowngradePolicy::Allowed
+        },
+    };
+    let budget_decision = budget::enforce(&ctx.budgets, &budget_subject, format).await?;
+    tracing::debug!(
+        target: "nasiko::llm_router::budget",
+        %agent_id,
+        ?budget_decision,
+        "chat_core: budget decision"
+    );
+
     // ── compression seam ──────────────────────────────────────────────────────────────────
     // After `resolve_routed_request`, not before it: `RequestSignals` (built at :159 from
     // `req.messages`) feeds the classifier, the salience gate and the `conv_id` that keys the
@@ -371,6 +395,7 @@ async fn chat_core(
     usage::spawn_log(
         ctx.db.clone(),
         ctx.pricing.clone(),
+        ctx.budgets.clone(),
         UsageRecord {
             owner_id,
             agent_id,
@@ -585,6 +610,7 @@ fn stream_chat(args: StreamChatArgs<'_>) -> Result<Response, GatewayError> {
     let guard = UsageGuard {
         db: ctx.db.clone(),
         pricing: ctx.pricing.clone(),
+        budgets: ctx.budgets.clone(),
         span,
         owner_id,
         agent_id,
@@ -653,6 +679,7 @@ struct StreamState {
 struct UsageGuard {
     db: sqlx::PgPool,
     pricing: Arc<nasiko_pricing::PricingEngine>,
+    budgets: Arc<budget::BudgetEngine>,
     span: tracing::Span,
     owner_id: String,
     agent_id: String,
@@ -677,6 +704,7 @@ impl Drop for UsageGuard {
         usage::spawn_log(
             self.db.clone(),
             self.pricing.clone(),
+            self.budgets.clone(),
             UsageRecord {
                 owner_id: self.owner_id.clone(),
                 agent_id: self.agent_id.clone(),
@@ -810,6 +838,7 @@ mod tests {
             let guard = UsageGuard {
                 db: ctx.db,
                 pricing: Arc::new(nasiko_pricing::PricingEngine::offline()),
+                budgets: Arc::new(budget::BudgetEngine::disabled()),
                 span,
                 // An invalid owner skips the asynchronous database write in this
                 // span-lifetime test; persistence is covered by integration tests.
@@ -929,6 +958,7 @@ mod tests {
             pricing: Arc::new(nasiko_pricing::PricingEngine::new(
                 PgPool::connect_lazy("postgres://u:p@127.0.0.1:5999/none").unwrap(),
             )),
+            budgets: Arc::new(crate::budget::BudgetEngine::disabled()),
         }
     }
 

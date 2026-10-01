@@ -86,9 +86,20 @@ pub struct LlmRouterCtx {
     /// through this — the DB trigger that used to do it returned NULL for any
     /// model missing from `model_pricing`, which booked 92.8% of calls at $0.
     pub pricing: Arc<PricingEngine>,
+    /// Dollar-budget engine: pre-call enforcement and post-call counters. Shared
+    /// with the host (see [`LlmRouterCtx::with_budgets`]) so a budget change made
+    /// through the host's API invalidates the same definitions snapshot the
+    /// router reads.
+    pub budgets: Arc<budget::BudgetEngine>,
 }
 
 impl LlmRouterCtx {
+    /// Replace the budget engine, typically with the host's own instance.
+    pub fn with_budgets(mut self, budgets: Arc<budget::BudgetEngine>) -> Self {
+        self.budgets = budgets;
+        self
+    }
+
     /// Build from resources the host already owns (the server's `PgPool` + HTTP
     /// client). Gateway-specific config is read from the environment.
     pub fn from_shared(db: PgPool, http: reqwest::Client) -> Self {
@@ -128,6 +139,17 @@ impl LlmRouterCtx {
         let cfg = Arc::new(cfg);
         let salience_gate = build_salience_gate(&cfg);
         let pricing = Arc::new(PricingEngine::new(db.clone()));
+        let redis = match redis::Client::open(cfg.redis_url.as_str()) {
+            Ok(client) if !cfg.redis_url.is_empty() => Some(client),
+            _ => {
+                tracing::warn!(
+                    target: "nasiko::llm_router::startup",
+                    "llm-router: no usable REDIS_URL; any call covered by a budget will fail closed"
+                );
+                None
+            }
+        };
+        let budgets = Arc::new(budget::BudgetEngine::new(db.clone(), redis));
         Self {
             db,
             http,
@@ -138,6 +160,7 @@ impl LlmRouterCtx {
             cell_store,
             salience_gate,
             pricing,
+            budgets,
         }
     }
 }

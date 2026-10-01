@@ -14,6 +14,8 @@ use nasiko_pricing::{PricingEngine, PromptConvention, RawUsage};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::budget::BudgetEngine;
+use crate::budget::keys::usd_to_micros;
 use crate::ir::Usage;
 use crate::routing::attribution::AttributionSource;
 
@@ -60,18 +62,24 @@ pub struct UsageRecord {
 }
 
 /// Spawn the usage write so it never blocks the response.
-pub fn spawn_log(db: PgPool, pricing: Arc<PricingEngine>, record: UsageRecord) {
+pub fn spawn_log(
+    db: PgPool,
+    pricing: Arc<PricingEngine>,
+    budgets: Arc<BudgetEngine>,
+    record: UsageRecord,
+) {
     tokio::spawn(async move {
-        if let Err(e) = log_usage(db, pricing.as_ref(), record).await {
+        if let Err(e) = log_usage(db, pricing.as_ref(), budgets.as_ref(), record).await {
             tracing::warn!(error = %e, "llm_usage write failed (swallowed)");
         }
     });
 }
 
-/// Insert one priced `token_usage` row.
+/// Insert one priced `token_usage` row and reconcile the budget counters with it.
 pub async fn log_usage(
     db: PgPool,
     pricing: &PricingEngine,
+    budgets: &BudgetEngine,
     record: UsageRecord,
 ) -> Result<(), String> {
     // token_usage.user_id is NOT NULL + FK to users(id); without a valid owner we
@@ -140,6 +148,23 @@ pub async fn log_usage(
         brevity: record.brevity_metadata,
     });
 
+    // Counters are bumped before the INSERT so a sequential follow-up call sees
+    // the new spend as early as possible (ENF-06); keys that did not exist are
+    // rebuilt after it so their SUM includes this row. Invariant: every row
+    // reaching this function has `operation_type` in {'direct_llm','embedding'},
+    // exactly the set the budget rebuild SUM filters on, so live increments and
+    // rebuilds count the same spend; a new operation_type written here requires
+    // updating that filter (`budget::SUM_*`).
+    let budget_now = Utc::now();
+    let budget_outcome = budgets
+        .record(
+            owner,
+            agent,
+            usd_to_micros(priced.cost.total_usd),
+            budget_now,
+        )
+        .await;
+
     sqlx::query(
         r#"INSERT INTO token_usage
                (user_id, agent_id, operation_type, provider, model,
@@ -173,6 +198,7 @@ pub async fn log_usage(
     .execute(&db)
     .await
     .map_err(|e| e.to_string())?;
+    budgets.finish_record(budget_outcome, budget_now).await;
     Ok(())
 }
 

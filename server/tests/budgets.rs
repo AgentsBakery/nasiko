@@ -560,6 +560,8 @@ fn set_router_env(upstream_url: &str) {
 /// body ending in a usage chunk.
 async fn stub_upstream_big_usage() -> mockito::ServerGuard {
     let mut upstream = mockito::Server::new_async().await;
+    // mockito prefers the most recently created matching mock, so the catch-all
+    // JSON mock is registered first and the stricter streaming mock last.
     let sse = format!(
         "data: {{\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o-mini\",\
          \"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":\"hi\"}}}}]}}\n\n\
@@ -569,15 +571,6 @@ async fn stub_upstream_big_usage() -> mockito::ServerGuard {
          \"total_tokens\":{}}}}}\n\ndata: [DONE]\n\n",
         BIG_PROMPT_TOKENS + 7
     );
-    upstream
-        .mock("POST", "/chat/completions")
-        .match_body(mockito::Matcher::PartialJson(json!({"stream": true})))
-        .with_status(200)
-        .with_header("content-type", "text/event-stream")
-        .with_body(sse)
-        .expect_at_least(0)
-        .create_async()
-        .await;
     upstream
         .mock("POST", "/chat/completions")
         .with_status(200)
@@ -591,6 +584,15 @@ async fn stub_upstream_big_usage() -> mockito::ServerGuard {
                           "total_tokens":{}}}}}"#,
             BIG_PROMPT_TOKENS + 7
         ))
+        .expect_at_least(0)
+        .create_async()
+        .await;
+    upstream
+        .mock("POST", "/chat/completions")
+        .match_body(mockito::Matcher::PartialJson(json!({"stream": true})))
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(sse)
         .expect_at_least(0)
         .create_async()
         .await;
@@ -795,6 +797,9 @@ async fn block_budget_rejects_every_dialect_before_upstream() {
         ("/v1/embeddings", embeddings_body()),
     ];
     for (path, body) in cases {
+        // Taken before the call so the bound below can only be looser than the
+        // server's own clock reading (Retry-After rounds up).
+        let sent_at = Utc::now();
         let resp = post_llm(&server, path, &c.jwt, Some(&c.traceparent), &body).await;
         assert_eq!(resp.status(), 429, "{path}");
         let secs = retry_after(&resp);
@@ -805,7 +810,7 @@ async fn block_budget_rejects_every_dialect_before_upstream() {
             .unwrap()
             .parse()
             .unwrap();
-        let until_reset = (resets - Utc::now()).num_seconds();
+        let until_reset = (resets - sent_at).num_milliseconds().div_euclid(1000) + 1;
         assert!(
             secs > 0 && (secs as i64) <= until_reset + 1,
             "{path}: Retry-After {secs} vs {until_reset}"

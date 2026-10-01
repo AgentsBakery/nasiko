@@ -14,10 +14,13 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use super::chat::{RequestSignals, RoutedRequest, authenticate_request, resolve_routed_request};
 use crate::LlmRouterCtx;
+use crate::budget;
 use crate::error::GatewayError;
+use crate::inbound::InboundFormat;
 use crate::inbound::responses::{
     ResponsesRequest, ResponsesStreamRenderer, TerminalOutcome, parse_request, render_response,
 };
@@ -129,6 +132,25 @@ async fn responses_core(
         signals,
     )
     .await?;
+    // Budget seam: before any provider attempt is built, so a blocked call never reaches
+    // upstream. `routed.owner_id` is the billed user the usage row will count against.
+    let budget_subject = budget::BudgetSubject {
+        user_id: Uuid::parse_str(&routed.owner_id).ok(),
+        agent_id: Uuid::parse_str(&routed.agent_id).ok(),
+        downgrade: if routed.resolved.pinned_model.is_some() {
+            budget::DowngradePolicy::BlockInstead
+        } else {
+            budget::DowngradePolicy::Allowed
+        },
+    };
+    let budget_decision =
+        budget::enforce(&ctx.budgets, &budget_subject, InboundFormat::OpenAi).await?;
+    tracing::debug!(
+        target: "nasiko::llm_router::budget",
+        agent_id = %routed.agent_id,
+        ?budget_decision,
+        "responses_core: budget decision"
+    );
     let attempts = fallback::build_attempts(&routed.resolved, &ctx.cfg);
     let native_primary = routed.resolved.provider == "openai";
     let mut translated = if native_primary {
@@ -821,7 +843,12 @@ impl Drop for AttemptGuard {
             record.latency_ms = record
                 .latency_ms
                 .max(self.started.elapsed().as_millis() as i64);
-            usage::spawn_log(self.ctx.db.clone(), self.ctx.pricing.clone(), record);
+            usage::spawn_log(
+                self.ctx.db.clone(),
+                self.ctx.pricing.clone(),
+                self.ctx.budgets.clone(),
+                record,
+            );
         }
     }
 }
@@ -842,6 +869,7 @@ fn log_response_usage(
     usage::spawn_log(
         ctx.db.clone(),
         ctx.pricing.clone(),
+        ctx.budgets.clone(),
         UsageRecord {
             owner_id: routed.owner_id,
             agent_id: routed.agent_id,
@@ -1062,6 +1090,7 @@ mod tests {
             pricing: Arc::new(nasiko_pricing::PricingEngine::new(
                 PgPool::connect_lazy("postgres://u:p@127.0.0.1:5999/none").unwrap(),
             )),
+            budgets: Arc::new(crate::budget::BudgetEngine::disabled()),
         }
     }
 

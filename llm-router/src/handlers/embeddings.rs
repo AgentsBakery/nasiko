@@ -9,9 +9,11 @@ use axum::http::HeaderMap;
 use axum::http::header::AUTHORIZATION;
 use axum::response::{IntoResponse, Response};
 use serde_json::Value;
+use uuid::Uuid;
 
 use crate::LlmRouterCtx;
 use crate::auth::verify_agent_jwt;
+use crate::budget;
 use crate::error::GatewayError;
 use crate::inbound::{InboundFormat, inbound_for};
 use crate::providers::fallback;
@@ -71,6 +73,23 @@ async fn embeddings_core(
     };
     let resolved = resolve(store, &ctx.cache, &ctx.cfg, &agent_id, &owner_id, hint).await?;
 
+    // Billed to the flow's caller (strict attribution guarantees a flow); the JWT's owner
+    // is only the no-user safety net. The budget subject and the usage row use the same id.
+    let billed_user = attribution
+        .user_id
+        .map(|u| u.to_string())
+        .unwrap_or(owner_id);
+
+    // Budget seam: before the upstream call. Embeddings have no cheaper model to fall back
+    // to, so a downgrade budget is served unchanged until its ceiling (`ServeAsIs`) and the
+    // `Ok` decision is not acted on.
+    let budget_subject = budget::BudgetSubject {
+        user_id: Uuid::parse_str(&billed_user).ok(),
+        agent_id: Uuid::parse_str(&agent_id).ok(),
+        downgrade: budget::DowngradePolicy::ServeAsIs,
+    };
+    budget::enforce(&ctx.budgets, &budget_subject, InboundFormat::OpenAi).await?;
+
     // Ordered fallbacks (same rules as chat); usage records the effective provider/model.
     let started = Instant::now();
     let (resp, (provider, model)) =
@@ -80,13 +99,9 @@ async fn embeddings_core(
     usage::spawn_log(
         ctx.db.clone(),
         ctx.pricing.clone(),
+        ctx.budgets.clone(),
         UsageRecord {
-            // Billed to the flow's caller (strict attribution guarantees a
-            // flow); the JWT's owner is only the no-user safety net.
-            owner_id: attribution
-                .user_id
-                .map(|u| u.to_string())
-                .unwrap_or(owner_id),
+            owner_id: billed_user,
             agent_id,
             operation_type: "embedding",
             provider,
@@ -188,6 +203,7 @@ mod tests {
             pricing: Arc::new(nasiko_pricing::PricingEngine::new(
                 PgPool::connect_lazy("postgres://u:p@127.0.0.1:5999/none").unwrap(),
             )),
+            budgets: Arc::new(crate::budget::BudgetEngine::disabled()),
         }
     }
 
