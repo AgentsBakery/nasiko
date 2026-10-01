@@ -1,6 +1,14 @@
 /* Budgets: admin management table and the read-only "My budgets" view. */
 
 @scope (budgets-page) {
+  /* Host box matches tokenops-page (page-layout.css: s-24 / s-32). It is
+     declared here because budgets-page is not in that file's selector list;
+     moving it there would keep first-paint geometry in one place. */
+  :scope {
+    display: block;
+    padding: var(--s-24) var(--s-32);
+  }
+
   .page-head {
     display: flex;
     align-items: center;
