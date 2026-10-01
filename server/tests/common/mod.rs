@@ -463,6 +463,7 @@ fn test_config(db_url: String, redis_url: String, s3_endpoint: String) -> Config
         docker_agent_network: None,
         oci_registry_host: None,
         container_hours_poll_secs: 0, // disabled so the background loop never races tests driving reconcile_once directly
+        alerts: nasiko_config::AlertsConfig::disabled(),
         trace_usage_sync_secs: 0,
         trace_usage_overlap_secs: 600,
         trace_usage_batch_size: 50,

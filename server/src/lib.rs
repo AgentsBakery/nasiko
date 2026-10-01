@@ -10,6 +10,7 @@ pub mod admission;
 pub mod agent_lifecycle;
 pub mod agent_proxy;
 pub mod agents;
+pub mod alerts;
 pub mod auth;
 pub mod budgets;
 pub mod build;

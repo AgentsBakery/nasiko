@@ -1,5 +1,84 @@
 use nasiko_utils::{env_bool, env_or, env_parse, required_env};
 
+// ─── Alerts ─────────────────────────────────────────────────────────────────
+
+const DEFAULT_ALERTS_BUDGET_EVENTS_SECS: u64 = 15;
+const DEFAULT_ALERTS_RESOLVE_SWEEP_SECS: u64 = 60;
+const DEFAULT_ALERTS_OUTBOX_SECS: u64 = 5;
+const DEFAULT_ALERTS_MONITORS_SECS: u64 = 60;
+const DEFAULT_ALERTS_SPIKE_SECS: u64 = 300;
+const DEFAULT_ALERTS_SPIKE_SIGMA: f64 = 3.0;
+const DEFAULT_ALERTS_SPIKE_FLOOR_USD: f64 = 5.0;
+
+/// Alerting and notification settings (nested in [`Config::alerts`]).
+///
+/// Every `*_secs` interval gates one background worker: 0 disables it, which
+/// is how tests drive the `tick_*` functions directly without a racing loop.
+#[derive(Debug, Clone)]
+pub struct AlertsConfig {
+    /// Poll interval for turning `budget_events` into alerts. 0 disables.
+    pub budget_events_secs: u64,
+    /// Poll interval for the alert resolver sweep. 0 disables.
+    pub resolve_sweep_secs: u64,
+    /// Poll interval for the notification outbox dispatcher. 0 disables.
+    pub outbox_secs: u64,
+    /// Poll interval for error-rate / latency monitors. 0 disables.
+    pub monitors_secs: u64,
+    /// Poll interval for the spend-spike detector. 0 disables.
+    pub spike_secs: u64,
+    /// Spike threshold: baseline mean plus this many standard deviations.
+    pub spike_sigma: f64,
+    /// Spend (USD per hour) below which a spike is never raised.
+    pub spike_floor_usd: f64,
+    /// Origin prepended to alert links in notifications. Empty keeps links
+    /// relative. `ALERTS_PUBLIC_BASE_URL`, falling back to `APP_BASE_URL`.
+    pub public_base_url: String,
+    /// Dev/test only: relaxes the https requirement, the private-address
+    /// check and the Slack host pin on notification channel URLs.
+    pub allow_private_urls: bool,
+}
+
+impl AlertsConfig {
+    pub fn from_env() -> Self {
+        let public_base_url = std::env::var("ALERTS_PUBLIC_BASE_URL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| env_or("APP_BASE_URL", ""));
+        Self {
+            budget_events_secs: env_parse(
+                "ALERTS_BUDGET_EVENTS_SECS",
+                DEFAULT_ALERTS_BUDGET_EVENTS_SECS,
+            ),
+            resolve_sweep_secs: env_parse(
+                "ALERTS_RESOLVE_SWEEP_SECS",
+                DEFAULT_ALERTS_RESOLVE_SWEEP_SECS,
+            ),
+            outbox_secs: env_parse("ALERTS_OUTBOX_SECS", DEFAULT_ALERTS_OUTBOX_SECS),
+            monitors_secs: env_parse("ALERTS_MONITORS_SECS", DEFAULT_ALERTS_MONITORS_SECS),
+            spike_secs: env_parse("ALERTS_SPIKE_SECS", DEFAULT_ALERTS_SPIKE_SECS),
+            spike_sigma: env_parse("ALERTS_SPIKE_SIGMA", DEFAULT_ALERTS_SPIKE_SIGMA),
+            spike_floor_usd: env_parse("ALERTS_SPIKE_FLOOR_USD", DEFAULT_ALERTS_SPIKE_FLOOR_USD),
+            public_base_url: public_base_url.trim_end_matches('/').to_owned(),
+            allow_private_urls: env_bool("ALERTS_ALLOW_PRIVATE_URLS", false),
+        }
+    }
+
+    /// All workers off, default thresholds. Used by tests and benches.
+    pub fn disabled() -> Self {
+        Self {
+            budget_events_secs: 0,
+            resolve_sweep_secs: 0,
+            outbox_secs: 0,
+            monitors_secs: 0,
+            spike_secs: 0,
+            spike_sigma: DEFAULT_ALERTS_SPIKE_SIGMA,
+            spike_floor_usd: DEFAULT_ALERTS_SPIKE_FLOOR_USD,
+            public_base_url: String::new(),
+            allow_private_urls: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind: String,
@@ -215,6 +294,8 @@ pub struct Config {
     pub oci_registry_host: Option<String>,
     /// Poll interval in seconds for the container-hours meter. 0 disables metering.
     pub container_hours_poll_secs: u64,
+    /// Alerting workers, thresholds and notification URL policy.
+    pub alerts: AlertsConfig,
 
     // ─── Trace Materializer ─────────────────────────────────────────────────
     /// Poll interval in seconds for the trace-usage materializer. 0 disables.
@@ -462,6 +543,7 @@ impl Config {
                 .ok()
                 .filter(|s| !s.is_empty()),
             container_hours_poll_secs: env_parse("CONTAINER_HOURS_POLL_SECS", 60),
+            alerts: AlertsConfig::from_env(),
             trace_usage_sync_secs: env_parse("TRACE_USAGE_SYNC_SECS", 120),
             trace_usage_overlap_secs: env_parse("TRACE_USAGE_OVERLAP_SECS", 600),
             trace_usage_batch_size: env_parse("TRACE_USAGE_BATCH_SIZE", 50),

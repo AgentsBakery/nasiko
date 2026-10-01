@@ -175,6 +175,7 @@ pub fn build_bench_config(database_url: String, mock_llm_base_url: &str) -> Conf
         admin_username: "admin".into(),
         admin_password: "bench-admin-password".into(),
         container_hours_poll_secs: 60,
+        alerts: nasiko_config::AlertsConfig::disabled(),
         trace_usage_sync_secs: 0,
         trace_usage_overlap_secs: 600,
         trace_usage_batch_size: 50,
