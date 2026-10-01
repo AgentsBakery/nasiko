@@ -1250,3 +1250,595 @@ async fn increment_failure_forces_rebuild() {
     );
     server.cleanup().await;
 }
+
+// ─── downgrade (ENF-03) ──────────────────────────────────────────────────────
+
+const DOWNGRADED_HEADER: &str = "x-nasiko-budget-downgraded";
+const ORIGINAL_MODEL_HEADER: &str = "x-nasiko-original-model";
+const PRICEY_MODEL: &str = "gpt-4o";
+const CHEAP_MODEL: &str = "gpt-4o-mini";
+
+/// Operator Tier3 override for `provider` (what the router downgrades to).
+async fn seed_tier3(server: &TestServer, provider: &str, model: &str) {
+    sqlx::query(
+        "INSERT INTO model_registry (provider, tier, model) VALUES ($1, 3, $2) \
+         ON CONFLICT (provider, tier) DO UPDATE SET model = EXCLUDED.model",
+    )
+    .bind(provider)
+    .bind(model)
+    .execute(&server.db)
+    .await
+    .expect("seed tier3");
+}
+
+async fn set_counter(key: &str, micros: i64) {
+    let mut conn = redis_client()
+        .get_multiplexed_async_connection()
+        .await
+        .expect("redis conn");
+    let _: () = conn.set_ex(key, micros, 3600).await.expect("set counter");
+}
+
+async fn event_count(server: &TestServer, budget_id: &str, kind: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM budget_events WHERE budget_id = $1::uuid AND kind = $2",
+    )
+    .bind(budget_id)
+    .bind(kind)
+    .fetch_one(&server.db)
+    .await
+    .expect("event count")
+}
+
+/// Poll until `kind` has `want` rows for the budget (or 2 s pass); returns the count.
+async fn wait_event_count(server: &TestServer, budget_id: &str, kind: &str, want: i64) -> i64 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let n = event_count(server, budget_id, kind).await;
+        if n >= want || std::time::Instant::now() >= deadline {
+            return n;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+/// Poll until `n` router usage rows written after `since` exist for `user`.
+async fn wait_usage_rows(server: &TestServer, user: Uuid, since: DateTime<Utc>, n: i64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let got: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM token_usage WHERE user_id = $1 AND created_at >= $2",
+        )
+        .bind(user)
+        .bind(since)
+        .fetch_one(&server.db)
+        .await
+        .expect("usage count");
+        if got >= n || std::time::Instant::now() >= deadline {
+            assert!(got >= n, "expected {n} usage rows, saw {got}");
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+/// `(model, metadata)` of the newest usage row written after `since`.
+async fn newest_usage_row(
+    server: &TestServer,
+    user: Uuid,
+    since: DateTime<Utc>,
+) -> (String, Value) {
+    wait_usage_rows(server, user, since, 1).await;
+    let (model, metadata): (String, String) = sqlx::query_as(
+        "SELECT model, metadata::text FROM token_usage WHERE user_id = $1 AND created_at >= $2 \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(user)
+    .bind(since)
+    .fetch_one(&server.db)
+    .await
+    .expect("usage row");
+    (
+        model,
+        serde_json::from_str(&metadata).expect("metadata json"),
+    )
+}
+
+/// Upstream that serves the cheap model with a large usage block and must never
+/// see the pricey model. Mocks are registered pricey-last-irrelevant: the body
+/// matchers are disjoint, so ordering does not matter.
+struct DowngradeUpstream {
+    server: mockito::ServerGuard,
+    pricey_chat: mockito::Mock,
+    pricey_responses: mockito::Mock,
+    cheap_chat: mockito::Mock,
+    cheap_stream: mockito::Mock,
+    cheap_responses: mockito::Mock,
+}
+
+async fn downgrade_upstream() -> DowngradeUpstream {
+    let mut upstream = mockito::Server::new_async().await;
+    let model_is = |m: &str| mockito::Matcher::PartialJson(json!({"model": m}));
+    let pricey_chat = upstream
+        .mock("POST", "/chat/completions")
+        .match_body(model_is(PRICEY_MODEL))
+        .expect(0)
+        .create_async()
+        .await;
+    let pricey_responses = upstream
+        .mock("POST", "/responses")
+        .match_body(model_is(PRICEY_MODEL))
+        .expect(0)
+        .create_async()
+        .await;
+    let cheap_chat = upstream
+        .mock("POST", "/chat/completions")
+        .match_body(model_is(CHEAP_MODEL))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(format!(
+            r#"{{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"{CHEAP_MODEL}",
+                "choices":[{{"index":0,"message":{{"role":"assistant","content":"hi"}},
+                            "finish_reason":"stop"}}],
+                "usage":{{"prompt_tokens":{BIG_PROMPT_TOKENS},"completion_tokens":7,
+                          "total_tokens":{}}}}}"#,
+            BIG_PROMPT_TOKENS + 7
+        ))
+        .expect_at_least(0)
+        .create_async()
+        .await;
+    let sse = format!(
+        "data: {{\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"{CHEAP_MODEL}\",\
+         \"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":\"hi\"}}}}]}}\n\n\
+         data: {{\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"{CHEAP_MODEL}\",\
+         \"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}],\
+         \"usage\":{{\"prompt_tokens\":{BIG_PROMPT_TOKENS},\"completion_tokens\":7,\
+         \"total_tokens\":{}}}}}\n\ndata: [DONE]\n\n",
+        BIG_PROMPT_TOKENS + 7
+    );
+    let cheap_stream = upstream
+        .mock("POST", "/chat/completions")
+        .match_body(mockito::Matcher::PartialJson(
+            json!({"model": CHEAP_MODEL, "stream": true}),
+        ))
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(sse)
+        .expect_at_least(0)
+        .create_async()
+        .await;
+    let cheap_responses = upstream
+        .mock("POST", "/responses")
+        .match_body(model_is(CHEAP_MODEL))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(format!(
+            r#"{{"id":"resp_1","object":"response","status":"completed","model":"{CHEAP_MODEL}",
+                "output":[{{"type":"message","role":"assistant","status":"completed",
+                            "content":[{{"type":"output_text","text":"hi"}}]}}],
+                "usage":{{"input_tokens":{BIG_PROMPT_TOKENS},"output_tokens":7,
+                          "total_tokens":{}}}}}"#,
+            BIG_PROMPT_TOKENS + 7
+        ))
+        .expect_at_least(0)
+        .create_async()
+        .await;
+    upstream
+        .mock("POST", "/embeddings")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(format!(
+            r#"{{"object":"list","model":"text-embedding-3-small",
+                "data":[{{"object":"embedding","index":0,"embedding":[0.1,0.2]}}],
+                "usage":{{"prompt_tokens":{BIG_PROMPT_TOKENS},"total_tokens":{BIG_PROMPT_TOKENS}}}}}"#
+        ))
+        .expect_at_least(0)
+        .create_async()
+        .await;
+    set_router_env(&upstream.url());
+    DowngradeUpstream {
+        server: upstream,
+        pricey_chat,
+        pricey_responses,
+        cheap_chat,
+        cheap_stream,
+        cheap_responses,
+    }
+}
+
+fn downgrade_budget(name: &str, target: Uuid, limit: f64) -> Value {
+    json!({
+        "name": name, "scope": "user", "target_id": target, "period": "monthly",
+        "limit_usd": limit, "action": "downgrade", "downgrade_ceiling_pct": 125,
+    })
+}
+
+fn pricey_chat_body() -> Value {
+    json!({"model": PRICEY_MODEL, "messages": [{"role": "user", "content": "hello"}]})
+}
+
+fn assert_downgrade_headers(resp: &reqwest::Response, budget_id: &str) {
+    assert_eq!(
+        resp.headers()
+            .get(DOWNGRADED_HEADER)
+            .and_then(|v| v.to_str().ok()),
+        Some(budget_id),
+        "x-nasiko-budget-downgraded"
+    );
+    assert_eq!(
+        resp.headers()
+            .get(ORIGINAL_MODEL_HEADER)
+            .and_then(|v| v.to_str().ok()),
+        Some(PRICEY_MODEL),
+        "x-nasiko-original-model"
+    );
+}
+
+/// A downgrade budget with `spend_usd` already in `token_usage` for the caller.
+async fn exhausted_downgrade(
+    server: &TestServer,
+    root: Uuid,
+    c: &Caller,
+    spend_usd: f64,
+) -> String {
+    seed_usage(
+        server,
+        c.user,
+        None,
+        "direct_llm",
+        spend_usd,
+        in_current_period(),
+    )
+    .await;
+    let budget = create_budget(server, root, downgrade_budget("downgrade", c.user, 1.0)).await;
+    budget["id"].as_str().unwrap().to_owned()
+}
+
+#[tokio::test]
+#[serial]
+async fn downgrade_serves_cheapest_model() {
+    let upstream = downgrade_upstream().await;
+    let server = TestServer::start().await;
+    let root = seed_root(&server).await;
+    seed_tier3(&server, "openai", CHEAP_MODEL).await;
+    let c = caller(&server, "dg-chat").await;
+    let id = exhausted_downgrade(&server, root, &c, 1.1).await;
+    let since = Utc::now();
+
+    let resp = post_llm(
+        &server,
+        "/v1/chat/completions",
+        &c.jwt,
+        Some(&c.traceparent),
+        &pricey_chat_body(),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert_downgrade_headers(&resp, &id);
+
+    upstream.pricey_chat.assert_async().await;
+    upstream.cheap_chat.assert_async().await;
+    let (model, metadata) = newest_usage_row(&server, c.user, since).await;
+    assert_eq!(model, CHEAP_MODEL);
+    assert_eq!(
+        metadata["budget_downgrade"],
+        json!({"budget_id": id, "from_model": PRICEY_MODEL, "to_model": CHEAP_MODEL})
+    );
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn downgrade_stream_sets_headers() {
+    let upstream = downgrade_upstream().await;
+    let server = TestServer::start().await;
+    let root = seed_root(&server).await;
+    seed_tier3(&server, "openai", CHEAP_MODEL).await;
+    let c = caller(&server, "dg-stream").await;
+    let id = exhausted_downgrade(&server, root, &c, 1.1).await;
+    let since = Utc::now();
+
+    let mut body = pricey_chat_body();
+    body["stream"] = json!(true);
+    let resp = post_llm(
+        &server,
+        "/v1/chat/completions",
+        &c.jwt,
+        Some(&c.traceparent),
+        &body,
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert_downgrade_headers(&resp, &id);
+    let text = resp.text().await.unwrap();
+    assert!(text.contains("[DONE]"), "{text}");
+
+    upstream.pricey_chat.assert_async().await;
+    upstream.cheap_stream.assert_async().await;
+    let (model, metadata) = newest_usage_row(&server, c.user, since).await;
+    assert_eq!(model, CHEAP_MODEL);
+    assert_eq!(metadata["budget_downgrade"]["budget_id"], id);
+    assert_eq!(metadata["budget_downgrade"]["from_model"], PRICEY_MODEL);
+    assert_eq!(metadata["budget_downgrade"]["to_model"], CHEAP_MODEL);
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn downgrade_responses_surface() {
+    let upstream = downgrade_upstream().await;
+    let server = TestServer::start().await;
+    let root = seed_root(&server).await;
+    seed_tier3(&server, "openai", CHEAP_MODEL).await;
+    let c = caller(&server, "dg-responses").await;
+    let id = exhausted_downgrade(&server, root, &c, 1.1).await;
+    let since = Utc::now();
+
+    let resp = post_llm(
+        &server,
+        "/v1/responses",
+        &c.jwt,
+        Some(&c.traceparent),
+        &json!({"model": PRICEY_MODEL, "input": [{"role": "user", "content": "hello"}]}),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert_downgrade_headers(&resp, &id);
+
+    upstream.pricey_responses.assert_async().await;
+    upstream.cheap_responses.assert_async().await;
+    let (model, metadata) = newest_usage_row(&server, c.user, since).await;
+    assert_eq!(model, CHEAP_MODEL);
+    assert_eq!(metadata["budget_downgrade"]["budget_id"], id);
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn downgrade_ceiling_blocks() {
+    let _upstream = downgrade_upstream().await;
+    let server = TestServer::start().await;
+    let root = seed_root(&server).await;
+    seed_tier3(&server, "openai", CHEAP_MODEL).await;
+    let c = caller(&server, "dg-ceiling").await;
+    let id = exhausted_downgrade(&server, root, &c, 1.3).await;
+
+    let resp = post_llm(
+        &server,
+        "/v1/chat/completions",
+        &c.jwt,
+        Some(&c.traceparent),
+        &pricey_chat_body(),
+    )
+    .await;
+    assert_eq!(resp.status(), 429);
+    assert!(resp.headers().get(DOWNGRADED_HEADER).is_none());
+    let body = resp.json::<Value>().await.unwrap();
+    assert_nasiko_budget(&body, &id, "user", "monthly");
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn pinned_agent_downgrade_blocks() {
+    let upstream = downgrade_upstream().await;
+    let server = TestServer::start().await;
+    let root = seed_root(&server).await;
+    seed_tier3(&server, "openai", CHEAP_MODEL).await;
+    let c = caller(&server, "dg-pinned").await;
+    sqlx::query("UPDATE agents SET pinned_model = $2 WHERE id = $1")
+        .bind(c.agent)
+        .bind(PRICEY_MODEL)
+        .execute(&server.db)
+        .await
+        .expect("pin agent");
+    let id = exhausted_downgrade(&server, root, &c, 1.1).await;
+
+    let resp = post_llm(
+        &server,
+        "/v1/chat/completions",
+        &c.jwt,
+        Some(&c.traceparent),
+        &pricey_chat_body(),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        429,
+        "compliance-locked agents are blocked, not downgraded"
+    );
+    assert!(resp.headers().get(DOWNGRADED_HEADER).is_none());
+    let body = resp.json::<Value>().await.unwrap();
+    assert_nasiko_budget(&body, &id, "user", "monthly");
+    upstream.pricey_chat.assert_async().await;
+    upstream.cheap_chat.assert_async().await;
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn embeddings_not_downgraded() {
+    let _upstream = downgrade_upstream().await;
+    let server = TestServer::start().await;
+    let root = seed_root(&server).await;
+    seed_tier3(&server, "openai", CHEAP_MODEL).await;
+    let c = caller(&server, "dg-embed").await;
+    let id = exhausted_downgrade(&server, root, &c, 1.1).await;
+    let key = current_key(&id);
+
+    let body = embeddings_body();
+    let embed = || {
+        post_llm(
+            &server,
+            "/v1/embeddings",
+            &c.jwt,
+            Some(&c.traceparent),
+            &body,
+        )
+    };
+    let resp = embed().await;
+    assert_eq!(resp.status(), 200, "served as-is between limit and ceiling");
+    assert!(resp.headers().get(DOWNGRADED_HEADER).is_none());
+
+    // Push the counter to the ceiling (limit 1.0 x 125%).
+    set_counter(&key, 1_300_000).await;
+    let resp = embed().await;
+    assert_eq!(resp.status(), 429);
+    server.cleanup().await;
+}
+
+// ─── budget events (ENF-05) ──────────────────────────────────────────────────
+
+#[tokio::test]
+#[serial]
+async fn soft_event_exactly_once() {
+    let _upstream = stub_upstream_big_usage().await;
+    let server = TestServer::start().await;
+    let root = seed_root(&server).await;
+    let c = caller(&server, "soft-once").await;
+    let mut body = user_budget("soft once", c.user, 10.0);
+    body["soft_threshold_pct"] = json!(50);
+    let id = create_budget(&server, root, body).await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // 1 micro-USD below the soft threshold (50% of 10 USD): the first call's
+    // increment crosses it; set directly so no rebuild event is involved.
+    set_counter(&current_key(&id), 4_999_999).await;
+    let since = Utc::now();
+
+    let calls = (0..5).map(|_| chat(&server, &c));
+    for resp in futures::future::join_all(calls).await {
+        assert_eq!(resp.status(), 200, "soft never blocks");
+    }
+    for _ in 0..2 {
+        assert_eq!(chat(&server, &c).await.status(), 200);
+    }
+    wait_usage_rows(&server, c.user, since, 7).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    assert_eq!(wait_event_count(&server, &id, "soft_threshold", 1).await, 1);
+    assert_eq!(event_count(&server, &id, "soft_threshold").await, 1);
+    assert_eq!(event_count(&server, &id, "hard_limit").await, 0);
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn hard_limit_event_once() {
+    let _upstream = stub_upstream_big_usage().await;
+    let server = TestServer::start().await;
+    let root = seed_root(&server).await;
+    let c = caller(&server, "hard-once").await;
+    let id = create_budget(&server, root, user_budget("hard once", c.user, 1.0)).await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    set_counter(&current_key(&id), 999_999).await;
+
+    assert_eq!(chat(&server, &c).await.status(), 200);
+    assert_eq!(wait_event_count(&server, &id, "hard_limit", 1).await, 1);
+    assert_eq!(chat(&server, &c).await.status(), 429);
+    assert_eq!(event_count(&server, &id, "hard_limit").await, 1);
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn events_on_rebuild_path() {
+    let _upstream = stub_upstream_big_usage().await;
+    let server = TestServer::start().await;
+    let root = seed_root(&server).await;
+    let c = caller(&server, "rebuild-events").await;
+    // Default soft threshold is 80%: 8.5 of 10 USD is above it, below the limit.
+    seed_usage(
+        &server,
+        c.user,
+        None,
+        "direct_llm",
+        8.5,
+        in_current_period(),
+    )
+    .await;
+    let id = create_budget(&server, root, user_budget("rebuild", c.user, 10.0)).await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    del_key(&current_key(&id)).await;
+    let since = Utc::now();
+
+    assert_eq!(chat(&server, &c).await.status(), 200);
+    assert_eq!(wait_event_count(&server, &id, "soft_threshold", 1).await, 1);
+    for _ in 0..2 {
+        assert_eq!(chat(&server, &c).await.status(), 200);
+    }
+    wait_usage_rows(&server, c.user, since, 3).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(event_count(&server, &id, "soft_threshold").await, 1);
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn budget_created_over_threshold_emits_events() {
+    let _upstream = downgrade_upstream().await;
+    let server = TestServer::start().await;
+    let root = seed_root(&server).await;
+    seed_tier3(&server, "openai", CHEAP_MODEL).await;
+    let c = caller(&server, "created-over").await;
+    // Spend is 1.2x the limit before the budget exists, so its counter is first
+    // created already past both levels.
+    let id = exhausted_downgrade(&server, root, &c, 1.2).await;
+    let since = Utc::now();
+
+    let body = pricey_chat_body();
+    let post = || {
+        post_llm(
+            &server,
+            "/v1/chat/completions",
+            &c.jwt,
+            Some(&c.traceparent),
+            &body,
+        )
+    };
+    let resp = post().await;
+    assert_eq!(resp.status(), 200, "downgraded, below the ceiling");
+    assert_downgrade_headers(&resp, &id);
+    assert_eq!(wait_event_count(&server, &id, "soft_threshold", 1).await, 1);
+    assert_eq!(wait_event_count(&server, &id, "hard_limit", 1).await, 1);
+
+    for _ in 0..2 {
+        post().await;
+    }
+    wait_usage_rows(&server, c.user, since, 1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(event_count(&server, &id, "soft_threshold").await, 1);
+    assert_eq!(event_count(&server, &id, "hard_limit").await, 1);
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn event_period_start() {
+    let _upstream = stub_upstream_big_usage().await;
+    let server = TestServer::start().await;
+    let root = seed_root(&server).await;
+    let c = caller(&server, "event-period").await;
+    let id = create_budget(&server, root, user_budget("period", c.user, 1.0)).await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // 799_999 is 1 micro-USD below the default 80% soft threshold.
+    set_counter(&current_key(&id), 799_999).await;
+
+    assert_eq!(chat(&server, &c).await.status(), 200);
+    assert_eq!(wait_event_count(&server, &id, "soft_threshold", 1).await, 1);
+    let period_start: DateTime<Utc> =
+        sqlx::query_scalar("SELECT period_start FROM budget_events WHERE budget_id = $1::uuid")
+            .bind(&id)
+            .fetch_one(&server.db)
+            .await
+            .expect("event row");
+    assert_eq!(period_start, period_bounds(Period::Monthly, Utc::now()).0);
+    server.cleanup().await;
+}
