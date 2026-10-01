@@ -1894,3 +1894,1046 @@ async fn sweep_purges_only_old_finished_outbox_rows() {
     assert!(left.contains(&ids[2]) && left.contains(&ids[3]));
     server.cleanup().await;
 }
+
+// ─── llm call failures ───────────────────────────────────────────────────────
+//
+// The router reads `GatewayConfig::from_env()` once at boot, so these tests set
+// the environment before `TestServer::start()` and are `#[serial]`. The agent is
+// identified by a real agent JWT and the billed user comes from a live flow.
+
+const ROUTER_JWT_SECRET: &str = "alerts-router-test-secret";
+const FAILURE_POLL: Duration = Duration::from_secs(2);
+
+fn set_router_env(upstream_url: &str) {
+    // SAFETY: serialized by #[serial] within this test binary.
+    unsafe {
+        std::env::set_var("OPENAI_API_BASE", upstream_url);
+        std::env::set_var("AGENT_JWT_SECRET", ROUTER_JWT_SECRET);
+        std::env::set_var("PLATFORM_OPENAI_API_KEY", "sk-platform-test");
+        std::env::set_var("PLATFORM_ANTHROPIC_API_KEY", "sk-ant-platform-test");
+        std::env::set_var("PLATFORM_GEMINI_API_KEY", "gem-platform-test");
+    }
+}
+
+fn router_agent_jwt(agent_id: Uuid, owner_id: Uuid) -> String {
+    nasiko_llm_router::auth::mint_agent_token(
+        &agent_id.to_string(),
+        &owner_id.to_string(),
+        ROUTER_JWT_SECRET,
+        3600,
+        jsonwebtoken::Algorithm::HS256,
+    )
+    .expect("mint agent token")
+}
+
+async fn post_llm(server: &TestServer, path: &str, c: &Caller, body: &Value) -> reqwest::Response {
+    server
+        .client
+        .post(format!("{}{path}", server.base_url))
+        .bearer_auth(&c.jwt)
+        .header("traceparent", &c.traceparent)
+        .json(body)
+        .send()
+        .await
+        .expect("llm request")
+}
+
+fn chat_body() -> Value {
+    json!({"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hello"}]})
+}
+
+fn stream_chat_body() -> Value {
+    json!({"model": "gpt-4o-mini", "stream": true,
+           "messages": [{"role": "user", "content": "hello"}]})
+}
+
+fn embeddings_body() -> Value {
+    json!({"model": "text-embedding-3-small", "input": "hello"})
+}
+
+fn responses_body(stream: bool) -> Value {
+    json!({"model": "gpt-4o-mini", "input": "hello", "stream": stream})
+}
+
+/// A user with an agent, a live flow and an agent JWT: everything a router call needs.
+struct Caller {
+    user: Uuid,
+    agent: Uuid,
+    jwt: String,
+    traceparent: String,
+}
+
+async fn seed_agent(server: &TestServer, owner: Uuid, name: &str) -> Uuid {
+    sqlx::query_scalar("INSERT INTO agents (name, owner_id) VALUES ($1, $2) RETURNING id")
+        .bind(name)
+        .bind(owner)
+        .fetch_one(&server.db)
+        .await
+        .expect("seed agent")
+}
+
+async fn caller(server: &TestServer, name: &str) -> Caller {
+    let user = seed_user(server, name, "member").await;
+    let agent = seed_agent(server, user, &format!("{name}-agent")).await;
+    let (_flow, traceparent) = common::open_flow(&server.db, user, agent).await;
+    Caller {
+        user,
+        agent,
+        jwt: router_agent_jwt(agent, user),
+        traceparent,
+    }
+}
+
+async fn failure_rows(server: &TestServer, agent: Uuid) -> Vec<Value> {
+    sqlx::query_scalar::<_, Value>(
+        "SELECT to_jsonb(f) FROM llm_call_failures f WHERE agent_id = $1 ORDER BY created_at",
+    )
+    .bind(agent)
+    .fetch_all(&server.db)
+    .await
+    .expect("failure rows")
+}
+
+/// The failure write is a detached best-effort task: poll until `want` rows exist
+/// (or the deadline passes), then settle briefly so an unexpected second row would
+/// be visible to the caller's exact-count assertion.
+async fn wait_failures(server: &TestServer, agent: Uuid, want: usize) -> Vec<Value> {
+    let deadline = std::time::Instant::now() + FAILURE_POLL;
+    loop {
+        let rows = failure_rows(server, agent).await;
+        if rows.len() >= want || std::time::Instant::now() >= deadline {
+            if want > 0 {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                return failure_rows(server, agent).await;
+            }
+            return rows;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn token_usage_count(server: &TestServer, agent: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM token_usage WHERE agent_id = $1")
+        .bind(agent)
+        .fetch_one(&server.db)
+        .await
+        .expect("token_usage count")
+}
+
+async fn upstream_failing(path: &str, status: usize) -> mockito::ServerGuard {
+    let mut upstream = mockito::Server::new_async().await;
+    upstream
+        .mock("POST", path)
+        .with_status(status)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"error":{"message":"boom","type":"server_error"}}"#)
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    set_router_env(&upstream.url());
+    upstream
+}
+
+#[tokio::test]
+#[serial]
+async fn chat_upstream_500_records_one_failure() {
+    let _upstream = upstream_failing("/chat/completions", 500).await;
+    let server = TestServer::start().await;
+    let c = caller(&server, "fail-chat").await;
+
+    let resp = post_llm(&server, "/v1/chat/completions", &c, &chat_body()).await;
+    assert!(!resp.status().is_success(), "{}", resp.status());
+    let body = resp.json::<Value>().await.unwrap();
+    assert!(body.get("detail").is_some(), "wire body unchanged: {body}");
+
+    let rows = wait_failures(&server, c.agent, 1).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let r = &rows[0];
+    assert_eq!(r["user_id"], c.user.to_string());
+    assert_eq!(r["provider"], "openai");
+    assert_eq!(r["model"], "gpt-4o-mini");
+    assert_eq!(r["status_code"], 500);
+    assert_eq!(r["error_kind"], "upstream_5xx");
+    assert_eq!(r["streaming"], false);
+    assert_eq!(r["operation_type"], "direct_llm");
+    assert_eq!(token_usage_count(&server, c.agent).await, 0);
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn chat_upstream_400_and_429_kinds() {
+    for (status, kind) in [(400usize, "upstream_4xx"), (429, "rate_limited")] {
+        let _upstream = upstream_failing("/chat/completions", status).await;
+        let server = TestServer::start().await;
+        let c = caller(&server, &format!("fail-kind-{status}")).await;
+        let resp = post_llm(&server, "/v1/chat/completions", &c, &chat_body()).await;
+        assert!(!resp.status().is_success());
+        let rows = wait_failures(&server, c.agent, 1).await;
+        assert_eq!(rows.len(), 1, "{status}: {rows:?}");
+        assert_eq!(rows[0]["status_code"], status as i64);
+        assert_eq!(rows[0]["error_kind"], kind);
+        server.cleanup().await;
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn stream_connect_failure_records_streaming() {
+    let _upstream = upstream_failing("/chat/completions", 503).await;
+    let server = TestServer::start().await;
+    let c = caller(&server, "fail-stream").await;
+
+    let resp = post_llm(&server, "/v1/chat/completions", &c, &stream_chat_body()).await;
+    assert!(!resp.status().is_success());
+    let rows = wait_failures(&server, c.agent, 1).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["streaming"], true);
+    assert_eq!(rows[0]["error_kind"], "upstream_5xx");
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn embeddings_failure_records_embedding() {
+    let _upstream = upstream_failing("/embeddings", 500).await;
+    let server = TestServer::start().await;
+    let c = caller(&server, "fail-embed").await;
+
+    let resp = post_llm(&server, "/v1/embeddings", &c, &embeddings_body()).await;
+    assert!(!resp.status().is_success());
+    let rows = wait_failures(&server, c.agent, 1).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["operation_type"], "embedding");
+    assert_eq!(rows[0]["error_kind"], "upstream_5xx");
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn responses_failure_records_one_row() {
+    let _upstream = upstream_failing("/responses", 500).await;
+    let server = TestServer::start().await;
+    let c = caller(&server, "fail-responses").await;
+
+    let resp = post_llm(&server, "/v1/responses", &c, &responses_body(false)).await;
+    assert_eq!(resp.status(), 500);
+    let rows = wait_failures(&server, c.agent, 1).await;
+    assert_eq!(rows.len(), 1, "final outcome, not per attempt: {rows:?}");
+    assert_eq!(rows[0]["status_code"], 500);
+    assert_eq!(rows[0]["error_kind"], "upstream_5xx");
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn budget_denied_records_nothing() {
+    let mut upstream = mockito::Server::new_async().await;
+    let chat_mock = upstream
+        .mock("POST", "/chat/completions")
+        .expect(0)
+        .create_async()
+        .await;
+    set_router_env(&upstream.url());
+    let server = TestServer::start().await;
+    let root = seed_root(&server).await;
+    let c = caller(&server, "fail-budget").await;
+    sqlx::query(
+        "INSERT INTO token_usage (user_id, operation_type, provider, model, cost_usd, created_at) \
+         VALUES ($1, 'direct_llm', 'openai', 'gpt-4o-mini', 0.001, now())",
+    )
+    .bind(c.user)
+    .execute(&server.db)
+    .await
+    .expect("seed usage");
+    let budget = create_budget(&server, root, user_budget("fail-budget", c.user, 0.0001)).await;
+    let key = nasiko_llm_router::budget::keys::spend_key(
+        budget["id"].as_str().unwrap().parse().unwrap(),
+        nasiko_llm_router::budget::period::period_bounds(
+            nasiko_llm_router::budget::period::Period::Monthly,
+            Utc::now(),
+        )
+        .0,
+    );
+    let redis = redis::Client::open(
+        std::env::var("TEST_REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into()),
+    )
+    .expect("redis client");
+    let mut conn = redis
+        .get_multiplexed_async_connection()
+        .await
+        .expect("redis conn");
+    let _: () = redis::AsyncCommands::del(&mut conn, &key)
+        .await
+        .expect("del");
+
+    let resp = post_llm(&server, "/v1/chat/completions", &c, &chat_body()).await;
+    assert_eq!(resp.status(), 429);
+    let rows = wait_failures(&server, c.agent, 0).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(rows.is_empty() && failure_rows(&server, c.agent).await.is_empty());
+    chat_mock.assert_async().await;
+    server.cleanup().await;
+}
+
+/// One valid SSE chunk, then the connection is aborted so the provider's byte
+/// stream yields an error mid-flight.
+fn broken_sse(w: &mut dyn std::io::Write, first: &str) -> std::io::Result<()> {
+    w.write_all(first.as_bytes())?;
+    w.flush()?;
+    std::thread::sleep(Duration::from_millis(100));
+    Err(std::io::Error::other("upstream stream aborted"))
+}
+
+#[tokio::test]
+#[serial]
+async fn mid_stream_error_records_stream_error() {
+    let mut upstream = mockito::Server::new_async().await;
+    let chunk = "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o-mini\",\
+                 \"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"}}]}\n\n";
+    upstream
+        .mock("POST", "/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_chunked_body(move |w| broken_sse(w, chunk))
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    set_router_env(&upstream.url());
+    let server = TestServer::start().await;
+    let c = caller(&server, "fail-midstream").await;
+
+    let resp = post_llm(&server, "/v1/chat/completions", &c, &stream_chat_body()).await;
+    // Drain whatever the client receives; the stream may end early or error.
+    let _ = resp.bytes().await;
+
+    let rows = wait_failures(&server, c.agent, 1).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["error_kind"], "stream_error");
+    assert_eq!(rows[0]["streaming"], true);
+    assert!(rows[0]["status_code"].is_null());
+
+    let deadline = std::time::Instant::now() + FAILURE_POLL;
+    let finish = loop {
+        let f: Option<Option<String>> =
+            sqlx::query_scalar("SELECT finish_reason FROM token_usage WHERE agent_id = $1")
+                .bind(c.agent)
+                .fetch_optional(&server.db)
+                .await
+                .unwrap();
+        if let Some(f) = f {
+            break f;
+        }
+        assert!(std::time::Instant::now() < deadline, "no token_usage row");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(finish.as_deref(), Some("failed:stream"));
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn responses_mid_stream_error_records_stream_error() {
+    let mut upstream = mockito::Server::new_async().await;
+    let frame = "event: response.output_text.delta\n\
+                 data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n";
+    upstream
+        .mock("POST", "/responses")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_chunked_body(move |w| broken_sse(w, frame))
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    set_router_env(&upstream.url());
+    let server = TestServer::start().await;
+    let c = caller(&server, "fail-resp-midstream").await;
+
+    let resp = post_llm(&server, "/v1/responses", &c, &responses_body(true)).await;
+    let _ = resp.bytes().await;
+
+    let rows = wait_failures(&server, c.agent, 1).await;
+    assert_eq!(rows.len(), 1, "one per request, not per frame: {rows:?}");
+    assert_eq!(rows[0]["error_kind"], "stream_error");
+    assert_eq!(rows[0]["streaming"], true);
+    server.cleanup().await;
+}
+
+// ─── monitors ────────────────────────────────────────────────────────────────
+
+use nasiko_server::alerts::monitors::{MAX_ENABLED_MONITORS, RESOLVE_CLEAR_EVALS, tick_monitors};
+
+async fn post_monitor(server: &TestServer, root: Uuid, body: Value) -> reqwest::Response {
+    admin(root, server.client.post(server.url("/api/monitors")))
+        .json(&body)
+        .send()
+        .await
+        .expect("post monitor")
+}
+
+async fn make_monitor(server: &TestServer, root: Uuid, body: Value) -> Value {
+    let resp = post_monitor(server, root, body).await;
+    assert_eq!(resp.status(), 201, "create monitor");
+    resp.json::<Value>().await.unwrap()["data"].clone()
+}
+
+fn agent_monitor(agent: Uuid) -> Value {
+    json!({"name": "agent errors", "metric": "error_rate", "scope": "agent",
+           "scope_ref": agent.to_string(), "window_minutes": 15, "threshold": 10.0})
+}
+
+async fn assert_monitor_400(server: &TestServer, root: Uuid, body: Value, code: &str) {
+    let resp = post_monitor(server, root, body.clone()).await;
+    assert_eq!(resp.status(), 400, "{body}");
+    let json = resp.json::<Value>().await.unwrap();
+    assert_eq!(json["code"], code, "{body} -> {json}");
+}
+
+/// Insert `n` router-metered rows one minute old (inside every window).
+async fn seed_calls(
+    server: &TestServer,
+    user: Uuid,
+    agent: Uuid,
+    model: &str,
+    n: usize,
+    finish_reason: Option<&str>,
+    latency_ms: impl Fn(usize) -> i32,
+) {
+    for i in 0..n {
+        sqlx::query(
+            "INSERT INTO token_usage (user_id, agent_id, operation_type, provider, model, \
+             cost_usd, latency_ms, finish_reason, created_at) \
+             VALUES ($1, $2, 'direct_llm', 'openai', $3, 0.001, $4, $5, \
+                     now() - interval '1 minute')",
+        )
+        .bind(user)
+        .bind(agent)
+        .bind(model)
+        .bind(latency_ms(i))
+        .bind(finish_reason)
+        .execute(&server.db)
+        .await
+        .expect("seed call");
+    }
+}
+
+async fn seed_failures(server: &TestServer, agent: Uuid, model: &str, n: usize) {
+    for _ in 0..n {
+        sqlx::query(
+            "INSERT INTO llm_call_failures (agent_id, provider, model, status_code, error_kind, \
+             operation_type, created_at) \
+             VALUES ($1, 'openai', $2, 500, 'upstream_5xx', 'direct_llm', \
+                     now() - interval '1 minute')",
+        )
+        .bind(agent)
+        .bind(model)
+        .execute(&server.db)
+        .await
+        .expect("seed failure");
+    }
+}
+
+async fn monitor_alert(server: &TestServer, monitor_id: &str) -> Vec<Value> {
+    alert_by_key(server, &format!("monitor:{monitor_id}")).await
+}
+
+async fn member_agent(server: &TestServer, name: &str) -> (Uuid, Uuid) {
+    let user = seed_user(server, name, "member").await;
+    let agent = seed_agent(server, user, &format!("{name}-agent")).await;
+    (user, agent)
+}
+
+#[tokio::test]
+#[serial]
+async fn monitor_crud_and_validation() {
+    let server = TestServer::start().await;
+    let root = seed_root(&server).await;
+    let (user, agent) = member_agent(&server, "mon-crud").await;
+
+    let created = make_monitor(&server, root, agent_monitor(agent)).await;
+    let id = created["id"].as_str().unwrap().to_owned();
+    assert_eq!(created["min_samples"], 20);
+    assert_eq!(created["severity"], "warning");
+    assert_eq!(created["enabled"], true);
+    assert_eq!(created["scope_ref"], agent.to_string());
+    assert_eq!(created["metric"], "error_rate");
+    assert_eq!(created["window_minutes"], 15);
+    assert_eq!(created["threshold"].as_f64(), Some(10.0));
+
+    let resp = admin(root, server.client.get(server.url("/api/monitors")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let list = resp.json::<Value>().await.unwrap();
+    assert_eq!(list["data"].as_array().unwrap().len(), 1);
+
+    let resp = admin(
+        root,
+        server
+            .client
+            .get(server.url(&format!("/api/monitors/{id}"))),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.json::<Value>().await.unwrap()["data"]["id"], id);
+
+    let resp = admin(
+        root,
+        server
+            .client
+            .put(server.url(&format!("/api/monitors/{id}"))),
+    )
+    .json(&json!({"threshold": 25.5, "enabled": false, "severity": "critical"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    let updated = resp.json::<Value>().await.unwrap()["data"].clone();
+    assert_eq!(updated["threshold"].as_f64(), Some(25.5));
+    assert_eq!(updated["enabled"], false);
+    assert_eq!(updated["severity"], "critical");
+    assert_eq!(updated["window_minutes"], 15);
+
+    // PUT validates the same way.
+    let resp = admin(
+        root,
+        server
+            .client
+            .put(server.url(&format!("/api/monitors/{id}"))),
+    )
+    .json(&json!({"window_minutes": 4}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 400);
+    assert_eq!(
+        resp.json::<Value>().await.unwrap()["code"],
+        "invalid_window"
+    );
+
+    let resp = admin(
+        root,
+        server
+            .client
+            .delete(server.url(&format!("/api/monitors/{id}"))),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert!(resp.status().is_success());
+    let resp = admin(
+        root,
+        server
+            .client
+            .get(server.url(&format!("/api/monitors/{id}"))),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    let base = agent_monitor(agent);
+    let with = |k: &str, v: Value| {
+        let mut b = base.clone();
+        b[k] = v;
+        b
+    };
+    assert_monitor_400(&server, root, with("name", json!("")), "invalid_name").await;
+    assert_monitor_400(
+        &server,
+        root,
+        with("name", json!("n".repeat(121))),
+        "invalid_name",
+    )
+    .await;
+    assert_monitor_400(
+        &server,
+        root,
+        with("metric", json!("rps")),
+        "invalid_metric",
+    )
+    .await;
+    assert_monitor_400(&server, root, with("scope", json!("user")), "invalid_scope").await;
+    assert_monitor_400(
+        &server,
+        root,
+        with("scope_ref", json!("not-a-uuid")),
+        "invalid_scope_ref",
+    )
+    .await;
+    assert_monitor_400(
+        &server,
+        root,
+        with("scope_ref", json!(Uuid::new_v4().to_string())),
+        "invalid_scope_ref",
+    )
+    .await;
+    assert_monitor_400(
+        &server,
+        root,
+        json!({"name": "m", "metric": "error_rate", "scope": "model", "scope_ref": "",
+               "window_minutes": 15, "threshold": 10}),
+        "invalid_scope_ref",
+    )
+    .await;
+    assert_monitor_400(
+        &server,
+        root,
+        json!({"name": "m", "metric": "error_rate", "scope": "platform",
+               "scope_ref": "x", "window_minutes": 15, "threshold": 10}),
+        "invalid_scope_ref",
+    )
+    .await;
+    assert_monitor_400(
+        &server,
+        root,
+        with("window_minutes", json!(4)),
+        "invalid_window",
+    )
+    .await;
+    assert_monitor_400(
+        &server,
+        root,
+        with("window_minutes", json!(1441)),
+        "invalid_window",
+    )
+    .await;
+    assert_monitor_400(
+        &server,
+        root,
+        with("threshold", json!(0)),
+        "invalid_threshold",
+    )
+    .await;
+    assert_monitor_400(
+        &server,
+        root,
+        with("threshold", json!(-1)),
+        "invalid_threshold",
+    )
+    .await;
+    assert_monitor_400(
+        &server,
+        root,
+        with("threshold", json!(100.5)),
+        "invalid_threshold",
+    )
+    .await;
+    assert_monitor_400(
+        &server,
+        root,
+        with("min_samples", json!(0)),
+        "invalid_min_samples",
+    )
+    .await;
+    assert_monitor_400(
+        &server,
+        root,
+        with("severity", json!("fatal")),
+        "invalid_severity",
+    )
+    .await;
+
+    // Cap: MAX_ENABLED_MONITORS enabled monitors; the next enabled one is refused,
+    // a disabled one is accepted and cannot be enabled past the cap.
+    for i in 0..MAX_ENABLED_MONITORS {
+        sqlx::query(
+            "INSERT INTO monitors (name, metric, scope, window_minutes, threshold) \
+             VALUES ($1, 'error_rate', 'platform', 15, 10)",
+        )
+        .bind(format!("bulk {i}"))
+        .execute(&server.db)
+        .await
+        .unwrap();
+    }
+    let platform = json!({"name": "over", "metric": "p95_latency_ms", "scope": "platform",
+                          "window_minutes": 15, "threshold": 1000});
+    assert_monitor_400(&server, root, platform.clone(), "monitor_limit_reached").await;
+    let mut disabled = platform.clone();
+    disabled["enabled"] = json!(false);
+    let spare = make_monitor(&server, root, disabled).await;
+    let resp = admin(
+        root,
+        server
+            .client
+            .put(server.url(&format!("/api/monitors/{}", spare["id"].as_str().unwrap()))),
+    )
+    .json(&json!({"enabled": true}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 400);
+    assert_eq!(
+        resp.json::<Value>().await.unwrap()["code"],
+        "monitor_limit_reached"
+    );
+
+    // Members get 403 on all five routes.
+    let m = member(
+        server.client.get(server.url("/api/monitors")),
+        user,
+        "mon-crud",
+    );
+    assert_eq!(m.send().await.unwrap().status(), 403);
+    let body = agent_monitor(agent);
+    let m = member(
+        server.client.post(server.url("/api/monitors")),
+        user,
+        "mon-crud",
+    );
+    assert_eq!(m.json(&body).send().await.unwrap().status(), 403);
+    let url = server.url(&format!("/api/monitors/{id}"));
+    for method in [
+        reqwest::Method::GET,
+        reqwest::Method::PUT,
+        reqwest::Method::DELETE,
+    ] {
+        let m = member(
+            server.client.request(method.clone(), &url),
+            user,
+            "mon-crud",
+        );
+        let m = if method == reqwest::Method::PUT {
+            m.json(&json!({"enabled": false}))
+        } else {
+            m
+        };
+        assert_eq!(m.send().await.unwrap().status(), 403, "{method}");
+    }
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn error_rate_breach_and_hysteresis() {
+    let server = TestServer::start().await;
+    let root = seed_root(&server).await;
+    let (user, agent) = member_agent(&server, "mon-rate").await;
+    let channel = seed_channel(&server, "mon-rate-ch", true).await;
+    seed_route(&server, channel, None, "info").await;
+    let m = make_monitor(&server, root, agent_monitor(agent)).await;
+    let id = m["id"].as_str().unwrap().to_owned();
+
+    seed_calls(&server, user, agent, "gpt-4o-mini", 18, None, |_| 100).await;
+    seed_failures(&server, agent, "gpt-4o-mini", 4).await;
+    // Responses failed-attempt rows are neither successes nor samples.
+    seed_calls(
+        &server,
+        user,
+        agent,
+        "gpt-4o-mini",
+        5,
+        Some("failed:upstream"),
+        |_| 1,
+    )
+    .await;
+    seed_calls(
+        &server,
+        user,
+        agent,
+        "gpt-4o-mini",
+        5,
+        Some("http:500"),
+        |_| 1,
+    )
+    .await;
+
+    assert!(tick_monitors(&server.db, Utc::now()).await.unwrap() >= 1);
+    let alerts = monitor_alert(&server, &id).await;
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+    let a = &alerts[0];
+    assert_eq!(a["kind"], "monitor_breach");
+    assert_eq!(a["status"], "open");
+    assert_eq!(a["scope"], "agent");
+    assert_eq!(a["scope_ref"], agent.to_string());
+    assert_eq!(a["severity"], "warning");
+    assert_eq!(a["link"], format!("/tokenops?agent={agent}"));
+    let d = &a["details"];
+    assert_eq!(d["metric"], "error_rate");
+    assert!((d["value"].as_f64().unwrap() - 18.18).abs() < 0.1, "{d}");
+    assert_eq!(d["threshold"].as_f64(), Some(10.0));
+    assert_eq!(d["window_minutes"], 15);
+    assert_eq!(d["samples"], 22);
+    assert_eq!(d["clear_streak"], 0);
+
+    tick_monitors(&server.db, Utc::now()).await.unwrap();
+    let alerts = monitor_alert(&server, &id).await;
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0]["occurrences"], 2);
+
+    // Recovery: no failures and enough clean samples.
+    sqlx::query("DELETE FROM llm_call_failures WHERE agent_id = $1")
+        .bind(agent)
+        .execute(&server.db)
+        .await
+        .unwrap();
+    seed_calls(&server, user, agent, "gpt-4o-mini", 5, None, |_| 100).await;
+    for expected in 1..RESOLVE_CLEAR_EVALS {
+        tick_monitors(&server.db, Utc::now()).await.unwrap();
+        let a = &monitor_alert(&server, &id).await[0];
+        assert_eq!(a["status"], "open", "streak {expected}");
+        assert_eq!(a["details"]["clear_streak"], expected);
+    }
+    tick_monitors(&server.db, Utc::now()).await.unwrap();
+    let alerts = monitor_alert(&server, &id).await;
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0]["status"], "resolved");
+    let events: Vec<String> = outbox(&server)
+        .await
+        .iter()
+        .map(|o| o["event"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(events.contains(&"opened".to_owned()), "{events:?}");
+    assert!(events.contains(&"resolved".to_owned()), "{events:?}");
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn p95_breach_by_model() {
+    let server = TestServer::start().await;
+    let root = seed_root(&server).await;
+    let (user, agent) = member_agent(&server, "mon-p95").await;
+    let slow = make_monitor(
+        &server,
+        root,
+        json!({"name": "slow mini", "metric": "p95_latency_ms", "scope": "model",
+               "scope_ref": "gpt-4o-mini", "window_minutes": 15, "threshold": 1000}),
+    )
+    .await;
+    let idle = make_monitor(
+        &server,
+        root,
+        json!({"name": "idle model", "metric": "p95_latency_ms", "scope": "model",
+               "scope_ref": "some-other-model", "window_minutes": 15, "threshold": 1000}),
+    )
+    .await;
+
+    seed_calls(&server, user, agent, "gpt-4o-mini", 25, None, |i| {
+        100 + 100 * i as i32
+    })
+    .await;
+    // Failed attempts carry tiny latencies and must not drag p95 down.
+    seed_calls(
+        &server,
+        user,
+        agent,
+        "gpt-4o-mini",
+        60,
+        Some("failed:upstream"),
+        |_| 1,
+    )
+    .await;
+
+    tick_monitors(&server.db, Utc::now()).await.unwrap();
+    let alerts = monitor_alert(&server, slow["id"].as_str().unwrap()).await;
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+    assert_eq!(alerts[0]["scope"], "model");
+    assert_eq!(alerts[0]["scope_ref"], "gpt-4o-mini");
+    assert!(alerts[0]["details"]["value"].as_f64().unwrap() > 1000.0);
+    assert_eq!(alerts[0]["details"]["samples"], 25);
+    assert!(
+        monitor_alert(&server, idle["id"].as_str().unwrap())
+            .await
+            .is_empty()
+    );
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn min_samples_gates_both_ways() {
+    let server = TestServer::start().await;
+    let root = seed_root(&server).await;
+    let (user, agent) = member_agent(&server, "mon-gate").await;
+    let m = make_monitor(&server, root, agent_monitor(agent)).await;
+    let id = m["id"].as_str().unwrap().to_owned();
+
+    // 5 samples, all failing: below min_samples, no alert.
+    seed_failures(&server, agent, "gpt-4o-mini", 5).await;
+    tick_monitors(&server.db, Utc::now()).await.unwrap();
+    assert!(monitor_alert(&server, &id).await.is_empty());
+
+    // Enough failing samples to open it.
+    seed_failures(&server, agent, "gpt-4o-mini", 20).await;
+    tick_monitors(&server.db, Utc::now()).await.unwrap();
+    assert_eq!(monitor_alert(&server, &id).await.len(), 1);
+
+    // One clear evaluation, then the window empties out.
+    sqlx::query("DELETE FROM llm_call_failures WHERE agent_id = $1")
+        .bind(agent)
+        .execute(&server.db)
+        .await
+        .unwrap();
+    seed_calls(&server, user, agent, "gpt-4o-mini", 25, None, |_| 100).await;
+    tick_monitors(&server.db, Utc::now()).await.unwrap();
+    assert_eq!(
+        monitor_alert(&server, &id).await[0]["details"]["clear_streak"],
+        1
+    );
+
+    sqlx::query("DELETE FROM token_usage WHERE agent_id = $1")
+        .bind(agent)
+        .execute(&server.db)
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        tick_monitors(&server.db, Utc::now()).await.unwrap();
+    }
+    let a = &monitor_alert(&server, &id).await[0];
+    assert_eq!(a["status"], "open");
+    assert_eq!(a["details"]["clear_streak"], 1);
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn monitor_tick_skips_when_lock_held() {
+    let server = TestServer::start().await;
+    let root = seed_root(&server).await;
+    let (user, agent) = member_agent(&server, "mon-lock").await;
+    let m = make_monitor(&server, root, agent_monitor(agent)).await;
+    let id = m["id"].as_str().unwrap().to_owned();
+
+    seed_failures(&server, agent, "gpt-4o-mini", 25).await;
+    tick_monitors(&server.db, Utc::now()).await.unwrap();
+    let a = monitor_alert(&server, &id).await;
+    assert_eq!(
+        (
+            a[0]["occurrences"].as_i64(),
+            a[0]["details"]["clear_streak"].as_i64()
+        ),
+        (Some(1), Some(0))
+    );
+
+    let mut other = sqlx::PgConnection::connect(&server.db_url).await.unwrap();
+    sqlx::query("BEGIN").execute(&mut other).await.unwrap();
+    let got: bool = sqlx::query_scalar(
+        "SELECT pg_try_advisory_xact_lock(hashtextextended('alerts:monitor:' || $1, 0))",
+    )
+    .bind(&id)
+    .fetch_one(&mut other)
+    .await
+    .unwrap();
+    assert!(got);
+
+    // Breach data present: occurrences must not move while another replica holds the lock.
+    tick_monitors(&server.db, Utc::now()).await.unwrap();
+    assert_eq!(monitor_alert(&server, &id).await[0]["occurrences"], 1);
+
+    // Clear data present: clear_streak must not move either.
+    sqlx::query("DELETE FROM llm_call_failures WHERE agent_id = $1")
+        .bind(agent)
+        .execute(&server.db)
+        .await
+        .unwrap();
+    seed_calls(&server, user, agent, "gpt-4o-mini", 25, None, |_| 100).await;
+    tick_monitors(&server.db, Utc::now()).await.unwrap();
+    assert_eq!(
+        monitor_alert(&server, &id).await[0]["details"]["clear_streak"],
+        0
+    );
+
+    sqlx::query("ROLLBACK").execute(&mut other).await.unwrap();
+    tick_monitors(&server.db, Utc::now()).await.unwrap();
+    assert_eq!(
+        monitor_alert(&server, &id).await[0]["details"]["clear_streak"],
+        1
+    );
+    drop(other);
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn disabled_or_deleted_monitor_resolves_alert() {
+    let server = TestServer::start().await;
+    let root = seed_root(&server).await;
+    let (_user, agent) = member_agent(&server, "mon-sweep").await;
+    let disabled = make_monitor(&server, root, agent_monitor(agent)).await;
+    let deleted = make_monitor(&server, root, agent_monitor(agent)).await;
+    let kept = make_monitor(&server, root, agent_monitor(agent)).await;
+    let ids: Vec<String> = [&disabled, &deleted, &kept]
+        .iter()
+        .map(|m| m["id"].as_str().unwrap().to_owned())
+        .collect();
+
+    for id in &ids {
+        let mut conn = server.db.acquire().await.unwrap();
+        raise(
+            &mut conn,
+            &NewAlert {
+                kind: AlertKind::MonitorBreach,
+                severity: Severity::Warning,
+                scope: AlertScope::Agent,
+                scope_ref: Some(agent.to_string()),
+                dedup_key: format!("monitor:{id}"),
+                title: "t".into(),
+                message: "m".into(),
+                link: "/tokenops".into(),
+                details: json!({"monitor_id": id, "clear_streak": 0}),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let resp = admin(
+        root,
+        server
+            .client
+            .put(server.url(&format!("/api/monitors/{}", ids[0]))),
+    )
+    .json(&json!({"enabled": false}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    let resp = admin(
+        root,
+        server
+            .client
+            .delete(server.url(&format!("/api/monitors/{}", ids[1]))),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert!(resp.status().is_success());
+
+    tick_resolve_sweep(&server.db, Utc::now()).await.unwrap();
+    assert_eq!(
+        monitor_alert(&server, &ids[0]).await[0]["status"],
+        "resolved"
+    );
+    assert_eq!(
+        monitor_alert(&server, &ids[1]).await[0]["status"],
+        "resolved"
+    );
+    assert_eq!(monitor_alert(&server, &ids[2]).await[0]["status"], "open");
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn sweep_purges_only_old_llm_call_failures() {
+    let server = TestServer::start().await;
+    for age in ["31 days", "1 day"] {
+        sqlx::query(&format!(
+            "INSERT INTO llm_call_failures (provider, model, error_kind, operation_type, created_at) \
+             VALUES ('openai', 'm', 'upstream_5xx', 'direct_llm', now() - interval '{age}')"
+        ))
+        .execute(&server.db)
+        .await
+        .unwrap();
+    }
+    tick_resolve_sweep(&server.db, Utc::now()).await.unwrap();
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM llm_call_failures")
+        .fetch_one(&server.db)
+        .await
+        .unwrap();
+    assert_eq!(left, 1);
+    server.cleanup().await;
+}
