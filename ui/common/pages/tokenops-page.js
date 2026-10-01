@@ -404,6 +404,7 @@ class TokenopsPage extends HTMLElement {
         <h1 class="title-page">TokenOps</h1>
         <div class="head-actions">
           <app-button variant="tertiary" size="md" id="budgets-btn">Budgets</app-button>
+          <app-button variant="tertiary" size="md" id="alerts-btn">Alerts</app-button>
           <app-button variant="tertiary" size="md" id="export-btn">Export report</app-button>
         </div>
       </div>
@@ -576,6 +577,7 @@ class TokenopsPage extends HTMLElement {
     });
     this.querySelector('#export-btn').addEventListener('click', () => this.#exportCsv());
     this.querySelector('#budgets-btn').addEventListener('click', () => navigate('/budgets'));
+    this.querySelector('#alerts-btn').addEventListener('click', () => navigate('/alerts'));
 
     // Cosmetic gate only: the endpoint itself answers 403 to non-superusers.
     authService.fetchCurrentUser().catch(() => null).then(() => {
