@@ -35,7 +35,7 @@ import '/common/services/alerts-service.js';
 import { authService } from '/common/services/auth-service.js';
 import {
   ALERT_KINDS, CHANNEL_KINDS, METRICS, MONITOR_SCOPES, SEVERITIES,
-  channelPayload, deliveryStatusTone, kindLabel, monitorPayload, routesPayload,
+  budgetUrl, channelPayload, deliveryStatusTone, isInternalLink, kindLabel, monitorPayload, routesPayload,
   scopeRefLabel, severityTone, validateChannelForm, validateMonitorForm,
 } from '/common/utils/alerts.js';
 
@@ -110,10 +110,6 @@ const fmtDate = (iso) => {
 };
 
 const optionsAttr = (list) => `options='${escAttr(JSON.stringify(list))}'`;
-
-/** Server-provided links are followed only when they are internal paths. */
-const isInternalLink = (link) =>
-  typeof link === 'string' && link.startsWith('/') && !link.startsWith('//');
 
 const badge = (variant, text) =>
   `<app-badge variant="${escAttr(variant)}">${escHtml(text)}</app-badge>`;
@@ -272,6 +268,7 @@ class AlertsPage extends HTMLElement {
         <td>${badge(a.status === 'open' ? 'warning' : a.status === 'resolved' ? 'success' : 'neutral', a.status)}</td>
         <td><div class="row-actions">
           ${isInternalLink(a.link) ? `<app-button variant="tertiary" size="sm" data-open="${escAttr(a.id)}">Open</app-button>` : ''}
+          ${budgetUrl(a) ? `<app-button variant="tertiary" size="sm" data-budget="${escAttr(a.id)}">Budget</app-button>` : ''}
           ${a.status === 'open' ? `<app-button variant="tertiary" size="sm" data-ack="${escAttr(a.id)}">Acknowledge</app-button>` : ''}
         </div></td>
       </tr>`).join('');
@@ -283,6 +280,13 @@ class AlertsPage extends HTMLElement {
       btn.addEventListener('click', () => {
         const alert = this.#alerts.find((a) => a.id === btn.dataset.open);
         if (alert && isInternalLink(alert.link)) navigate(alert.link);
+      });
+    }
+    for (const btn of body.querySelectorAll('[data-budget]')) {
+      btn.addEventListener('click', () => {
+        const alert = this.#alerts.find((a) => a.id === btn.dataset.budget);
+        const url = budgetUrl(alert);
+        if (url) navigate(url);
       });
     }
     for (const btn of body.querySelectorAll('[data-ack]')) {

@@ -65,6 +65,25 @@ export function alertQuery(filters) {
   return q.toString();
 }
 
+/**
+ * Server-provided links are followed only when they are internal paths.
+ * @param {unknown} link
+ * @returns {boolean}
+ */
+export function isInternalLink(link) {
+  return typeof link === 'string' && link.startsWith('/') && !link.startsWith('//');
+}
+
+/**
+ * The internal budgets page an alert points at, or null when absent/external.
+ * @param {{details?: {budget_url?: unknown}} | null | undefined} alert
+ * @returns {string | null}
+ */
+export function budgetUrl(alert) {
+  const url = alert?.details?.budget_url;
+  return isInternalLink(url) ? /** @type {string} */ (url) : null;
+}
+
 const SEVERITY_TONES = { critical: 'error', warning: 'warning', info: 'info' };
 
 /** @param {string} severity @returns {'error'|'warning'|'info'|'neutral'} */

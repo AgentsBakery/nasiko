@@ -343,8 +343,9 @@ pub(crate) async fn delete_budget(
 
 // ─── self-service ────────────────────────────────────────────────────────────
 
-/// Budgets that apply to the caller: their own, their agents', and platform-wide.
-/// Non-admins see platform rows without dollar amounts.
+/// Budgets that apply to the caller: their own, agents they own (full) or can
+/// access (redacted), and platform-wide. Non-admins see platform and
+/// non-owned agent rows without dollar amounts.
 #[utoipa::path(
     get,
     path = "/api/budgets/me",
@@ -369,6 +370,15 @@ pub(crate) async fn my_budgets(State(state): State<AppState>, claims: Claims) ->
         Ok(v) => v,
         Err(e) => return internal("my_budgets", e),
     };
+    // accessible_agent_ids runs a per-agent ACL check (N+1); acceptable here
+    // because /me is a dashboard read, not the per-call router hot path.
+    let accessible = if claims.is_superuser {
+        Vec::new()
+    } else {
+        crate::observability::handler::accessible_agent_ids(&state, &claims)
+            .await
+            .unwrap_or_default()
+    };
     let all = match defs::load_budgets(&state.db, true).await {
         Ok(v) => v,
         Err(e) => return internal("my_budgets", e),
@@ -378,7 +388,7 @@ pub(crate) async fn my_budgets(State(state): State<AppState>, claims: Claims) ->
         .filter(|b| match (b.scope, b.target_id) {
             (Scope::Platform, _) => true,
             (Scope::User, Some(t)) => t == caller,
-            (Scope::Agent, Some(t)) => owned.contains(&t),
+            (Scope::Agent, Some(t)) => owned.contains(&t) || accessible.contains(&t),
             _ => false,
         })
         .collect();
@@ -386,7 +396,11 @@ pub(crate) async fn my_budgets(State(state): State<AppState>, claims: Claims) ->
         .await
         .iter()
         .zip(&mine)
-        .map(|(view, b)| view.to_json(b.scope == Scope::Platform && !is_admin))
+        .map(|(view, b)| {
+            let non_owned_agent =
+                b.scope == Scope::Agent && !b.target_id.is_some_and(|t| owned.contains(&t));
+            view.to_json(!is_admin && (b.scope == Scope::Platform || non_owned_agent))
+        })
         .collect();
     Json(json!({"data": data})).into_response()
 }

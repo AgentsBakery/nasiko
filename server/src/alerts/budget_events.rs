@@ -12,10 +12,20 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::engine;
-use super::models::{AlertKind, AlertScope, NewAlert, Severity};
+use super::models::{AlertKind, AlertScope, NewAlert, Severity, tokenops_link};
 
 const CLAIM_BATCH: i64 = 50;
-const BUDGETS_LINK: &str = "/budgets";
+const BUDGETS_URL: &str = "/budgets";
+
+/// TokenOps range matching the budget period, so the chart covers the window
+/// the spend was measured over.
+fn tokenops_range(period: Period) -> &'static str {
+    match period {
+        Period::Daily => "24h",
+        Period::Weekly => "7d",
+        Period::Monthly => "30d",
+    }
+}
 
 #[derive(sqlx::FromRow)]
 struct ClaimedEvent {
@@ -93,6 +103,7 @@ fn alert_for(ev: &ClaimedEvent, now: DateTime<Utc>) -> Option<NewAlert> {
         _ => return None,
     };
     let scope = AlertScope::parse(&ev.scope)?;
+    let agent = ev.target_id.filter(|_| scope == AlertScope::Agent);
     let message = format!(
         "Spend ${:.2} of ${:.2} ({} budget) in the period starting {}.",
         ev.spend_usd,
@@ -112,7 +123,7 @@ fn alert_for(ev: &ClaimedEvent, now: DateTime<Utc>) -> Option<NewAlert> {
         ),
         title,
         message,
-        link: BUDGETS_LINK.to_owned(),
+        link: tokenops_link(agent, Some(tokenops_range(period))),
         // period_end is stored now: the budget's period is editable, so the
         // resolver must not recompute it later.
         details: json!({
@@ -121,6 +132,19 @@ fn alert_for(ev: &ClaimedEvent, now: DateTime<Utc>) -> Option<NewAlert> {
             "period_end": period_end.to_rfc3339(),
             "limit_usd": ev.limit_usd,
             "spend_usd": ev.spend_usd,
+            "budget_url": BUDGETS_URL,
         }),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tokenops_range_follows_period() {
+        assert_eq!(tokenops_range(Period::Daily), "24h");
+        assert_eq!(tokenops_range(Period::Weekly), "7d");
+        assert_eq!(tokenops_range(Period::Monthly), "30d");
+    }
 }
