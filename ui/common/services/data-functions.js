@@ -14,6 +14,7 @@
  *   llm-service.js         — LLM router configs, providers, secrets
  *   usage-service.js       — usage summary, TokenOps, by-agent/model
  *   settings-service.js    — workspace settings, user search
+ *   budgets-service.js — budget CRUD and caller budget status
  *   mcp-service.js         — MCP gateway (connectors, credentials, OAuth,
  *                            toolkits, connections, per-agent access)
  */
@@ -26,4 +27,5 @@ import '/common/services/observability-service.js';
 import '/common/services/llm-service.js';
 import '/common/services/usage-service.js';
 import '/common/services/settings-service.js';
+import '/common/services/budgets-service.js';
 import '/common/services/mcp-service.js';
