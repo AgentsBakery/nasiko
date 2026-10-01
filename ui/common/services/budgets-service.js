@@ -18,7 +18,12 @@ const updateBudget = async ({ id, ...body }) =>
 
 const deleteBudget = async ({ id }) => deleteJson(`/budgets/${encodeURIComponent(id)}`);
 
+// Target picker for user-scoped budgets. GET /api/users is admin-only, which
+// matches the only caller (the admin dialog).
+const USER_PICKER_LIMIT = 200;
+const fetchBudgetUsers = async () => fetchApi(`/users?limit=${USER_PICKER_LIMIT}`);
+
 registerAll(
-  { fetchBudgets, fetchMyBudgets, createBudget, updateBudget, deleteBudget },
+  { fetchBudgets, fetchMyBudgets, createBudget, updateBudget, deleteBudget, fetchBudgetUsers },
   { replace: true },
 );

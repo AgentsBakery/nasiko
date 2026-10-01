@@ -97,6 +97,7 @@ import '/common/design-system/app-segmented-control/app-segmented-control.js';
 import '/common/design-system/app-select/app-select.js';
 import '/common/design-system/app-table/app-table.js';
 import { call } from '../core/data-sources.js';
+import { navigate } from '../core/router.js';
 import { authService } from '/common/services/auth-service.js';
 import { insightsRequestBody, insightsViewModel } from '/common/utils/finops-insights.js';
 import { errorStateHtml } from '/common/design-system/app-empty-state/error-state.js';
@@ -384,7 +385,10 @@ class TokenopsPage extends HTMLElement {
     this.innerHTML = `
       <div class="page-head">
         <h1 class="title-page">TokenOps</h1>
-        <app-button variant="tertiary" size="md" id="export-btn">Export report</app-button>
+        <div class="head-actions">
+          <app-button variant="tertiary" size="md" id="budgets-btn">Budgets</app-button>
+          <app-button variant="tertiary" size="md" id="export-btn">Export report</app-button>
+        </div>
       </div>
 
       <div class="filter-bar">
@@ -554,6 +558,7 @@ class TokenopsPage extends HTMLElement {
       this.#load();
     });
     this.querySelector('#export-btn').addEventListener('click', () => this.#exportCsv());
+    this.querySelector('#budgets-btn').addEventListener('click', () => navigate('/budgets'));
 
     // Cosmetic gate only: the endpoint itself answers 403 to non-superusers.
     authService.fetchCurrentUser().catch(() => null).then(() => {

@@ -43,6 +43,7 @@ const BASE_ROUTES = [
   { path: '/mcp-detail',      tag: 'mcp-detail-page',          module: '/common/pages/mcp-detail-page.js',          title: 'Nasiko — MCP Server' },
   { path: '/llm-router',      tag: 'llm-router-page',          module: '/common/pages/llm-router-page.js',          title: 'Nasiko — LLM Router' },
   { path: '/tokenops',        tag: 'tokenops-page',            module: '/common/pages/tokenops-page.js',            title: 'Nasiko — TokenOps' },
+  { path: '/budgets',         tag: 'budgets-page',             module: '/common/pages/budgets-page.js',             title: 'Nasiko — Budgets' },
   { path: '/flows',           tag: 'flows-page',               module: '/common/pages/flows-page.js',               title: 'Nasiko — Flows' },
   { path: '/flow',            tag: 'flow-detail-page',         module: '/common/pages/flow-detail-page.js',         title: 'Nasiko — Flow' },
   { path: '/builds',          tag: 'builds-page',              module: '/common/pages/builds-page.js',              title: 'Nasiko — Builds' },

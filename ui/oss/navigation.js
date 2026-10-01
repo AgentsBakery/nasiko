@@ -47,6 +47,7 @@ const BASE_ITEMS = () => [
   { title: "MCP gateway", url: "/mcp", icon: "server", rail: true, module: "mcp" },
   { title: "LLM router", url: "/llm-router", icon: "route", rail: true },
   { title: "TokenOps", url: "/tokenops", icon: "banknote", rail: true },
+  { title: "Budgets", url: "/budgets", icon: "banknote" },
   { title: "Your Agents", url: "/your-agents", icon: "user", module: "agents" },
   { title: "Add Agent", url: "/add-agent", icon: "plus", module: "agents" },
   { title: "Set up CLI", url: "/setup-cli", icon: "terminal" },

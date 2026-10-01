@@ -1,0 +1,62 @@
+/* Budgets: admin management table and the read-only "My budgets" view. */
+
+@scope (budgets-page) {
+  .page-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--s-16);
+    margin-bottom: var(--s-16);
+  }
+
+  .table-wrap {
+    overflow-x: auto;
+    background: var(--bg-group);
+    border-radius: var(--r-12);
+    padding: var(--s-8) var(--s-16);
+  }
+
+  .budgets-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: var(--font-size-sm);
+    color: var(--color-text-main);
+  }
+
+  .budgets-table th {
+    text-align: left;
+    font-size: var(--font-size-xs);
+    font-weight: 500;
+    color: var(--color-text-muted);
+    padding: var(--s-8) var(--s-12);
+    white-space: nowrap;
+  }
+
+  .budgets-table td {
+    padding: var(--s-12);
+    border-top: 1px solid var(--color-border);
+    vertical-align: middle;
+  }
+
+  .budgets-table .num { text-align: right; white-space: nowrap; }
+  .budgets-table .name { font-weight: 500; }
+  .budgets-table .sub { color: var(--color-text-muted); font-size: var(--font-size-xs); }
+  .budgets-table .used { min-width: 140px; }
+  .budgets-table .used-label { font-size: var(--font-size-xs); color: var(--color-text-muted); }
+  .budgets-table .row-actions { display: flex; gap: var(--s-4); justify-content: flex-end; }
+
+  .modal-form {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s-12);
+    min-width: min(420px, 80vw);
+  }
+
+  .modal-form .pair {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--s-12);
+  }
+
+  .modal-form [hidden] { display: none; }
+}

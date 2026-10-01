@@ -118,6 +118,8 @@
     margin-bottom: var(--s-16);
   }
 
+  .head-actions { display: flex; gap: var(--s-8); }
+
   /* ── Filter bar: period on the left, everything that narrows it on the right.
      The dashed rule is the separator in the design — a solid hairline here read
      as a second page header. ─────────────────────────────────────────────── */
