@@ -39,9 +39,12 @@ All routes are under `/api`.
   `pct_used`, `projected_usd` (linear projection over the period), `period_start`,
   `resets_at`, and `state`.
 - `GET /budgets/me`: any authenticated user; returns only the budgets that apply to the
-  caller (own user budgets, their agents' budgets, platform budgets). Platform rows are
-  redacted for non-admins: the dollar fields (`limit_usd`, `spend_usd`, `projected_usd`)
-  are absent.
+  caller: own user budgets, platform budgets, budgets of agents the caller owns (full
+  amounts), and budgets of agents the caller can access through public visibility or
+  grants. Members see redacted rows (`pct_used`, `state`, `resets_at` and `period` only;
+  the dollar fields `limit_usd`, `spend_usd`, `projected_usd` are absent) for platform
+  budgets and for budgets on agents that are public or granted to them rather than
+  owned. Superusers see owned agents only, as before.
 - `state` is one of `ok`, `soft`, `downgrading`, `blocked`, `disabled`, `unknown`.
   `unknown` means the counter store was unavailable; spend is never reported as zero then.
 
@@ -174,8 +177,15 @@ flush or new-key window and is at most the cost of the calls committing inside i
 
 ## Known limitations
 
-- Orchestrator-internal LLM turns (`operation_type = 'orchestrator'`) are neither counted
-  nor gated; only router-metered calls are.
+- Budgets (and spend-spike detection) count only router-metered rows with
+  `operation_type IN ('direct_llm','embedding')`. Not counted or gated: `'orchestrator'`
+  (the orchestrator's own chat turns, written by `server/src/router/usage_meta.rs`),
+  `'router_selection'` (the agent-selector LLM call in `orchestrator/src/engine.rs`) and
+  `'mcp_tool_call'` (tool-call metering rows, not LLM spend).
+- TokenOps charts read `trace_usage` (materialized from Tempo traces) while budgets and
+  spend-spike alerts read `token_usage`, so TokenOps totals can differ from budget spend
+  (missing or late traces, excluded operation types). Budget enforcement always uses
+  `token_usage`.
 - Budget definitions are cached for 5 s per replica; edits converge across replicas within
   that time (the replica that handled the edit sees it immediately).
 - SDKs commonly retry 429 and 5xx responses. Budget refusals happen before any provider

@@ -227,6 +227,10 @@ markers, newest first, with `alert_id`, `hour_start`, `scope`, `scope_ref`, `age
   spend and the plotted bar can differ.
 - Alert links open TokenOps preselected: `/tokenops?agent=<uuid>&range=24h`. Only
   `24h`, `7d` and `30d` are accepted for `range`.
+- Budget alerts link to `/tokenops?agent=<uuid>&range=<24h|7d|30d>` for agent budgets and
+  `/tokenops?range=<r>` otherwise (range from the budget period: daily 24h, weekly 7d,
+  monthly 30d). `details.budget_url = "/budgets"` is shown as a secondary Budget button on
+  the Alerts page. Alerts raised before this change keep their stored `/budgets` link.
 
 ## Known limitations
 
