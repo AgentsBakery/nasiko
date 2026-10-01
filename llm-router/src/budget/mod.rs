@@ -311,6 +311,16 @@ impl BudgetEngine {
                         outcome.applied.push((budget, value, cost_micros));
                     }
                 }
+                // A crossing is only observable here: the Lua increment returns the
+                // post-value, so `pre = post - delta`. Rebuilt counters (`missing`) cannot
+                // show a crossing; their shared rebuild emits what it finds instead.
+                for (budget, post, delta) in &outcome.applied {
+                    let kinds = crossings(budget, post - delta, *post);
+                    if !kinds.is_empty() {
+                        let start = period_bounds(budget.period, now).0;
+                        self.emit_events(budget, start, *post, &kinds).await;
+                    }
+                }
             }
             Err(e) => {
                 tracing::warn!(%e, "budget record: increment failed, invalidating counters");
@@ -473,15 +483,23 @@ impl BudgetEngine {
         period_start: DateTime<Utc>,
         spend_micros: i64,
     ) {
+        let kinds = reached(budget, spend_micros);
+        self.emit_events(budget, period_start, spend_micros, &kinds)
+            .await;
+    }
+
+    /// Insert one `budget_events` row per kind. The UNIQUE constraint plus
+    /// `ON CONFLICT DO NOTHING` is the exactly-once mechanism across replicas and
+    /// concurrent callers (D-06). Failures are logged, never propagated.
+    async fn emit_events(
+        &self,
+        budget: &Budget,
+        period_start: DateTime<Utc>,
+        spend_micros: i64,
+        kinds: &[EventKind],
+    ) {
         let Some(db) = &self.db else { return };
-        let levels = [
-            ("soft_threshold", budget.soft_micros()),
-            ("hard_limit", budget.limit_micros),
-        ];
-        for (kind, at) in levels {
-            if spend_micros < at {
-                continue;
-            }
+        for kind in kinds {
             let res = sqlx::query(
                 "INSERT INTO budget_events (budget_id, period_start, kind, spend_usd, limit_usd) \
                  VALUES ($1, $2, $3, $4::float8, $5::float8) \
@@ -489,16 +507,53 @@ impl BudgetEngine {
             )
             .bind(budget.id)
             .bind(period_start)
-            .bind(kind)
+            .bind(kind.as_str())
             .bind(micros_to_usd(spend_micros))
             .bind(micros_to_usd(budget.limit_micros))
             .execute(db)
             .await;
             if let Err(e) = res {
-                tracing::warn!(budget_id = %budget.id, kind, %e, "emit_threshold_events: db error");
+                tracing::warn!(budget_id = %budget.id, kind = kind.as_str(), %e, "budget::record: event insert failed");
             }
         }
     }
+}
+
+// ─── events ──────────────────────────────────────────────────────────────────
+
+/// The two durable levels a budget reports; Phase 3 alerting consumes them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventKind {
+    SoftThreshold,
+    HardLimit,
+}
+
+impl EventKind {
+    /// The `budget_events.kind` value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EventKind::SoftThreshold => "soft_threshold",
+            EventKind::HardLimit => "hard_limit",
+        }
+    }
+}
+
+/// Levels a counter moving from `pre` to `post` crossed (`pre < level <= post`).
+pub fn crossings(budget: &Budget, pre: i64, post: i64) -> Vec<EventKind> {
+    let mut kinds = Vec::new();
+    if pre < budget.soft_micros() && budget.soft_micros() <= post {
+        kinds.push(EventKind::SoftThreshold);
+    }
+    if pre < budget.limit_micros && budget.limit_micros <= post {
+        kinds.push(EventKind::HardLimit);
+    }
+    kinds
+}
+
+/// Levels a counter value has already reached; used where no `pre` exists (a
+/// freshly rebuilt counter, or a blocked call).
+fn reached(budget: &Budget, spend_micros: i64) -> Vec<EventKind> {
+    crossings(budget, i64::MIN, spend_micros)
 }
 
 // ─── decision ────────────────────────────────────────────────────────────────
@@ -866,6 +921,64 @@ mod tests {
         assert_eq!(info.limit_micros, 4_000_000);
         assert_eq!(info.spend_micros, 4_200_000);
         assert_eq!(info.scope, Scope::Platform);
+    }
+
+    #[test]
+    fn crossings_soft_only() {
+        let b = budget(BudgetAction::Block);
+        // soft = 3_200_000, limit = 4_000_000
+        assert_eq!(
+            crossings(&b, 3_100_000, 3_200_000),
+            vec![EventKind::SoftThreshold]
+        );
+        assert_eq!(
+            crossings(&b, 3_199_999, 3_999_999),
+            vec![EventKind::SoftThreshold]
+        );
+    }
+
+    #[test]
+    fn crossings_hard_only() {
+        let b = budget(BudgetAction::Block);
+        assert_eq!(
+            crossings(&b, 3_900_000, 4_000_000),
+            vec![EventKind::HardLimit]
+        );
+    }
+
+    #[test]
+    fn crossings_both_at_once() {
+        let b = budget(BudgetAction::Block);
+        assert_eq!(
+            crossings(&b, 3_000_000, 4_500_000),
+            vec![EventKind::SoftThreshold, EventKind::HardLimit]
+        );
+    }
+
+    #[test]
+    fn crossings_none_when_already_past_or_short() {
+        let b = budget(BudgetAction::Block);
+        assert!(crossings(&b, 0, 3_199_999).is_empty());
+        assert!(crossings(&b, 3_200_000, 3_900_000).is_empty());
+        assert!(crossings(&b, 4_000_000, 5_000_000).is_empty());
+        assert!(crossings(&b, 5_000_000, 5_000_000).is_empty());
+    }
+
+    #[test]
+    fn reached_reports_every_level_at_or_below_spend() {
+        let b = budget(BudgetAction::Block);
+        assert!(reached(&b, 3_199_999).is_empty());
+        assert_eq!(reached(&b, 3_200_000), vec![EventKind::SoftThreshold]);
+        assert_eq!(
+            reached(&b, 4_000_000),
+            vec![EventKind::SoftThreshold, EventKind::HardLimit]
+        );
+    }
+
+    #[test]
+    fn event_kind_names_match_the_table_check() {
+        assert_eq!(EventKind::SoftThreshold.as_str(), "soft_threshold");
+        assert_eq!(EventKind::HardLimit.as_str(), "hard_limit");
     }
 
     #[tokio::test]

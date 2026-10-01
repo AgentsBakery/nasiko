@@ -1348,7 +1348,8 @@ async fn newest_usage_row(
 /// see the pricey model. Mocks are registered pricey-last-irrelevant: the body
 /// matchers are disjoint, so ordering does not matter.
 struct DowngradeUpstream {
-    server: mockito::ServerGuard,
+    /// Held only to keep the stub server alive for the test's duration.
+    _server: mockito::ServerGuard,
     pricey_chat: mockito::Mock,
     pricey_responses: mockito::Mock,
     cheap_chat: mockito::Mock,
@@ -1437,7 +1438,7 @@ async fn downgrade_upstream() -> DowngradeUpstream {
         .await;
     set_router_env(&upstream.url());
     DowngradeUpstream {
-        server: upstream,
+        _server: upstream,
         pricey_chat,
         pricey_responses,
         cheap_chat,
