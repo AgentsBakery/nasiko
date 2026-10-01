@@ -23,6 +23,11 @@ use crate::state::AppState;
     paths(
         crate::alerts::routes::list_alerts,
         crate::alerts::routes::acknowledge_alert,
+        crate::alerts::monitors::list_monitors,
+        crate::alerts::monitors::create_monitor,
+        crate::alerts::monitors::get_monitor,
+        crate::alerts::monitors::update_monitor,
+        crate::alerts::monitors::delete_monitor,
         crate::notifications::channels::list_channels,
         crate::notifications::channels::create_channel,
         crate::notifications::channels::get_channel,
@@ -121,6 +126,9 @@ use crate::state::AppState;
     ),
     components(schemas(
         crate::alerts::models::AlertView,
+        crate::alerts::monitors::MonitorView,
+        crate::alerts::monitors::CreateMonitorRequest,
+        crate::alerts::monitors::UpdateMonitorRequest,
         crate::notifications::channels::ChannelView,
         crate::notifications::channels::CreateChannelRequest,
         crate::notifications::channels::UpdateChannelRequest,

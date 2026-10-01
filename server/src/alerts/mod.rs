@@ -1,5 +1,5 @@
 //! Alerting: alert records with dedup and auto-resolve, the sources that raise
-//! them (budget events today), the outbox that notifications flow through, and
+//! them (budget events and error/latency monitors), the outbox that notifications flow through, and
 //! the background workers that drive it all.
 
 use std::future::Future;
@@ -18,10 +18,12 @@ use crate::state::AppState;
 pub mod budget_events;
 pub mod engine;
 pub mod models;
+pub mod monitors;
 pub mod routes;
 pub mod sweep;
 
 pub use budget_events::tick_budget_events;
+pub use monitors::tick_monitors;
 pub use sweep::tick_resolve_sweep;
 
 /// Admin alert routes. `GET /alerts/{id}` is deliberately absent: later plans
@@ -30,6 +32,16 @@ pub fn admin_router() -> Router<AppState> {
     Router::new()
         .route("/alerts", get(routes::list_alerts))
         .route("/alerts/{id}/acknowledge", post(routes::acknowledge_alert))
+        .route(
+            "/monitors",
+            get(monitors::list_monitors).post(monitors::create_monitor),
+        )
+        .route(
+            "/monitors/{id}",
+            get(monitors::get_monitor)
+                .put(monitors::update_monitor)
+                .delete(monitors::delete_monitor),
+        )
 }
 
 /// Spawn the alert workers. Each runs only when its interval is above 0 (tests
@@ -43,6 +55,17 @@ pub fn spawn_workers(db: PgPool, cfg: AlertsConfig) {
             move || {
                 let db = db.clone();
                 async move { tick_budget_events(&db, Utc::now()).await.map(|_| ()) }
+            },
+        ));
+    }
+    if cfg.monitors_secs > 0 {
+        let db = db.clone();
+        tokio::spawn(run_every(
+            "monitors",
+            Duration::from_secs(cfg.monitors_secs),
+            move || {
+                let db = db.clone();
+                async move { tick_monitors(&db, Utc::now()).await.map(|_| ()) }
             },
         ));
     }
