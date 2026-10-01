@@ -90,6 +90,24 @@ export function kindLabel(kind) {
   return ALERT_KINDS.find((k) => k.value === kind)?.label ?? kind;
 }
 
+const SHORT_ID_LEN = 8;
+
+/**
+ * Display text for an alert/monitor scope reference. Agent refs resolve to the
+ * agent name via `agentNames` (id -> name), falling back to a shortened id.
+ * Callers must still escape the result.
+ * @param {string} scope
+ * @param {string|null|undefined} ref
+ * @param {Map<string, string>} [agentNames]
+ * @returns {string}
+ */
+export function scopeRefLabel(scope, ref, agentNames) {
+  if (ref === null || ref === undefined || ref === '') return '';
+  const id = String(ref);
+  if (scope !== 'agent') return id;
+  return agentNames?.get(id) ?? id.slice(0, SHORT_ID_LEN);
+}
+
 const DELIVERY_TONES = { delivered: 'success', failed: 'error', pending: 'neutral', sending: 'info' };
 
 /** @param {string} status @returns {'success'|'error'|'neutral'|'info'} */

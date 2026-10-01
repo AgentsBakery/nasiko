@@ -173,3 +173,11 @@ test('deliveryStatusTone maps statuses', () => {
   assert.equal(A.deliveryStatusTone('sending'), 'info');
   assert.equal(A.deliveryStatusTone('x'), 'neutral');
 });
+
+test('scopeRefLabel resolves agent names and shortens unknown ids', () => {
+  const names = new Map([['f7819085-e5cf-4000-8000-000000000000', 'Support bot']]);
+  assert.equal(A.scopeRefLabel('agent', 'f7819085-e5cf-4000-8000-000000000000', names), 'Support bot');
+  assert.equal(A.scopeRefLabel('agent', 'abcdef12-3456', names), 'abcdef12');
+  assert.equal(A.scopeRefLabel('model', 'gpt-4o', names), 'gpt-4o');
+  assert.equal(A.scopeRefLabel('platform', null, names), '');
+});

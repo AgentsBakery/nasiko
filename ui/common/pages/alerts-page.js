@@ -36,7 +36,7 @@ import { authService } from '/common/services/auth-service.js';
 import {
   ALERT_KINDS, CHANNEL_KINDS, METRICS, MONITOR_SCOPES, SEVERITIES,
   channelPayload, deliveryStatusTone, kindLabel, monitorPayload, routesPayload,
-  severityTone, validateChannelForm, validateMonitorForm,
+  scopeRefLabel, severityTone, validateChannelForm, validateMonitorForm,
 } from '/common/utils/alerts.js';
 
 document.adoptedStyleSheets = [...document.adoptedStyleSheets, styles];
@@ -227,6 +227,7 @@ class AlertsPage extends HTMLElement {
     const resp = await call('fetchAgentList', { limit: AGENT_PICKER_LIMIT }).catch(() => null);
     this.#agents = asRows(resp).map((a) => ({ id: String(a.id), name: a.name || String(a.id) }));
     if (this.#monitors.length) this.#renderMonitors();
+    if (this.#alerts.length) this.#renderAlerts();
   }
 
   // ── alerts tab ───────────────────────────────────────────────────────────
@@ -265,7 +266,7 @@ class AlertsPage extends HTMLElement {
         <td>${escHtml(kindLabel(a.kind))}</td>
         <td><div class="name">${escHtml(a.title)}</div>
           <div class="sub">${escHtml(a.message)}</div></td>
-        <td>${escHtml(a.scope)}${a.scope_ref ? ` <span class="sub">${escHtml(a.scope_ref)}</span>` : ''}</td>
+        <td>${escHtml(a.scope)}${a.scope_ref ? ` <span class="sub">${escHtml(scopeRefLabel(a.scope, a.scope_ref, this.#agentNames()))}</span>` : ''}</td>
         <td class="nowrap">${escHtml(fmtDate(a.first_seen_at))}<div class="sub">last ${escHtml(fmtDate(a.last_seen_at))}</div></td>
         <td class="num">${escHtml(String(a.occurrences ?? 1))}</td>
         <td>${badge(a.status === 'open' ? 'warning' : a.status === 'resolved' ? 'success' : 'neutral', a.status)}</td>
@@ -320,11 +321,12 @@ class AlertsPage extends HTMLElement {
 
   #monitorTarget(m) {
     if (m.scope === 'platform') return 'Platform';
-    if (m.scope === 'agent') {
-      const name = this.#agents.find((a) => a.id === String(m.scope_ref))?.name ?? m.scope_ref;
-      return `Agent: ${name}`;
-    }
-    return `Model: ${m.scope_ref}`;
+    const label = scopeRefLabel(m.scope, m.scope_ref, this.#agentNames());
+    return m.scope === 'agent' ? `Agent: ${label}` : `Model: ${label}`;
+  }
+
+  #agentNames() {
+    return new Map(this.#agents.map((a) => [a.id, a.name]));
   }
 
   #renderMonitors() {
