@@ -816,7 +816,9 @@ class TokenopsPage extends HTMLElement {
     // `data.agents` comes back already filtered by `agent_id`, so adopting it
     // while an agent is selected would leave that agent as the dropdown's only
     // option — no way back to any other agent. Keep the last unfiltered list.
-    if (!this.#agentFilter || !this.#agents.length) this.#agents = data.agents || [];
+    if (!this.#agentFilter) this.#agents = data.agents || [];
+    else if (!this.#agents.length) this.#agents = await this.#unfilteredAgents(params, data.agents);
+    if (id !== this.#loadId) return;
     this.#summary = data.summary || {};
     this.#kpis = data.kpis || null;
     const rawRows = data.attributions?.rows ?? data.agents ?? [];
@@ -837,6 +839,21 @@ class TokenopsPage extends HTMLElement {
     // The day picker is independent of the window, but the agent filter still
     // applies to it — re-pull it on every load, not only when the day changes.
     this.#loadDay(id);
+  }
+
+  /** A deep link (`?agent=`) makes the first dashboard response agent-filtered,
+   *  which would leave the dropdown with only that agent. One unfiltered fetch
+   *  (same window, server-side scoping applies) restores the full accessible
+   *  list; on failure the filtered list is the fallback. */
+  async #unfilteredAgents(params, fallback) {
+    try {
+      const resp = await call('fetchTokenopsDashboard', { ...params, agentId: undefined });
+      const list = (resp?.data ?? resp ?? {}).agents;
+      if (Array.isArray(list) && list.length) return list;
+    } catch (e) {
+      console.error('TokenOps agent list fetch failed:', e);
+    }
+    return fallback || [];
   }
 
   async #loadSpikeMarkers(id, params) {
