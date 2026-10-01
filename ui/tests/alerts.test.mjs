@@ -53,3 +53,123 @@ test('markerAnomalies tolerates empty and non-array input', () => {
   assert.deepEqual(A.markerAnomalies(hourPoints, 'hour', undefined), []);
   assert.deepEqual(A.markerAnomalies(hourPoints, 'hour', [{ title: 'no time' }]), []);
 });
+
+// ─── view helpers (alerts page) ─────────────────────────────────────────────
+
+test('alertQuery keeps only non-empty keys', () => {
+  const q = A.alertQuery({
+    status: 'open', kind: '', severity: 'critical', scope: undefined,
+    since: '2026-10-01T00:00:00Z', limit: 50, cursor: 'abc',
+  });
+  assert.deepEqual(Object.fromEntries(new URLSearchParams(q)), {
+    status: 'open', severity: 'critical', since: '2026-10-01T00:00:00Z', limit: '50', cursor: 'abc',
+  });
+  assert.equal(A.alertQuery({}), '');
+});
+
+test('severityTone maps to badge variants', () => {
+  assert.equal(A.severityTone('critical'), 'error');
+  assert.equal(A.severityTone('warning'), 'warning');
+  assert.equal(A.severityTone('info'), 'info');
+  assert.equal(A.severityTone('weird'), 'neutral');
+});
+
+test('kindLabel names known kinds and passes unknown through', () => {
+  assert.equal(A.kindLabel('budget_soft'), 'Budget soft threshold');
+  assert.equal(A.kindLabel('budget_hard'), 'Budget exhausted');
+  assert.equal(A.kindLabel('spend_spike'), 'Spend spike');
+  assert.equal(A.kindLabel('monitor_breach'), 'Monitor breach');
+  assert.equal(A.kindLabel('other_kind'), 'other_kind');
+});
+
+const goodMonitor = {
+  name: 'API errors', metric: 'error_rate', scope: 'agent', scope_ref: 'a1',
+  window_minutes: '15', threshold: '10', min_samples: '20', severity: 'warning',
+};
+
+test('validateMonitorForm accepts valid forms', () => {
+  assert.deepEqual(A.validateMonitorForm(goodMonitor), {});
+  assert.deepEqual(A.validateMonitorForm({ ...goodMonitor, scope: 'model', scope_ref: 'gpt-4o' }), {});
+  assert.deepEqual(A.validateMonitorForm({ ...goodMonitor, scope: 'platform', scope_ref: 'ignored' }), {});
+});
+
+test('validateMonitorForm reports field errors', () => {
+  const bad = (patch) => A.validateMonitorForm({ ...goodMonitor, ...patch });
+  assert.ok(bad({ name: '  ' }).name);
+  assert.ok(bad({ name: 'x'.repeat(121) }).name);
+  assert.ok(bad({ scope: 'agent', scope_ref: '' }).scope_ref);
+  assert.ok(bad({ scope: 'model', scope_ref: ' ' }).scope_ref);
+  assert.ok(bad({ window_minutes: '4' }).window_minutes);
+  assert.ok(bad({ window_minutes: '1441' }).window_minutes);
+  assert.ok(bad({ window_minutes: '10.5' }).window_minutes);
+  assert.ok(bad({ threshold: '0' }).threshold);
+  assert.ok(bad({ metric: 'error_rate', threshold: '100.5' }).threshold);
+  assert.equal(bad({ metric: 'p95_latency_ms', threshold: '2500' }).threshold, undefined);
+  assert.ok(bad({ min_samples: '0' }).min_samples);
+});
+
+test('monitorPayload parses numbers and drops platform scope_ref', () => {
+  assert.deepEqual(A.monitorPayload({ ...goodMonitor, name: '  API errors  ', enabled: true }), {
+    name: 'API errors', metric: 'error_rate', scope: 'agent', scope_ref: 'a1',
+    window_minutes: 15, threshold: 10, min_samples: 20, severity: 'warning', enabled: true,
+  });
+  const p = A.monitorPayload({ ...goodMonitor, scope: 'platform', scope_ref: 'x' });
+  assert.equal(p.scope_ref, null);
+});
+
+test('validateChannelForm requires https url on create and rejects http by default', () => {
+  const ok = { name: 'ops', kind: 'webhook', url: 'https://example.com/hook', hmac_secret: '' };
+  assert.deepEqual(A.validateChannelForm(ok, { isEdit: false }), {});
+  assert.ok(A.validateChannelForm({ ...ok, name: '' }, { isEdit: false }).name);
+  assert.ok(A.validateChannelForm({ ...ok, kind: '' }, { isEdit: false }).kind);
+  assert.ok(A.validateChannelForm({ ...ok, url: '' }, { isEdit: false }).url);
+  assert.ok(A.validateChannelForm({ ...ok, url: 'http://example.com/h' }, { isEdit: false }).url);
+  assert.deepEqual(
+    A.validateChannelForm({ ...ok, url: 'http://example.com/h' }, { isEdit: false, allowInsecure: true }), {});
+  assert.ok(A.validateChannelForm({ ...ok, kind: 'slack', hmac_secret: 's' }, { isEdit: false }).hmac_secret);
+});
+
+test('validateChannelForm edit allows an empty url (unchanged)', () => {
+  const form = { name: 'ops', kind: 'webhook', url: '', hmac_secret: '' };
+  assert.deepEqual(A.validateChannelForm(form, { isEdit: true }), {});
+  assert.ok(A.validateChannelForm({ ...form, url: 'ftp://x' }, { isEdit: true }).url);
+});
+
+test('channelPayload create includes url and secret only when present', () => {
+  assert.deepEqual(
+    A.channelPayload({ name: ' ops ', kind: 'webhook', url: 'https://e.com/h', hmac_secret: '', enabled: true }, { isEdit: false }),
+    { name: 'ops', kind: 'webhook', url: 'https://e.com/h', enabled: true });
+  assert.equal(
+    A.channelPayload({ name: 'o', kind: 'webhook', url: 'https://e.com/h', hmac_secret: 'sec' }, { isEdit: false }).hmac_secret,
+    'sec');
+});
+
+test('channelPayload edit omits unchanged url and honours keep/clear for the secret', () => {
+  const base = { name: 'ops', kind: 'webhook', url: '', hmac_secret: '', hmac_mode: 'keep' };
+  const keep = A.channelPayload(base, { isEdit: true });
+  assert.ok(!('url' in keep) && !('hmac_secret' in keep) && !('kind' in keep));
+  assert.equal(A.channelPayload({ ...base, hmac_mode: 'clear' }, { isEdit: true }).hmac_secret, '');
+  const set = A.channelPayload({ ...base, url: 'https://e.com/n', hmac_mode: 'set', hmac_secret: 'new' }, { isEdit: true });
+  assert.equal(set.url, 'https://e.com/n');
+  assert.equal(set.hmac_secret, 'new');
+});
+
+test('routesPayload maps any to null and removes exact duplicates', () => {
+  assert.deepEqual(A.routesPayload([
+    { alert_kind: '', min_severity: 'warning' },
+    { alert_kind: 'any', min_severity: 'warning' },
+    { alert_kind: 'budget_hard', min_severity: 'critical' },
+    { alert_kind: 'budget_hard', min_severity: 'critical' },
+  ]), { routes: [
+    { alert_kind: null, min_severity: 'warning' },
+    { alert_kind: 'budget_hard', min_severity: 'critical' },
+  ] });
+});
+
+test('deliveryStatusTone maps statuses', () => {
+  assert.equal(A.deliveryStatusTone('delivered'), 'success');
+  assert.equal(A.deliveryStatusTone('failed'), 'error');
+  assert.equal(A.deliveryStatusTone('pending'), 'neutral');
+  assert.equal(A.deliveryStatusTone('sending'), 'info');
+  assert.equal(A.deliveryStatusTone('x'), 'neutral');
+});
