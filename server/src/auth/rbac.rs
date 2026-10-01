@@ -29,11 +29,15 @@ pub async fn require_admin(State(state): State<AppState>, req: Request, next: Ne
     match req.extensions().get::<Claims>() {
         Some(claims) => {
             let identity = claims.clone().into();
-            if state.auth.can_manage_pool(&identity).await {
-                next.run(req).await
-            } else {
-                (StatusCode::FORBIDDEN, "requires admin role or higher").into_response()
+            if !state.auth.can_manage_pool(&identity).await {
+                return (StatusCode::FORBIDDEN, "requires admin role or higher").into_response();
             }
+            // OSS `can_manage_pool` is allow-all, so the service check alone
+            // admits every member; also require the admin predicate.
+            if let Err(denied) = crate::users::require_admin_caller(&state, claims).await {
+                return denied;
+            }
+            next.run(req).await
         }
         None => (StatusCode::UNAUTHORIZED, "not authenticated").into_response(),
     }
