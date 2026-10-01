@@ -21,6 +21,8 @@ use crate::state::AppState;
         version = "0.1.0"
     ),
     paths(
+        crate::alerts::routes::list_alerts,
+        crate::alerts::routes::acknowledge_alert,
         crate::budgets::routes::list_budgets,
         crate::budgets::routes::create_budget,
         crate::budgets::routes::get_budget,
@@ -109,6 +111,7 @@ use crate::state::AppState;
         crate::observability::routes::agent_logs_stream,
     ),
     components(schemas(
+        crate::alerts::models::AlertView,
         crate::budgets::models::CreateBudgetRequest,
         crate::budgets::models::UpdateBudgetRequest,
         crate::budgets::models::BudgetView,

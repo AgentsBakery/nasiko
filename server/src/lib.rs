@@ -199,6 +199,13 @@ where
 
     // Budget administration. `require_user_manager` is allow-all in OSS, so
     // each handler also checks the admin role.
+    // Alert administration. Same shape: the OSS layer is allow-all, so the
+    // handlers check the admin role themselves.
+    let alert_admin_routes = alerts::admin_router().layer(middleware::from_fn_with_state(
+        state.clone(),
+        auth::rbac::require_user_manager,
+    ));
+
     let budget_admin_routes = budgets::admin_router().layer(middleware::from_fn_with_state(
         state.clone(),
         auth::rbac::require_user_manager,
@@ -278,6 +285,7 @@ where
         .merge(pool_routes)
         .merge(user_routes)
         .merge(budget_admin_routes)
+        .merge(alert_admin_routes)
         .merge(budgets::me_router())
         .merge(build_routes)
         .merge(degradable_routes)

@@ -371,6 +371,11 @@ impl AppState {
             ));
         }
 
+        // Alert workers (budget events, resolver sweep). Each is gated by its
+        // own interval inside spawn_workers: 0 = off, and tests drive the
+        // tick_* functions directly.
+        crate::alerts::spawn_workers(state.db.clone(), state.config.alerts.clone());
+
         // Trace-usage materializer: reads recent traces from Tempo, extracts
         // FinOps metrics, and upserts into trace_usage so dashboard queries
         // hit Postgres instead of Tempo. 0 disables.
