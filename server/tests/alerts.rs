@@ -940,3 +940,914 @@ async fn member_gets_403_on_alert_routes() {
     );
     server.cleanup().await;
 }
+
+// ─── notifications ───────────────────────────────────────────────────────────
+
+use hmac::{Hmac, Mac};
+use nasiko_config::AlertsConfig;
+use nasiko_server::notifications::dispatch::{
+    DispatchDeps, SendResult, finish_row, tick_outbox_dispatch,
+};
+use sha2::Sha256;
+
+fn dispatch_deps(allow_private: bool) -> DispatchDeps {
+    let mut cfg = AlertsConfig::disabled();
+    cfg.allow_private_urls = allow_private;
+    DispatchDeps::from_config(&cfg)
+}
+
+async fn private_server() -> TestServer {
+    TestServer::start_with(|c| c.alerts.allow_private_urls = true).await
+}
+
+/// Headers and body of the most recent request a mock matched.
+#[derive(Clone, Default)]
+struct Captured(std::sync::Arc<std::sync::Mutex<Option<(Vec<(String, String)>, Vec<u8>)>>>);
+
+impl Captured {
+    fn matcher(&self) -> impl Fn(&mockito::Request) -> bool + Send + Sync + 'static {
+        let slot = self.0.clone();
+        move |req| {
+            let headers = req
+                .headers()
+                .iter()
+                .map(|(k, v)| (k.as_str().to_owned(), v.to_str().unwrap_or("").to_owned()))
+                .collect();
+            let body = req.body().map(|b| b.clone()).unwrap_or_default();
+            *slot.lock().unwrap() = Some((headers, body));
+            true
+        }
+    }
+
+    fn header(&self, name: &str) -> Option<String> {
+        let guard = self.0.lock().unwrap();
+        let (headers, _) = guard.as_ref()?;
+        headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    }
+
+    fn body(&self) -> Vec<u8> {
+        self.0
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(_, b)| b.clone())
+            .unwrap_or_default()
+    }
+}
+
+async fn post_channel(server: &TestServer, root: Uuid, body: Value) -> reqwest::Response {
+    admin(
+        root,
+        server.client.post(server.url("/api/notification-channels")),
+    )
+    .json(&body)
+    .send()
+    .await
+    .expect("post channel")
+}
+
+async fn make_channel(server: &TestServer, root: Uuid, body: Value) -> Uuid {
+    let resp = post_channel(server, root, body).await;
+    assert_eq!(resp.status(), 201, "create channel");
+    let v = resp.json::<Value>().await.unwrap();
+    v["data"]["id"].as_str().unwrap().parse().unwrap()
+}
+
+fn webhook_body(name: &str, url: &str, hmac_secret: Option<&str>) -> Value {
+    let mut b = json!({"name": name, "kind": "webhook", "url": url});
+    if let Some(s) = hmac_secret {
+        b["hmac_secret"] = json!(s);
+    }
+    b
+}
+
+async fn put_routes(server: &TestServer, root: Uuid, channel: Uuid, routes: Value) -> Value {
+    let resp = admin(
+        root,
+        server
+            .client
+            .put(server.url(&format!("/api/notification-channels/{channel}/routes"))),
+    )
+    .json(&json!({ "routes": routes }))
+    .send()
+    .await
+    .expect("put routes");
+    assert_eq!(resp.status(), 200, "put routes");
+    resp.json::<Value>().await.unwrap()
+}
+
+async fn insert_outbox(server: &TestServer, channel: Uuid, title: &str) -> Uuid {
+    let payload = json!({
+        "event": "opened",
+        "alert": {
+            "id": Uuid::new_v4(), "kind": "budget_soft", "severity": "warning",
+            "scope": "platform", "scope_ref": null, "title": title, "message": "m",
+            "link": "/budgets", "first_seen_at": "2026-01-01T00:00:00.000000Z",
+            "last_seen_at": "2026-01-01T00:00:00.000000Z", "occurrences": 1, "status": "open",
+        },
+    });
+    sqlx::query_scalar(
+        "INSERT INTO notification_outbox (channel_id, event, payload) \
+         VALUES ($1, 'opened', $2) RETURNING id",
+    )
+    .bind(channel)
+    .bind(payload)
+    .fetch_one(&server.db)
+    .await
+    .expect("insert outbox")
+}
+
+async fn outbox_row(server: &TestServer, id: Uuid) -> Value {
+    sqlx::query_scalar::<_, Value>("SELECT to_jsonb(o) FROM notification_outbox o WHERE id = $1")
+        .bind(id)
+        .fetch_one(&server.db)
+        .await
+        .expect("outbox row")
+}
+
+async fn raise_budget_event(server: &TestServer, root: Uuid, name: &str, kind: &str) {
+    let user = seed_user(server, &format!("u-{}", Uuid::new_v4().simple()), "member").await;
+    let budget = create_budget(server, root, user_budget(name, user, 10.0)).await;
+    let now = Utc::now();
+    insert_event(
+        server,
+        budget["id"].as_str().unwrap(),
+        month_start(now),
+        kind,
+        10.0,
+        10.0,
+    )
+    .await;
+    assert_eq!(tick_budget_events(&server.db, now).await.unwrap(), 1);
+}
+
+#[tokio::test]
+#[serial]
+async fn channel_crud_never_returns_secrets() {
+    let server = private_server().await;
+    let root = seed_root(&server).await;
+    let mut receiver = mockito::Server::new_async().await;
+    let hook = receiver
+        .mock("POST", "/hook/SECRETPATH1234")
+        .with_status(200)
+        .expect(1)
+        .create_async()
+        .await;
+    let url = format!("{}/hook/SECRETPATH1234", receiver.url());
+
+    let resp = post_channel(&server, root, webhook_body("crud", &url, Some("s3cr3t"))).await;
+    assert_eq!(resp.status(), 201);
+    let text = resp.text().await.unwrap();
+    let v: Value = serde_json::from_str(&text).unwrap();
+    let id = v["data"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(v["data"]["has_hmac_secret"], true);
+    assert!(v["data"]["url_hint"].is_string());
+    for forbidden in ["url", "hmac_secret", "config_encrypted"] {
+        assert!(v["data"].get(forbidden).is_none(), "{forbidden} leaked");
+    }
+    assert!(!text.contains("SECRETPATH") && !text.contains("s3cr3t"));
+
+    let stored: String = sqlx::query_scalar(
+        "SELECT config_encrypted FROM notification_channels WHERE id = $1::uuid",
+    )
+    .bind(&id)
+    .fetch_one(&server.db)
+    .await
+    .unwrap();
+    assert!(!stored.contains("SECRETPATH") && !stored.contains("s3cr3t"));
+
+    let list = admin(
+        root,
+        server.client.get(server.url("/api/notification-channels")),
+    )
+    .send()
+    .await
+    .unwrap()
+    .text()
+    .await
+    .unwrap();
+    assert!(!list.contains("SECRETPATH") && !list.contains("s3cr3t"));
+    assert!(list.contains(&id));
+
+    let one_url = server.url(&format!("/api/notification-channels/{id}"));
+    let one = admin(root, server.client.get(&one_url))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!one.contains("SECRETPATH") && !one.contains("s3cr3t"));
+
+    let put = admin(root, server.client.put(&one_url))
+        .json(&json!({"name": "renamed"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status(), 200);
+    let put_text = put.text().await.unwrap();
+    assert!(!put_text.contains("SECRETPATH") && !put_text.contains("s3cr3t"));
+    let pv: Value = serde_json::from_str(&put_text).unwrap();
+    assert_eq!(pv["data"]["name"], "renamed");
+    assert_eq!(pv["data"]["has_hmac_secret"], true);
+
+    // The URL survived the unrelated update: a test send still reaches the path.
+    let test = admin(root, server.client.post(format!("{one_url}/test")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(test.status(), 200);
+    hook.assert_async().await;
+
+    let cleared = admin(root, server.client.put(&one_url))
+        .json(&json!({"hmac_secret": ""}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cleared.status(), 200);
+    let cv = cleared.json::<Value>().await.unwrap();
+    assert_eq!(cv["data"]["has_hmac_secret"], false);
+
+    let del = admin(root, server.client.delete(&one_url))
+        .send()
+        .await
+        .unwrap();
+    assert!(del.status().is_success(), "delete: {}", del.status());
+    let gone = admin(root, server.client.get(&one_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(gone.status(), 404);
+    assert_eq!(gone.json::<Value>().await.unwrap()["code"], "not_found");
+
+    let slack = post_channel(
+        &server,
+        root,
+        json!({"name": "s", "kind": "slack", "url": format!("{}/services/T/B/X", receiver.url()),
+               "hmac_secret": "nope"}),
+    )
+    .await;
+    assert_eq!(slack.status(), 400);
+    assert_eq!(
+        slack.json::<Value>().await.unwrap()["code"],
+        "hmac_not_supported"
+    );
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn channel_url_policy_default_server() {
+    let server = TestServer::start().await;
+    let root = seed_root(&server).await;
+    let cases = [
+        ("webhook", "http://example.com/x"),
+        ("webhook", "https://127.0.0.1/x"),
+        ("webhook", "https://[::1]/x"),
+        ("webhook", "https://169.254.169.254/latest"),
+        ("webhook", "https://[::ffff:127.0.0.1]/x"),
+        ("webhook", "https://localhost/x"),
+        ("webhook", "https://hooks.slack.com@127.0.0.1/x"),
+        ("slack", "https://example.com/services/x"),
+    ];
+    for (kind, url) in cases {
+        let resp = post_channel(
+            &server,
+            root,
+            json!({"name": "bad", "kind": kind, "url": url}),
+        )
+        .await;
+        assert_eq!(resp.status(), 400, "{url}");
+        let text = resp.text().await.unwrap();
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["code"], "invalid_channel_url", "{url}");
+        assert!(
+            !text.contains("example.com") && !text.contains("127.0.0.1"),
+            "{text}"
+        );
+    }
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM notification_channels")
+        .fetch_one(&server.db)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn routes_replace_and_validate() {
+    let server = private_server().await;
+    let root = seed_root(&server).await;
+    let channel = make_channel(
+        &server,
+        root,
+        webhook_body("r", "http://127.0.0.1:9/x", None),
+    )
+    .await;
+    let routes_url = server.url(&format!("/api/notification-channels/{channel}/routes"));
+
+    put_routes(
+        &server,
+        root,
+        channel,
+        json!([
+            {"alert_kind": null, "min_severity": "warning"},
+            {"alert_kind": "budget_hard", "min_severity": "critical"},
+        ]),
+    )
+    .await;
+    let got = admin(root, server.client.get(&routes_url))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(got["data"].as_array().unwrap().len(), 2);
+
+    put_routes(
+        &server,
+        root,
+        channel,
+        json!([{"alert_kind": "spend_spike", "min_severity": "info"}]),
+    )
+    .await;
+    let got = admin(root, server.client.get(&routes_url))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    let rows = got["data"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["alert_kind"], "spend_spike");
+    assert_eq!(rows[0]["min_severity"], "info");
+
+    for bad in [
+        json!([{"alert_kind": "nope", "min_severity": "info"}]),
+        json!([{"alert_kind": null, "min_severity": "loud"}]),
+    ] {
+        let resp = admin(root, server.client.put(&routes_url))
+            .json(&json!({ "routes": bad }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        assert_eq!(resp.json::<Value>().await.unwrap()["code"], "invalid_route");
+    }
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn budget_alert_delivered_with_hmac() {
+    let server = private_server().await;
+    let root = seed_root(&server).await;
+    let captured = Captured::default();
+    let mut receiver = mockito::Server::new_async().await;
+    let hook = receiver
+        .mock("POST", "/hook")
+        .match_request(captured.matcher())
+        .with_status(200)
+        .expect(1)
+        .create_async()
+        .await;
+    let channel = make_channel(
+        &server,
+        root,
+        webhook_body(
+            "hmac",
+            &format!("{}/hook", receiver.url()),
+            Some("topsecret"),
+        ),
+    )
+    .await;
+    put_routes(
+        &server,
+        root,
+        channel,
+        json!([{"alert_kind": null, "min_severity": "info"}]),
+    )
+    .await;
+
+    raise_budget_event(&server, root, "hmac budget", "soft_threshold").await;
+    let stats = tick_outbox_dispatch(&server.db, &dispatch_deps(true))
+        .await
+        .unwrap();
+    assert_eq!((stats.claimed, stats.delivered), (1, 1));
+    hook.assert_async().await;
+
+    assert_eq!(
+        captured.header("content-type").as_deref(),
+        Some("application/json")
+    );
+    assert_eq!(captured.header("x-nasiko-event").as_deref(), Some("opened"));
+    let row = outbox(&server).await.remove(0);
+    assert_eq!(
+        captured.header("x-nasiko-delivery").as_deref(),
+        row["id"].as_str()
+    );
+    let ts: i64 = captured
+        .header("x-nasiko-timestamp")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((Utc::now().timestamp() - ts).abs() < 60);
+    let body = captured.body();
+    let mut mac = Hmac::<Sha256>::new_from_slice(b"topsecret").unwrap();
+    mac.update(format!("{ts}.").as_bytes());
+    mac.update(&body);
+    let expected = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+    assert_eq!(captured.header("x-nasiko-signature"), Some(expected));
+
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["event"], "opened");
+    assert_eq!(v["alert"]["kind"], "budget_soft");
+    assert_eq!(v["alert"]["link"], "/budgets");
+    assert!(v["sent_at"].is_string());
+
+    assert_eq!(row["status"], "delivered");
+    assert!(row["delivered_at"].is_string());
+    assert_eq!(row["attempts"], 1);
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn slack_delivery_shape() {
+    let server = private_server().await;
+    let root = seed_root(&server).await;
+    let captured = Captured::default();
+    let mut receiver = mockito::Server::new_async().await;
+    let hook = receiver
+        .mock("POST", "/services/T/B/X")
+        .match_request(captured.matcher())
+        .with_status(200)
+        .expect(1)
+        .create_async()
+        .await;
+    let channel = make_channel(
+        &server,
+        root,
+        json!({"name": "slack", "kind": "slack", "url": format!("{}/services/T/B/X", receiver.url())}),
+    )
+    .await;
+    put_routes(
+        &server,
+        root,
+        channel,
+        json!([{"alert_kind": null, "min_severity": "info"}]),
+    )
+    .await;
+
+    raise_budget_event(&server, root, "a<b>&c", "hard_limit").await;
+    tick_outbox_dispatch(&server.db, &dispatch_deps(true))
+        .await
+        .unwrap();
+    hook.assert_async().await;
+
+    let v: Value = serde_json::from_slice(&captured.body()).unwrap();
+    let text = v["text"].as_str().expect("text");
+    assert!(v["blocks"].is_array());
+    assert!(text.contains("a&lt;b&gt;&amp;c"), "{text}");
+    assert!(!text.contains("a<b>"), "{text}");
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn failing_receiver_backs_off_then_fails() {
+    let server = private_server().await;
+    let root = seed_root(&server).await;
+    let mut receiver = mockito::Server::new_async().await;
+    let hook = receiver
+        .mock("POST", "/fail")
+        .with_status(500)
+        .expect(6)
+        .create_async()
+        .await;
+    let channel = make_channel(
+        &server,
+        root,
+        webhook_body("fail", &format!("{}/fail", receiver.url()), None),
+    )
+    .await;
+    let id = insert_outbox(&server, channel, "t").await;
+    let deps = dispatch_deps(true);
+
+    tick_outbox_dispatch(&server.db, &deps).await.unwrap();
+    let row = outbox_row(&server, id).await;
+    assert_eq!(row["status"], "pending");
+    assert_eq!(row["attempts"], 1);
+    assert_eq!(row["last_error"], "http_5xx");
+    let next: DateTime<Utc> = row["next_attempt_at"].as_str().unwrap().parse().unwrap();
+    let delta = (next - Utc::now()).num_seconds();
+    assert!((25..=35).contains(&delta), "first backoff was {delta}s");
+
+    for _ in 0..5 {
+        sqlx::query("UPDATE notification_outbox SET next_attempt_at = now() WHERE id = $1")
+            .bind(id)
+            .execute(&server.db)
+            .await
+            .unwrap();
+        tick_outbox_dispatch(&server.db, &deps).await.unwrap();
+    }
+    let row = outbox_row(&server, id).await;
+    assert_eq!(row["status"], "failed");
+    assert_eq!(row["attempts"], 6);
+    let err = row["last_error"].as_str().unwrap();
+    assert!(
+        !err.contains("http://") && !err.contains("127.0.0.1"),
+        "{err}"
+    );
+
+    tick_outbox_dispatch(&server.db, &deps).await.unwrap();
+    hook.assert_async().await;
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn concurrent_dispatchers_send_each_row_once() {
+    let server = private_server().await;
+    let root = seed_root(&server).await;
+    let mut receiver = mockito::Server::new_async().await;
+    let hook = receiver
+        .mock("POST", "/once")
+        .with_status(200)
+        .expect(10)
+        .create_async()
+        .await;
+    let channel = make_channel(
+        &server,
+        root,
+        webhook_body("once", &format!("{}/once", receiver.url()), None),
+    )
+    .await;
+    let mut ids = Vec::new();
+    for i in 0..10 {
+        ids.push(insert_outbox(&server, channel, &format!("t{i}")).await);
+    }
+
+    let pool_a = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(3)
+        .connect(&server.db_url)
+        .await
+        .unwrap();
+    let pool_b = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(3)
+        .connect(&server.db_url)
+        .await
+        .unwrap();
+    let deps = dispatch_deps(true);
+    let (a, b) = tokio::join!(
+        tick_outbox_dispatch(&pool_a, &deps),
+        tick_outbox_dispatch(&pool_b, &deps)
+    );
+    let (a, b) = (a.unwrap(), b.unwrap());
+    let mut claimed = a.claimed + b.claimed;
+    for _ in 0..3 {
+        let left: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM notification_outbox WHERE status <> 'delivered'",
+        )
+        .fetch_one(&server.db)
+        .await
+        .unwrap();
+        if left == 0 {
+            break;
+        }
+        claimed += tick_outbox_dispatch(&pool_a, &deps).await.unwrap().claimed;
+    }
+    assert_eq!(claimed, 10);
+    hook.assert_async().await;
+    for id in ids {
+        let row = outbox_row(&server, id).await;
+        assert_eq!(row["status"], "delivered");
+        assert_eq!(row["attempts"], 1);
+    }
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn stale_reclaim_does_not_double_finish() {
+    let server = private_server().await;
+    let root = seed_root(&server).await;
+    let channel = make_channel(
+        &server,
+        root,
+        webhook_body("stale", "http://127.0.0.1:9/x", None),
+    )
+    .await;
+    let id = insert_outbox(&server, channel, "t").await;
+
+    let t1: DateTime<Utc> = sqlx::query_scalar(
+        "UPDATE notification_outbox SET status = 'sending', attempts = 1, \
+         claimed_at = now() - interval '5 minutes' WHERE id = $1 RETURNING claimed_at",
+    )
+    .bind(id)
+    .fetch_one(&server.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE notification_outbox SET claimed_at = now(), attempts = attempts + 1 WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&server.db)
+    .await
+    .unwrap();
+
+    let result = SendResult {
+        delivered: true,
+        status_code: Some(200),
+        error: None,
+    };
+    let applied = finish_row(&server.db, id, t1, &result, 1).await.unwrap();
+    assert!(!applied, "stale worker must not apply its result");
+    let row = outbox_row(&server, id).await;
+    assert_eq!(row["status"], "sending");
+    assert_eq!(row["attempts"], 2);
+    assert!(row["delivered_at"].is_null());
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn stale_sending_row_is_reclaimed() {
+    let server = private_server().await;
+    let root = seed_root(&server).await;
+    let mut receiver = mockito::Server::new_async().await;
+    let hook = receiver
+        .mock("POST", "/stale")
+        .with_status(200)
+        .expect(1)
+        .create_async()
+        .await;
+    let channel = make_channel(
+        &server,
+        root,
+        webhook_body("stale", &format!("{}/stale", receiver.url()), None),
+    )
+    .await;
+    let stale = insert_outbox(&server, channel, "stale").await;
+    let fresh = insert_outbox(&server, channel, "fresh").await;
+    for (id, age) in [(stale, "3 minutes"), (fresh, "30 seconds")] {
+        sqlx::query(&format!(
+            "UPDATE notification_outbox SET status = 'sending', attempts = 1, \
+             claimed_at = now() - interval '{age}' WHERE id = $1"
+        ))
+        .bind(id)
+        .execute(&server.db)
+        .await
+        .unwrap();
+    }
+    tick_outbox_dispatch(&server.db, &dispatch_deps(true))
+        .await
+        .unwrap();
+    hook.assert_async().await;
+    assert_eq!(outbox_row(&server, stale).await["status"], "delivered");
+    assert_eq!(outbox_row(&server, stale).await["attempts"], 2);
+    assert_eq!(outbox_row(&server, fresh).await["status"], "sending");
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn disabled_channel_marks_failed() {
+    let server = private_server().await;
+    let root = seed_root(&server).await;
+    let mut receiver = mockito::Server::new_async().await;
+    let hook = receiver
+        .mock("POST", "/off")
+        .with_status(200)
+        .expect(0)
+        .create_async()
+        .await;
+    let channel = make_channel(
+        &server,
+        root,
+        webhook_body("off", &format!("{}/off", receiver.url()), None),
+    )
+    .await;
+    let id = insert_outbox(&server, channel, "t").await;
+    let resp = admin(
+        root,
+        server
+            .client
+            .put(server.url(&format!("/api/notification-channels/{channel}"))),
+    )
+    .json(&json!({"enabled": false}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    tick_outbox_dispatch(&server.db, &dispatch_deps(true))
+        .await
+        .unwrap();
+    let row = outbox_row(&server, id).await;
+    assert_eq!(row["status"], "failed");
+    assert_eq!(row["last_error"], "channel_disabled");
+    hook.assert_async().await;
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn send_time_ssrf_recheck() {
+    let server = TestServer::start().await;
+    let root = seed_root(&server).await;
+    let _ = root;
+    let crypto = nasiko_secrets::SecretsCrypto::try_for_system().expect("test master key");
+    let channel: Uuid = sqlx::query_scalar(
+        "INSERT INTO notification_channels (name, kind, config_encrypted, url_hint) \
+         VALUES ('ssrf', 'webhook', $1, 'h') RETURNING id",
+    )
+    .bind(crypto.encrypt(r#"{"url":"http://127.0.0.1:9/x"}"#))
+    .fetch_one(&server.db)
+    .await
+    .unwrap();
+    seed_route(&server, channel, None, "info").await;
+    let id = insert_outbox(&server, channel, "t").await;
+
+    tick_outbox_dispatch(&server.db, &dispatch_deps(false))
+        .await
+        .unwrap();
+    let row = outbox_row(&server, id).await;
+    let err = row["last_error"].as_str().unwrap();
+    assert!(
+        err == "blocked_address" || err == "invalid_url" || err == "scheme_not_allowed",
+        "unexpected error {err}"
+    );
+    assert_ne!(row["status"], "delivered");
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_endpoint_reports_result() {
+    let server = private_server().await;
+    let root = seed_root(&server).await;
+    let mut receiver = mockito::Server::new_async().await;
+    let _ok = receiver
+        .mock("POST", "/ok")
+        .with_status(200)
+        .create_async()
+        .await;
+    let _bad = receiver
+        .mock("POST", "/bad")
+        .with_status(500)
+        .create_async()
+        .await;
+    let ok = make_channel(
+        &server,
+        root,
+        webhook_body("ok", &format!("{}/ok", receiver.url()), None),
+    )
+    .await;
+    let bad = make_channel(
+        &server,
+        root,
+        webhook_body("bad", &format!("{}/bad", receiver.url()), None),
+    )
+    .await;
+
+    let call = |id: Uuid| {
+        admin(
+            root,
+            server
+                .client
+                .post(server.url(&format!("/api/notification-channels/{id}/test"))),
+        )
+        .send()
+    };
+    let resp = call(ok).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.json::<Value>().await.unwrap()["data"],
+        json!({"delivered": true, "status_code": 200, "error": null})
+    );
+    let resp = call(bad).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.json::<Value>().await.unwrap()["data"],
+        json!({"delivered": false, "status_code": 500, "error": "http_5xx"})
+    );
+
+    let rows = outbox(&server).await;
+    assert_eq!(rows.len(), 2);
+    for r in &rows {
+        assert_eq!(r["event"], "test");
+        assert!(r["alert_id"].is_null());
+    }
+    assert!(rows.iter().any(|r| r["status"] == "delivered"));
+    assert!(rows.iter().any(|r| r["status"] == "failed"));
+
+    for _ in 0..8 {
+        assert_eq!(call(ok).await.unwrap().status(), 200);
+    }
+    let limited = call(ok).await.unwrap();
+    assert_eq!(limited.status(), 429);
+    assert!(limited.headers().contains_key("retry-after"));
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn deliveries_api_lists_history() {
+    let server = TestServer::start().await;
+    let root = seed_root(&server).await;
+    let channel = seed_channel(&server, "hist", true).await;
+    seed_route(&server, channel, None, "info").await;
+    let mut conn = server.db.acquire().await.unwrap();
+    let key = "hist:one";
+    raise(
+        &mut conn,
+        &new_alert(key, AlertKind::BudgetSoft, Severity::Warning),
+    )
+    .await
+    .unwrap();
+    raise(
+        &mut conn,
+        &new_alert(key, AlertKind::BudgetSoft, Severity::Critical),
+    )
+    .await
+    .unwrap();
+    drop(conn);
+    let alert_id: Uuid = sqlx::query_scalar("SELECT id FROM alerts WHERE dedup_key = $1")
+        .bind(key)
+        .fetch_one(&server.db)
+        .await
+        .unwrap();
+
+    let resp = admin(
+        root,
+        server
+            .client
+            .get(server.url(&format!("/api/notification-deliveries?alert_id={alert_id}"))),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v = resp.json::<Value>().await.unwrap();
+    let rows = v["data"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["event"], "escalated");
+    assert_eq!(rows[1]["event"], "opened");
+    for r in rows {
+        assert!(r.get("payload").is_none());
+        for f in [
+            "id",
+            "alert_id",
+            "channel_id",
+            "event",
+            "status",
+            "attempts",
+            "next_attempt_at",
+            "last_error",
+            "delivered_at",
+            "created_at",
+        ] {
+            assert!(r.get(f).is_some(), "missing {f}");
+        }
+    }
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn member_gets_403_on_channel_routes() {
+    let server = TestServer::start().await;
+    let user = seed_user(&server, "chan-member", "member").await;
+    let id = Uuid::new_v4();
+    let base = "/api/notification-channels";
+    let calls: Vec<(&str, String)> = vec![
+        ("GET", base.to_owned()),
+        ("POST", base.to_owned()),
+        ("GET", format!("{base}/{id}")),
+        ("PUT", format!("{base}/{id}")),
+        ("DELETE", format!("{base}/{id}")),
+        ("GET", format!("{base}/{id}/routes")),
+        ("PUT", format!("{base}/{id}/routes")),
+        ("POST", format!("{base}/{id}/test")),
+        ("GET", "/api/notification-deliveries".to_owned()),
+    ];
+    for (method, path) in calls {
+        let rb = server
+            .client
+            .request(method.parse().unwrap(), server.url(&path));
+        let resp = member(rb, user, "chan-member")
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403, "{method} {path}");
+    }
+    server.cleanup().await;
+}
