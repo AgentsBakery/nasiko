@@ -49,6 +49,11 @@ pub enum GatewayError {
     // Not client-actionable; the detail is logged but not exposed in the body.
     #[error("{0}")]
     Internal(String),
+
+    // ── 429 / 503 — LLM budget enforcement ───────────────────────────────────
+    // Rendered in the caller's own error dialect, not as `{"detail": ...}`.
+    #[error("LLM budget denied")]
+    BudgetDenied(Box<crate::budget::denial::BudgetDenial>),
 }
 
 impl GatewayError {
@@ -67,6 +72,7 @@ impl GatewayError {
             | GatewayError::NoApiKey => StatusCode::BAD_REQUEST,
             GatewayError::Upstream(_) => StatusCode::BAD_GATEWAY,
             GatewayError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            GatewayError::BudgetDenied(denial) => denial.status(),
         }
     }
 }
@@ -74,6 +80,12 @@ impl GatewayError {
 impl IntoResponse for GatewayError {
     fn into_response(self) -> Response {
         let status = self.status();
+        if let GatewayError::BudgetDenied(denial) = self {
+            if status.is_server_error() {
+                tracing::error!(%status, "LLM router budget enforcement unavailable");
+            }
+            return denial.into_response();
+        }
         let full = self.to_string();
         // Log all 5xx in full server-side (§3.2).
         if status.is_server_error() {

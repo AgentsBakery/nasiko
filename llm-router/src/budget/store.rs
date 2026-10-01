@@ -6,17 +6,37 @@
 //! off the response path and gets 1 s so a transient blip does not drop a write.
 
 use std::future::Future;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use redis::aio::MultiplexedConnection;
-use redis::{AsyncConnectionConfig, RedisError};
+use redis::{AsyncConnectionConfig, RedisError, Script};
 use tokio::sync::RwLock;
 
 /// Bound for the pre-call check and status reads.
 const CHECK_TIMEOUT_MS: u64 = 50;
 /// Bound for post-call writes; also the outer limit on the connection itself.
 const RECORD_TIMEOUT_MS: u64 = 1000;
+
+/// `INCRBY` every key that exists; report -1 for a key that does not. Never
+/// creates a key: a counter made by an increment alone would start from the
+/// delta instead of the period's true spend, so a missing key must be rebuilt
+/// from `token_usage` instead. A real post-increment value is always positive
+/// (deltas are), so -1 is unambiguous.
+const INCR_IF_EXISTS_LUA: &str = r#"
+local out = {}
+for i = 1, #KEYS do
+  if redis.call('EXISTS', KEYS[i]) == 1 then
+    out[i] = redis.call('INCRBY', KEYS[i], ARGV[1])
+  else
+    out[i] = -1
+  end
+end
+return out
+"#;
+
+static INCR_IF_EXISTS: LazyLock<Script> = LazyLock::new(|| Script::new(INCR_IF_EXISTS_LUA));
 
 /// Which latency budget a store call runs under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,6 +200,28 @@ impl RedisBudgetStore {
                 .query_async::<i64>(&mut conn)
                 .await
                 .map(|_| ())
+        })
+        .await
+    }
+
+    /// Atomically `INCRBY delta` on every key that already exists, in one
+    /// round trip. Returns the new value per key, or -1 where the key is missing.
+    pub async fn incr_if_exists(
+        &self,
+        keys: &[String],
+        delta: i64,
+        bound: StoreBound,
+    ) -> Result<Vec<i64>, StoreError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.run(bound, |mut conn| async move {
+            let mut invocation = INCR_IF_EXISTS.prepare_invoke();
+            for key in keys {
+                invocation.key(key);
+            }
+            invocation.arg(delta);
+            invocation.invoke_async::<Vec<i64>>(&mut conn).await
         })
         .await
     }

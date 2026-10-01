@@ -72,6 +72,11 @@ pub async fn responses(
 }
 
 fn gateway_error_response(error: GatewayError) -> Response {
+    // Responses speaks the OpenAI error shape, which is what the denial renders
+    // for `InboundFormat::OpenAi`.
+    if let GatewayError::BudgetDenied(denial) = error {
+        return denial.into_response();
+    }
     let status = error.status();
     let code = error_code(&error);
     let message = if matches!(error, GatewayError::Internal(_)) {
@@ -923,6 +928,7 @@ fn error_code(error: &GatewayError) -> &'static str {
         | GatewayError::NoApiKey => "routing_configuration_error",
         GatewayError::Upstream(_) => "upstream_error",
         GatewayError::Internal(_) => "internal_error",
+        GatewayError::BudgetDenied(_) => "budget_denied",
     }
 }
 

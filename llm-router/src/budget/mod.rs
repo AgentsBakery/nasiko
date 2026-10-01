@@ -13,6 +13,24 @@
 //! rebuilt from router-metered `token_usage` only (`direct_llm` and `embedding`
 //! rows; orchestrator-internal turns are not counted). The hot path never runs
 //! a SUM except on such a miss.
+//!
+//! Ordering of the post-call path (`usage::log_usage`): counters are incremented
+//! *before* the `token_usage` INSERT, which shortens the window in which a
+//! sequential follow-up call can still see the old spend (ENF-06); keys that were
+//! missing are rebuilt *after* the INSERT so the SUM includes the new row (and
+//! are not also incremented). Store calls are bounded by [`StoreBound`]: the
+//! pre-call check gets 50 ms and fails closed, post-call work gets 1 s.
+//!
+//! A lost increment never leaves a stale-low counter trusted: the affected keys
+//! are deleted (or, if even that fails, marked dirty in-process) so the next read
+//! rebuilds them from `token_usage`.
+//!
+//! Known bounded UNDERCOUNT: when a key is missing (after a Redis flush, or for
+//! a brand-new budget or period), another process's SUM snapshot can be taken
+//! before a concurrent row commits and still win the `SET NX`; that row's cost is
+//! then absent from the counter until the key next expires. This only happens in
+//! the flush/new-key window, is at most the cost of calls committing during it,
+//! and is the same class as the ENF-06 overshoot.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -24,6 +42,7 @@ use sqlx::PgPool;
 use tokio::sync::{Mutex, RwLock};
 
 pub mod defs;
+pub mod denial;
 pub mod keys;
 pub mod period;
 pub mod store;
@@ -32,8 +51,12 @@ pub use defs::{Budget, BudgetAction, Scope};
 pub use period::Period;
 pub use store::{RedisBudgetStore, StoreBound, StoreError, StoreStats};
 
+use crate::error::GatewayError;
+use crate::inbound::InboundFormat;
+use denial::{BudgetDenial, DenialKind};
 use keys::{micros_to_usd, spend_key};
 use period::{counter_ttl_secs, elapsed_fraction, period_bounds};
+use uuid::Uuid;
 
 const DEFINITIONS_TTL: Duration = Duration::from_secs(5);
 /// Below this fraction of the period a linear projection is noise.
@@ -74,6 +97,14 @@ pub struct BudgetEngine {
     /// overwrite the cleared snapshot with pre-mutation data.
     generation: Arc<AtomicU64>,
     rebuild_locks: DashMap<String, Arc<Mutex<()>>>,
+    /// Counter keys whose increment was lost and could not be deleted; the next
+    /// read treats them as missing and rebuilds from `token_usage`.
+    dirty: DashMap<String, ()>,
+    /// `(budget, period start)` pairs whose `hard_limit` event this process has
+    /// already ensured, so repeated blocked calls do not hit the DB each time.
+    hard_emitted: DashMap<(Uuid, i64), ()>,
+    /// Test hook, see [`BudgetEngine::fail_next_increment`].
+    fail_next_increment: AtomicBool,
 }
 
 impl BudgetEngine {
@@ -85,6 +116,9 @@ impl BudgetEngine {
             refreshing: Arc::default(),
             generation: Arc::default(),
             rebuild_locks: DashMap::new(),
+            dirty: DashMap::new(),
+            hard_emitted: DashMap::new(),
+            fail_next_increment: AtomicBool::new(false),
         }
     }
 
@@ -97,6 +131,9 @@ impl BudgetEngine {
             refreshing: Arc::default(),
             generation: Arc::default(),
             rebuild_locks: DashMap::new(),
+            dirty: DashMap::new(),
+            hard_emitted: DashMap::new(),
+            fail_next_increment: AtomicBool::new(false),
         }
     }
 
@@ -185,12 +222,162 @@ impl BudgetEngine {
         let found = store.mget(&keys, bound).await?;
         let mut out = Vec::with_capacity(budgets.len());
         for ((budget, key), value) in budgets.iter().zip(&keys).zip(found) {
+            let dirty = self.dirty.contains_key(key);
             out.push(match value {
-                Some(v) => v,
-                None => self.rebuild(store, budget, key, now, bound).await?,
+                Some(v) if !dirty => v,
+                _ => {
+                    if dirty {
+                        // The stored value may be stale-low; drop it so the
+                        // rebuild below recomputes instead of re-reading it.
+                        store.del(std::slice::from_ref(key), bound).await?;
+                    }
+                    let v = self.rebuild(store, budget, key, now, bound).await?;
+                    self.dirty.remove(key);
+                    v
+                }
             });
         }
         Ok(out)
+    }
+
+    /// Test hook: make the next counter increment fail as if the store were
+    /// unreachable. Never called by production code.
+    #[doc(hidden)]
+    pub fn fail_next_increment(&self) {
+        self.fail_next_increment.store(true, Ordering::Release);
+    }
+
+    /// Pre-call decision for `subject` at `now`. Makes no Redis call when no
+    /// enabled budget applies, otherwise exactly one MGET (plus rebuilds on miss).
+    pub async fn check(
+        &self,
+        subject: &BudgetSubject,
+        now: DateTime<Utc>,
+    ) -> Result<BudgetDecision, BudgetError> {
+        let defs = self.definitions().await?;
+        let applicable = defs::applicable(&defs, subject.user_id, subject.agent_id);
+        if applicable.is_empty() {
+            return Ok(BudgetDecision::Allow);
+        }
+        let spends = self.spend_micros(&applicable, now).await?;
+        let entries: Vec<(&Budget, i64)> = applicable.iter().copied().zip(spends).collect();
+        Ok(decide(&entries, subject.downgrade, now))
+    }
+
+    /// Post-call: add `cost_micros` to every applicable counter that exists.
+    /// Never fails the caller; a lost increment invalidates the affected keys.
+    pub async fn record(
+        &self,
+        user_id: Uuid,
+        agent_id: Option<Uuid>,
+        cost_micros: i64,
+        now: DateTime<Utc>,
+    ) -> RecordOutcome {
+        let mut outcome = RecordOutcome::default();
+        if cost_micros <= 0 {
+            return outcome;
+        }
+        let defs = match self.definitions().await {
+            Ok(defs) => defs,
+            Err(e) => {
+                tracing::warn!(%e, "budget record: definitions unavailable, counters not incremented");
+                return outcome;
+            }
+        };
+        let applicable: Vec<Budget> = defs::applicable(&defs, Some(user_id), agent_id)
+            .into_iter()
+            .cloned()
+            .collect();
+        let Some(store) = self.store.as_ref().filter(|_| !applicable.is_empty()) else {
+            return outcome;
+        };
+        let keys: Vec<String> = applicable
+            .iter()
+            .map(|b| spend_key(b.id, period_bounds(b.period, now).0))
+            .collect();
+        let result = if self.fail_next_increment.swap(false, Ordering::AcqRel) {
+            Err(StoreError("injected increment failure".into()))
+        } else {
+            store
+                .incr_if_exists(&keys, cost_micros, StoreBound::Record)
+                .await
+        };
+        match result {
+            Ok(values) => {
+                for (budget, value) in applicable.into_iter().zip(values) {
+                    if value < 0 {
+                        outcome.missing.push(budget);
+                    } else {
+                        outcome.applied.push((budget, value, cost_micros));
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(%e, "budget record: increment failed, invalidating counters");
+                if store.del(&keys, StoreBound::Record).await.is_err() {
+                    for key in &keys {
+                        self.dirty.insert(key.clone(), ());
+                    }
+                }
+                outcome.failed = applicable;
+            }
+        }
+        outcome
+    }
+
+    /// Post-INSERT reconciliation: rebuild counters that were missing (the SUM
+    /// now includes the new row, so they are not also incremented) and counters
+    /// whose increment failed.
+    pub async fn finish_record(&self, outcome: RecordOutcome, now: DateTime<Utc>) {
+        if let Some(store) = &self.store {
+            // The first invalidation may have raced a concurrent rebuild that ran
+            // before the row committed; drop the key again now that it has.
+            let keys: Vec<String> = outcome
+                .failed
+                .iter()
+                .map(|b| spend_key(b.id, period_bounds(b.period, now).0))
+                .collect();
+            if store.del(&keys, StoreBound::Record).await.is_err() {
+                for key in keys {
+                    self.dirty.insert(key, ());
+                }
+            }
+        }
+        let to_rebuild: Vec<&Budget> = outcome.missing.iter().chain(&outcome.failed).collect();
+        if to_rebuild.is_empty() {
+            return;
+        }
+        if let Err(e) = self
+            .spend_micros_bound(&to_rebuild, now, StoreBound::Record)
+            .await
+        {
+            tracing::warn!(%e, "budget finish_record: rebuild failed");
+        }
+    }
+
+    /// Make sure a `hard_limit` event exists for a budget that just blocked a
+    /// call, even when its counter was never observed crossing the limit (e.g.
+    /// restored or materialized elsewhere). Idempotent across replicas via the
+    /// table's UNIQUE constraint; once per budget-period per process.
+    async fn ensure_hard_limit_event(&self, info: &ExceededInfo, now: DateTime<Utc>) {
+        let period_start = period_bounds(info.period, now).0;
+        let marker = (info.budget_id, period_start.timestamp());
+        if self.hard_emitted.contains_key(&marker) {
+            return;
+        }
+        let defs = match self.definitions().await {
+            Ok(defs) => defs,
+            Err(e) => {
+                tracing::warn!(budget_id = %info.budget_id, %e, "ensure_hard_limit_event: definitions unavailable");
+                return;
+            }
+        };
+        let Some(budget) = defs.iter().find(|b| b.id == info.budget_id) else {
+            return;
+        };
+        self.emit_threshold_events(budget, period_start, info.spend_micros)
+            .await;
+        self.hard_emitted.insert(marker, ());
     }
 
     async fn rebuild(
@@ -310,6 +497,141 @@ impl BudgetEngine {
             if let Err(e) = res {
                 tracing::warn!(budget_id = %budget.id, kind, %e, "emit_threshold_events: db error");
             }
+        }
+    }
+}
+
+// ─── decision ────────────────────────────────────────────────────────────────
+
+/// What the router may do when a `Downgrade` budget is past its limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DowngradePolicy {
+    /// Chat and responses: a cheaper model can be substituted.
+    Allowed,
+    /// Embeddings: there is no cheaper model; serve unchanged until the ceiling.
+    ServeAsIs,
+    /// Pinned or compliance-locked agents: the model must not change, so block.
+    BlockInstead,
+}
+
+/// Whose spend a call counts against.
+#[derive(Debug, Clone, Copy)]
+pub struct BudgetSubject {
+    pub user_id: Option<Uuid>,
+    pub agent_id: Option<Uuid>,
+    pub downgrade: DowngradePolicy,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExceededInfo {
+    pub budget_id: Uuid,
+    pub scope: Scope,
+    pub period: Period,
+    pub limit_micros: i64,
+    pub spend_micros: i64,
+    pub resets_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DowngradeInfo {
+    pub budget_id: Uuid,
+}
+
+#[derive(Debug, Clone)]
+pub enum BudgetDecision {
+    Allow,
+    Downgrade(DowngradeInfo),
+    Block(ExceededInfo),
+}
+
+/// Combine every applicable budget's `(budget, spend)` into one decision. Any
+/// block beats a downgrade beats allow; among several blocking budgets the one
+/// resetting last is reported so `Retry-After` is honest.
+pub fn decide(
+    entries: &[(&Budget, i64)],
+    policy: DowngradePolicy,
+    now: DateTime<Utc>,
+) -> BudgetDecision {
+    let mut block: Option<ExceededInfo> = None;
+    let mut downgrade: Option<DowngradeInfo> = None;
+    for &(budget, spend) in entries {
+        let blocks = match budget.action {
+            BudgetAction::Block => spend >= budget.limit_micros,
+            BudgetAction::Downgrade => match policy {
+                DowngradePolicy::BlockInstead => spend >= budget.limit_micros,
+                DowngradePolicy::Allowed | DowngradePolicy::ServeAsIs => {
+                    spend >= budget.ceiling_micros()
+                }
+            },
+        };
+        if blocks {
+            let resets_at = period_bounds(budget.period, now).1;
+            if block.as_ref().is_none_or(|b| resets_at > b.resets_at) {
+                block = Some(ExceededInfo {
+                    budget_id: budget.id,
+                    scope: budget.scope,
+                    period: budget.period,
+                    limit_micros: budget.limit_micros,
+                    spend_micros: spend,
+                    resets_at,
+                });
+            }
+        } else if budget.action == BudgetAction::Downgrade
+            && policy == DowngradePolicy::Allowed
+            && spend >= budget.limit_micros
+            && downgrade.is_none()
+        {
+            downgrade = Some(DowngradeInfo {
+                budget_id: budget.id,
+            });
+        }
+    }
+    match (block, downgrade) {
+        (Some(info), _) => BudgetDecision::Block(info),
+        (None, Some(info)) => BudgetDecision::Downgrade(info),
+        (None, None) => BudgetDecision::Allow,
+    }
+}
+
+/// Counters touched by one [`BudgetEngine::record`].
+#[derive(Debug, Default)]
+pub struct RecordOutcome {
+    /// Budgets whose counter did not exist; rebuilt by `finish_record`.
+    pub missing: Vec<Budget>,
+    /// `(budget, value after increment, delta)` for counters that were bumped.
+    pub applied: Vec<(Budget, i64, i64)>,
+    /// Budgets whose increment failed; their counters were invalidated.
+    pub failed: Vec<Budget>,
+}
+
+/// Router-facing gate: `Ok` is `Allow` or `Downgrade`; a block or an unreadable
+/// counter store becomes the dialect-correct refusal. An error here means at
+/// least one enabled budget may apply, so it fails closed (ENF-04).
+pub async fn enforce(
+    engine: &BudgetEngine,
+    subject: &BudgetSubject,
+    format: InboundFormat,
+) -> Result<BudgetDecision, GatewayError> {
+    let now = Utc::now();
+    match engine.check(subject, now).await {
+        Ok(BudgetDecision::Block(info)) => {
+            engine.ensure_hard_limit_event(&info, now).await;
+            let remaining_ms = (info.resets_at - now).num_milliseconds().max(0) as u64;
+            let retry_after_secs = remaining_ms.div_ceil(1000).max(1);
+            Err(GatewayError::BudgetDenied(Box::new(BudgetDenial {
+                kind: DenialKind::Exceeded(info),
+                format,
+                retry_after_secs,
+            })))
+        }
+        Ok(decision) => Ok(decision),
+        Err(e) => {
+            tracing::error!(error = %e, "budget::enforce: counter store unavailable, failing closed");
+            Err(GatewayError::BudgetDenied(Box::new(BudgetDenial {
+                kind: DenialKind::StoreUnavailable,
+                format,
+                retry_after_secs: 1,
+            })))
         }
     }
 }
@@ -453,6 +775,97 @@ mod tests {
         off.enabled = false;
         assert_eq!(state(&off, Some(9_000_000)), BudgetState::Disabled);
         assert_eq!(state(&off, None), BudgetState::Disabled);
+    }
+
+    fn entry(budget: &Budget, spend: i64) -> (&Budget, i64) {
+        (budget, spend)
+    }
+
+    fn is_block(d: &BudgetDecision) -> bool {
+        matches!(d, BudgetDecision::Block(_))
+    }
+
+    #[test]
+    fn block_budget_blocks_at_limit() {
+        let b = budget(BudgetAction::Block);
+        let at = |spend| decide(&[entry(&b, spend)], DowngradePolicy::Allowed, noon());
+        assert!(matches!(at(3_999_999), BudgetDecision::Allow));
+        assert!(is_block(&at(4_000_000)));
+    }
+
+    #[test]
+    fn downgrade_budget_with_allowed_policy() {
+        let b = budget(BudgetAction::Downgrade);
+        let at = |spend| decide(&[entry(&b, spend)], DowngradePolicy::Allowed, noon());
+        assert!(matches!(at(3_999_999), BudgetDecision::Allow));
+        assert!(matches!(at(4_000_000), BudgetDecision::Downgrade(_)));
+        assert!(matches!(at(4_999_999), BudgetDecision::Downgrade(_)));
+        assert!(is_block(&at(5_000_000)));
+    }
+
+    #[test]
+    fn serve_as_is_ignores_downgrade_until_ceiling() {
+        let b = budget(BudgetAction::Downgrade);
+        let at = |spend| decide(&[entry(&b, spend)], DowngradePolicy::ServeAsIs, noon());
+        assert!(matches!(at(4_500_000), BudgetDecision::Allow));
+        assert!(is_block(&at(5_000_000)));
+    }
+
+    #[test]
+    fn block_instead_blocks_at_limit() {
+        let b = budget(BudgetAction::Downgrade);
+        let at = |spend| decide(&[entry(&b, spend)], DowngradePolicy::BlockInstead, noon());
+        assert!(matches!(at(3_999_999), BudgetDecision::Allow));
+        assert!(is_block(&at(4_000_000)));
+    }
+
+    #[test]
+    fn block_beats_downgrade_beats_allow() {
+        let down = budget(BudgetAction::Downgrade);
+        let block = budget(BudgetAction::Block);
+        let ok = budget(BudgetAction::Block);
+        let policy = DowngradePolicy::Allowed;
+        let d = decide(&[entry(&ok, 0), entry(&down, 4_000_000)], policy, noon());
+        assert!(matches!(d, BudgetDecision::Downgrade(_)));
+        let d = decide(
+            &[entry(&down, 4_000_000), entry(&block, 4_000_000)],
+            policy,
+            noon(),
+        );
+        assert!(is_block(&d));
+        let d = decide(&[entry(&ok, 0), entry(&down, 0)], policy, noon());
+        assert!(matches!(d, BudgetDecision::Allow));
+    }
+
+    #[test]
+    fn latest_reset_is_reported_among_blocking_budgets() {
+        let daily = budget(BudgetAction::Block);
+        let mut monthly = budget(BudgetAction::Block);
+        monthly.period = Period::Monthly;
+        let d = decide(
+            &[entry(&daily, 9_000_000), entry(&monthly, 9_000_000)],
+            DowngradePolicy::Allowed,
+            noon(),
+        );
+        let BudgetDecision::Block(info) = d else {
+            panic!("expected block");
+        };
+        assert_eq!(info.budget_id, monthly.id);
+        assert_eq!(info.period, Period::Monthly);
+        assert_eq!(info.resets_at, period_bounds(Period::Monthly, noon()).1);
+    }
+
+    #[test]
+    fn exceeded_info_carries_budget_numbers() {
+        let b = budget(BudgetAction::Block);
+        let BudgetDecision::Block(info) =
+            decide(&[entry(&b, 4_200_000)], DowngradePolicy::Allowed, noon())
+        else {
+            panic!("expected block");
+        };
+        assert_eq!(info.limit_micros, 4_000_000);
+        assert_eq!(info.spend_micros, 4_200_000);
+        assert_eq!(info.scope, Scope::Platform);
     }
 
     #[tokio::test]
