@@ -15,6 +15,7 @@ use crate::LlmRouterCtx;
 use crate::auth::verify_agent_jwt;
 use crate::budget;
 use crate::error::GatewayError;
+use crate::failures::{self, FailureRecord};
 use crate::inbound::{InboundFormat, inbound_for};
 use crate::providers::fallback;
 use crate::resolver::{PgRegistry, RegistryStore, RequestHint, resolve};
@@ -93,7 +94,24 @@ async fn embeddings_core(
     // Ordered fallbacks (same rules as chat); usage records the effective provider/model.
     let started = Instant::now();
     let (resp, (provider, model)) =
-        fallback::execute_embeddings(&ctx.http, &ctx.cfg, &resolved, &req).await?;
+        match fallback::execute_embeddings(&ctx.http, &ctx.cfg, &resolved, &req).await {
+            Ok(ok) => ok,
+            Err(exec) => {
+                failures::spawn_log_failure(
+                    ctx.db.clone(),
+                    FailureRecord {
+                        agent_id: agent_id.clone(),
+                        user_id: billed_user.clone(),
+                        provider: resolved.provider.clone(),
+                        model: resolved.model.clone(),
+                        class: exec.failure,
+                        streaming: false,
+                        operation_type: "embedding",
+                    },
+                );
+                return Err(exec.into());
+            }
+        };
     let latency_ms = started.elapsed().as_millis() as i64;
 
     usage::spawn_log(

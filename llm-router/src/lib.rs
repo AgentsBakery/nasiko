@@ -32,6 +32,7 @@ pub mod budget;
 mod compress;
 pub mod config;
 pub mod error;
+pub mod failures;
 pub mod handlers;
 pub mod inbound;
 pub mod inject;

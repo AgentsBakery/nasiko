@@ -26,10 +26,11 @@ use crate::LlmRouterCtx;
 use crate::auth::verify_agent_jwt;
 use crate::budget;
 use crate::error::GatewayError;
+use crate::failures::{self, FailureClass, FailureRecord};
 use crate::inbound::{ChatStreamRenderer, InboundFormat, inbound_for};
 use crate::ir::{ChatChunk, Usage};
 use crate::providers::{ProviderError, fallback};
-use crate::resolver::{PgRegistry, RegistryStore, RequestHint, resolve};
+use crate::resolver::{PgRegistry, RegistryStore, RequestHint, ResolvedConfig, resolve};
 use crate::routing::boundary::{TRACEPARENT_HEADER, parse_flow_id};
 use crate::routing::{self, BoundarySignals, RouteInputs};
 use crate::usage::{self, UsageRecord};
@@ -437,9 +438,16 @@ async fn chat_core(
 
     if req.is_streaming() {
         let (stream, (provider, model)) =
-            fallback::execute_chat_stream(&ctx.http, &ctx.cfg, &resolved, &req)
+            match fallback::execute_chat_stream(&ctx.http, &ctx.cfg, &resolved, &req)
                 .instrument(llm_span.clone())
-                .await?;
+                .await
+            {
+                Ok(ok) => ok,
+                Err(exec) => {
+                    record_exec_failure(ctx, &agent_id, &owner_id, &resolved, exec.failure, true);
+                    return Err(exec.into());
+                }
+            };
         llm_span.record("gen_ai.response.model", model.as_str());
         let renderer = inbound.chat_stream_renderer();
         return stream_chat(StreamChatArgs {
@@ -468,9 +476,17 @@ async fn chat_core(
     }
 
     // Non-streaming: run with ordered fallbacks; usage records the effective provider/model.
-    let (resp, (provider, model)) = fallback::execute_chat(&ctx.http, &ctx.cfg, &resolved, &req)
-        .instrument(llm_span.clone())
-        .await?;
+    let (resp, (provider, model)) =
+        match fallback::execute_chat(&ctx.http, &ctx.cfg, &resolved, &req)
+            .instrument(llm_span.clone())
+            .await
+        {
+            Ok(ok) => ok,
+            Err(exec) => {
+                record_exec_failure(ctx, &agent_id, &owner_id, &resolved, exec.failure, false);
+                return Err(exec.into());
+            }
+        };
     let latency_ms = started.elapsed().as_millis() as i64;
 
     // Record effective model and token usage on the server-side gen_ai span.
@@ -747,6 +763,7 @@ fn stream_chat(args: StreamChatArgs<'_>) -> Result<Response, GatewayError> {
                 Err(e) => {
                     // Mid-stream provider failure: log and end the stream cleanly.
                     tracing::error!(error = %e, "provider stream error");
+                    state.lock().unwrap_or_else(|e| e.into_inner()).stream_error = true;
                     break;
                 }
             }
@@ -767,7 +784,37 @@ fn stream_chat(args: StreamChatArgs<'_>) -> Result<Response, GatewayError> {
 struct StreamState {
     usage: Option<Usage>,
     finish_reason: Option<String>,
+    /// The provider stream yielded an error after bytes were already flowing. A client
+    /// disconnect never sets this, so it is not counted as an upstream failure.
+    stream_error: bool,
 }
+
+/// Record a pre-response upstream failure (every fallback attempt exhausted).
+fn record_exec_failure(
+    ctx: &LlmRouterCtx,
+    agent_id: &str,
+    owner_id: &str,
+    resolved: &ResolvedConfig,
+    class: FailureClass,
+    streaming: bool,
+) {
+    failures::spawn_log_failure(
+        ctx.db.clone(),
+        FailureRecord {
+            agent_id: agent_id.to_owned(),
+            user_id: owner_id.to_owned(),
+            provider: resolved.provider.clone(),
+            model: resolved.model.clone(),
+            class,
+            streaming,
+            operation_type: "direct_llm",
+        },
+    );
+}
+
+/// Finish reason stamped on a stream that died mid-flight with none reported; the
+/// Responses surface uses the same `failed:<stage>` convention.
+const FINISH_REASON_STREAM_FAILED: &str = "failed:stream";
 
 /// Writes the streaming usage row when dropped (stream completion or client disconnect).
 struct UsageGuard {
@@ -797,6 +844,22 @@ impl Drop for UsageGuard {
         let budget_downgrade = self.budget_downgrade.take();
         let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         record_span_usage(&self.span, st.usage.as_ref());
+        let mut finish_reason = st.finish_reason.clone();
+        if st.stream_error {
+            finish_reason.get_or_insert_with(|| FINISH_REASON_STREAM_FAILED.to_owned());
+            failures::spawn_log_failure(
+                self.db.clone(),
+                FailureRecord {
+                    agent_id: self.agent_id.clone(),
+                    user_id: self.owner_id.clone(),
+                    provider: self.provider.clone(),
+                    model: self.model.clone(),
+                    class: FailureClass::stream_error(),
+                    streaming: true,
+                    operation_type: "direct_llm",
+                },
+            );
+        }
         usage::spawn_log(
             self.db.clone(),
             self.pricing.clone(),
@@ -812,7 +875,7 @@ impl Drop for UsageGuard {
                 reasoning_tokens: None,
                 latency_ms: self.started.elapsed().as_millis() as i64,
                 streaming: true,
-                finish_reason: st.finish_reason.clone(),
+                finish_reason,
                 flow_id: self.flow_id.clone(),
                 attribution_source: self.attribution_source,
                 platform_paid: self.platform_paid,
@@ -954,6 +1017,7 @@ mod tests {
                         .unwrap(),
                     ),
                     finish_reason: None,
+                    stream_error: false,
                 })),
                 flow_id: None,
                 attribution_source: None,

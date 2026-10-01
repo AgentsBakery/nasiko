@@ -14,11 +14,35 @@ use futures::stream::BoxStream;
 use super::{ProviderClient, ProviderError, provider_for};
 use crate::config::GatewayConfig;
 use crate::error::GatewayError;
+use crate::failures::{FailureClass, KIND_CONFIG, KIND_TRANSPORT, classify_provider_error};
 use crate::ir::{ChatChunk, ChatRequest, ChatResponse, EmbeddingsRequest, EmbeddingsResponse};
 use crate::resolver::ResolvedConfig;
 
 /// The provider/model actually used for a call.
 type Effective = (String, String);
+
+/// A failed fallback execution: the unchanged client-facing error plus the
+/// classification of the last attempt, so handlers can record why it failed
+/// without the wire error (`GatewayError::Upstream`) carrying structure.
+#[derive(Debug)]
+pub struct ExecError {
+    pub error: GatewayError,
+    pub failure: FailureClass,
+}
+
+impl From<ExecError> for GatewayError {
+    fn from(e: ExecError) -> Self {
+        e.error
+    }
+}
+
+/// Final error once every attempt failed; the default class covers "no attempts".
+fn exhausted(last: Option<GatewayError>, class: Option<FailureClass>) -> ExecError {
+    ExecError {
+        error: last.unwrap_or_else(|| GatewayError::Upstream("no provider attempts".to_string())),
+        failure: class.unwrap_or(FailureClass::kind(KIND_TRANSPORT)),
+    }
+}
 
 /// Cap on how many distinct parameters we'll drop-and-retry against one model before
 /// giving up on it. A backstop against a provider that keeps rejecting params; real
@@ -32,9 +56,10 @@ pub async fn execute_chat(
     cfg: &GatewayConfig,
     primary: &ResolvedConfig,
     req: &ChatRequest,
-) -> Result<(ChatResponse, Effective), GatewayError> {
+) -> Result<(ChatResponse, Effective), ExecError> {
     let attempts = build_attempts(primary, cfg);
     let mut last: Option<GatewayError> = None;
+    let mut last_class: Option<FailureClass> = None;
     let total = attempts.len();
     for (i, attempt) in attempts.iter().enumerate() {
         log_request("chat", attempt, i, total);
@@ -42,6 +67,7 @@ pub async fn execute_chat(
             Ok(p) => p,
             Err(e) => {
                 last = Some(e);
+                last_class = Some(FailureClass::kind(KIND_CONFIG));
                 continue;
             }
         };
@@ -61,13 +87,14 @@ pub async fn execute_chat(
                         continue;
                     }
                     warn_attempt(attempt, &e, i, total);
+                    last_class = Some(classify_provider_error(&e));
                     last = Some(e.into());
                     break;
                 }
             }
         }
     }
-    Err(last.unwrap_or_else(|| GatewayError::Upstream("no provider attempts".to_string())))
+    Err(exhausted(last, last_class))
 }
 
 /// Run a streaming chat with ordered fallbacks (fallback applies to the *initial*
@@ -83,10 +110,11 @@ pub async fn execute_chat_stream(
         BoxStream<'static, Result<ChatChunk, ProviderError>>,
         Effective,
     ),
-    GatewayError,
+    ExecError,
 > {
     let attempts = build_attempts(primary, cfg);
     let mut last: Option<GatewayError> = None;
+    let mut last_class: Option<FailureClass> = None;
     let total = attempts.len();
     for (i, attempt) in attempts.iter().enumerate() {
         log_request("chat_stream", attempt, i, total);
@@ -94,6 +122,7 @@ pub async fn execute_chat_stream(
             Ok(p) => p,
             Err(e) => {
                 last = Some(e);
+                last_class = Some(FailureClass::kind(KIND_CONFIG));
                 continue;
             }
         };
@@ -119,13 +148,14 @@ pub async fn execute_chat_stream(
                         continue;
                     }
                     warn_attempt(attempt, &e, i, total);
+                    last_class = Some(classify_provider_error(&e));
                     last = Some(e.into());
                     break;
                 }
             }
         }
     }
-    Err(last.unwrap_or_else(|| GatewayError::Upstream("no provider attempts".to_string())))
+    Err(exhausted(last, last_class))
 }
 
 /// Run embeddings with ordered fallbacks (always non-streaming). Returns the response
@@ -136,14 +166,18 @@ pub async fn execute_embeddings(
     cfg: &GatewayConfig,
     primary: &ResolvedConfig,
     req: &EmbeddingsRequest,
-) -> Result<(EmbeddingsResponse, Effective), GatewayError> {
+) -> Result<(EmbeddingsResponse, Effective), ExecError> {
     let attempts = build_attempts(primary, cfg);
     let mut last: Option<GatewayError> = None;
+    let mut last_class: Option<FailureClass> = None;
     let total = attempts.len();
     for (i, attempt) in attempts.iter().enumerate() {
         log_request("embeddings", attempt, i, total);
         match provider_for(attempt, http, cfg) {
-            Err(e) => last = Some(e),
+            Err(e) => {
+                last = Some(e);
+                last_class = Some(FailureClass::kind(KIND_CONFIG));
+            }
             Ok(provider) => match provider.embeddings(req, attempt).await {
                 Ok(resp) => {
                     log_response("embeddings", attempt, &resp);
@@ -151,12 +185,13 @@ pub async fn execute_embeddings(
                 }
                 Err(e) => {
                     warn_attempt(attempt, &e, i, total);
+                    last_class = Some(classify_provider_error(&e));
                     last = Some(e.into());
                 }
             },
         }
     }
-    Err(last.unwrap_or_else(|| GatewayError::Upstream("no provider attempts".to_string())))
+    Err(exhausted(last, last_class))
 }
 
 /// Log the outbound request to an upstream LLM — provider + model only (never the
@@ -699,6 +734,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_construction_failure_is_config_class_and_error_is_unchanged() {
+        let primary = primary("no-such-provider", vec![]);
+        let req: ChatRequest =
+            serde_json::from_value(json!({"messages": [{"role": "user", "content": "hi"}]}))
+                .unwrap();
+        let err = execute_chat(&reqwest::Client::new(), &cfg("sk"), &primary, &req)
+            .await
+            .unwrap_err();
+        assert_eq!(err.failure.error_kind, KIND_CONFIG);
+        assert_eq!(err.failure.status_code, None);
+        let before = err.error.to_string();
+        let converted: GatewayError = err.into();
+        assert_eq!(converted.to_string(), before);
+    }
+
+    #[tokio::test]
     async fn all_attempts_exhausted_is_502() {
         let mut openai = mockito::Server::new_async().await;
         openai
@@ -738,7 +789,7 @@ mod tests {
         let err = execute_chat(&reqwest::Client::new(), &cfg, &primary, &req)
             .await
             .unwrap_err();
-        assert!(matches!(err, GatewayError::Upstream(_)));
-        assert_eq!(err.status(), axum::http::StatusCode::BAD_GATEWAY);
+        assert!(matches!(err.error, GatewayError::Upstream(_)));
+        assert_eq!(err.error.status(), axum::http::StatusCode::BAD_GATEWAY);
     }
 }

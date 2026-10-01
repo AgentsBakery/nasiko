@@ -23,6 +23,7 @@ use super::chat::{
 use crate::LlmRouterCtx;
 use crate::budget;
 use crate::error::GatewayError;
+use crate::failures::{self, FailureClass, FailureRecord};
 use crate::inbound::InboundFormat;
 use crate::inbound::responses::{
     ResponsesRequest, ResponsesStreamRenderer, TerminalOutcome, parse_request, render_response,
@@ -168,6 +169,8 @@ async fn responses_core(
         }
         None => None,
     };
+    // Captured before the block below moves `routed`; the downgrade (if any) is already applied.
+    let failure_target = FailureTarget::new(&routed.agent_id, &routed.owner_id, &routed.resolved);
     // One block so every success path (translated, native, streaming) passes through the
     // single header-stamping point below instead of each `return` repeating it.
     let outcome: Result<Response, GatewayError> = async {
@@ -267,12 +270,68 @@ async fn responses_core(
         })
     }
     .await;
+    // Final-outcome failure record (one per request, not per attempt). Client-request
+    // errors and budget denials are not provider failures, so only upstream errors and
+    // upstream error statuses count. Mid-stream failures are recorded by the stream
+    // wrappers because the outcome is already `Ok` by then.
+    match &outcome {
+        Err(GatewayError::Upstream(text)) => {
+            failure_target.record(ctx, failures::classify_upstream_text(text), stream);
+        }
+        Ok(response) if response.status().as_u16() >= HTTP_ERROR_MIN => {
+            failure_target.record(
+                ctx,
+                failures::classify_status(response.status().as_u16()),
+                stream,
+            );
+        }
+        _ => {}
+    }
     outcome.map(|mut response| {
         if let Some(h) = &downgrade_headers {
             apply_downgrade_headers(&mut response, h);
         }
         response
     })
+}
+
+/// First HTTP status treated as an upstream failure when a response is passed through.
+const HTTP_ERROR_MIN: u16 = 400;
+
+/// Identity of a Responses call, owned so it can move into a stream closure.
+#[derive(Clone)]
+struct FailureTarget {
+    agent_id: String,
+    owner_id: String,
+    provider: String,
+    model: String,
+}
+
+impl FailureTarget {
+    fn new(agent_id: &str, owner_id: &str, resolved: &crate::resolver::ResolvedConfig) -> Self {
+        Self {
+            agent_id: agent_id.to_owned(),
+            owner_id: owner_id.to_owned(),
+            provider: resolved.provider.clone(),
+            model: resolved.model.clone(),
+        }
+    }
+
+    /// Best-effort durable failure row; never affects the response.
+    fn record(&self, ctx: &LlmRouterCtx, class: FailureClass, streaming: bool) {
+        failures::spawn_log_failure(
+            ctx.db.clone(),
+            FailureRecord {
+                agent_id: self.agent_id.clone(),
+                user_id: self.owner_id.clone(),
+                provider: self.provider.clone(),
+                model: self.model.clone(),
+                class,
+                streaming,
+                operation_type: "direct_llm",
+            },
+        );
+    }
 }
 
 fn is_retryable_transport_error(error: &reqwest::Error) -> bool {
@@ -428,6 +487,8 @@ fn translated_stream_response(
         state: Arc::clone(&usage_state),
     };
     let model = attempt.model.clone();
+    let failure_target = FailureTarget::new(&routed.agent_id, &routed.owner_id, attempt);
+    let failure_ctx = ctx.clone();
     let mut renderer = ResponsesStreamRenderer::new(model.clone(), parsed.tool_kinds.clone());
     let stream = async_stream::stream! {
         let _guard = guard;
@@ -451,6 +512,7 @@ fn translated_stream_response(
                 }
                 Err(error) => {
                     usage_state.lock().unwrap_or_else(|error| error.into_inner()).finish_reason = Some("failed:stream".into());
+                    failure_target.record(&failure_ctx, FailureClass::stream_error(), true);
                     for frame in renderer.fail(error.to_string()) { yield Ok(frame); }
                     return;
                 }
@@ -540,6 +602,8 @@ fn stream_response(
 ) -> Result<Response, GatewayError> {
     let headers = upstream.headers().clone();
     let state = Arc::new(Mutex::new(ResponseStreamState::default()));
+    let failure_target = FailureTarget::new(&routed.agent_id, &routed.owner_id, &attempt);
+    let failure_ctx = ctx.clone();
     let guard = ResponsesUsageGuard {
         ctx: ctx.clone(),
         routed: Some((routed, attempt)),
@@ -559,6 +623,7 @@ fn stream_response(
                 }
                 Err(error) => {
                     tracing::warn!(error = %error, "Responses upstream stream failed midstream");
+                    failure_target.record(&failure_ctx, FailureClass::stream_error(), true);
                     yield Err(std::io::Error::other(error));
                     return;
                 }
