@@ -28,6 +28,7 @@ pub mod llm_router;
 pub mod maf;
 pub mod mcp;
 pub mod multipart_util;
+pub mod notifications;
 pub mod observability;
 pub mod openapi;
 pub mod orchestrator_policy;

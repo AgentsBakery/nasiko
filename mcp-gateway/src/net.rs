@@ -141,7 +141,10 @@ pub async fn validate_public_url(raw: &str) -> Result<()> {
 
 /// True if `ip` is loopback / private / link-local / unspecified / otherwise
 /// non-public (including the IPv4-mapped forms of those).
-fn is_blocked_ip(ip: IpAddr) -> bool {
+///
+/// Public so other egress guards (notification channels) reuse one definition
+/// of "internal address" instead of keeping a second copy that can drift.
+pub fn is_blocked_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v) => {
             let o = v.octets();
