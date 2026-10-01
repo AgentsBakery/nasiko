@@ -23,6 +23,7 @@ use crate::state::AppState;
     paths(
         crate::alerts::routes::list_alerts,
         crate::alerts::routes::acknowledge_alert,
+        crate::alerts::markers::spike_markers,
         crate::alerts::monitors::list_monitors,
         crate::alerts::monitors::create_monitor,
         crate::alerts::monitors::get_monitor,
@@ -126,6 +127,8 @@ use crate::state::AppState;
     ),
     components(schemas(
         crate::alerts::models::AlertView,
+        crate::alerts::markers::SpikeMarker,
+        crate::alerts::markers::SpikeMarkersResponse,
         crate::alerts::monitors::MonitorView,
         crate::alerts::monitors::CreateMonitorRequest,
         crate::alerts::monitors::UpdateMonitorRequest,

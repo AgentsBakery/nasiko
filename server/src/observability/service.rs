@@ -157,7 +157,7 @@ fn bucket_label(bucket: TimeBucket) -> &'static str {
 /// same precedence as the quick-select UI. `end_time` still overrides "now"
 /// when both are given (matches the month-picker semantics elsewhere in this
 /// module). Hour granularity for 24h, day granularity otherwise.
-fn resolve_window(
+pub(crate) fn resolve_window(
     start_time: Option<&str>,
     end_time: Option<&str>,
     range: Option<&str>,

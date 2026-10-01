@@ -81,7 +81,7 @@ pub(super) async fn resolve_accessible_agent(
     None
 }
 
-pub(super) async fn agent_name_fully_accessible(
+pub(crate) async fn agent_name_fully_accessible(
     state: &AppState,
     claims: &Claims,
     agent_name: &str,

@@ -299,6 +299,7 @@ where
         .merge(alert_admin_routes)
         .merge(notification_admin_routes)
         .merge(budgets::me_router())
+        .merge(alerts::markers_router())
         .merge(build_routes)
         .merge(degradable_routes)
         .merge(chat::router())

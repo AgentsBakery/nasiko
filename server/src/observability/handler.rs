@@ -159,7 +159,7 @@ pub struct FinopsAttributionsParams {
 // runs at most once per request (an early-return 400 path), not a hot loop —
 // boxing it would just move the allocation, not remove it.
 #[allow(clippy::result_large_err)]
-fn validate_range(range: Option<&str>) -> Result<(), Response> {
+pub(crate) fn validate_range(range: Option<&str>) -> Result<(), Response> {
     match range {
         None | Some("24h") | Some("7d") | Some("30d") => Ok(()),
         Some(other) => Err((
@@ -190,7 +190,7 @@ fn validate_view(view: Option<&str>) -> Result<&str, Response> {
 /// one was given but didn't resolve — a silently-dropped filter would show
 /// unfiltered data under a caller-set "Agent: X" label, which is worse than
 /// an explicit error.
-async fn resolve_agent_filter(
+pub(crate) async fn resolve_agent_filter(
     db: &sqlx::PgPool,
     agent_id: Option<&str>,
 ) -> Result<Option<String>, Response> {
@@ -860,7 +860,10 @@ pub async fn get_agent_hours(
     }
 }
 
-async fn accessible_agent_ids(state: &AppState, claims: &Claims) -> Option<Vec<uuid::Uuid>> {
+pub(crate) async fn accessible_agent_ids(
+    state: &AppState,
+    claims: &Claims,
+) -> Option<Vec<uuid::Uuid>> {
     if claims.is_superuser {
         return None;
     }

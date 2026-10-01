@@ -24,6 +24,7 @@ pub async fn tick_resolve_sweep(db: &PgPool, now: DateTime<Utc>) -> Result<usize
     let mut resolved = 0;
     resolved += resolve_budget_alerts(&mut tx, now).await?;
     resolved += resolve_orphaned_monitor_alerts(&mut tx).await?;
+    resolved += resolve_stale_spike_alerts(&mut tx, now).await?;
     purge_old_outbox(&mut tx).await?;
     purge_old_failures(&mut tx).await?;
     tx.commit().await?;
@@ -64,6 +65,27 @@ async fn resolve_orphaned_monitor_alerts(conn: &mut PgConnection) -> Result<usiz
                            WHERE m.id = (details->>'monitor_id')::uuid AND m.enabled) \
          RETURNING id",
     )
+    .fetch_all(&mut *conn)
+    .await?;
+    for id in &ids {
+        engine::enqueue(conn, *id, NotifyEvent::Resolved).await?;
+    }
+    Ok(ids.len())
+}
+
+/// A spike alert is a point-in-time marker for one hour; the detector resolves
+/// it on the next quiet hour, and this step is the backstop after 24 hours.
+async fn resolve_stale_spike_alerts(
+    conn: &mut PgConnection,
+    now: DateTime<Utc>,
+) -> Result<usize, sqlx::Error> {
+    let ids: Vec<Uuid> = sqlx::query_scalar(
+        "UPDATE alerts SET status = 'resolved', resolved_at = now() \
+         WHERE kind = 'spend_spike' AND status <> 'resolved' \
+           AND first_seen_at < $1 - interval '24 hours' \
+         RETURNING id",
+    )
+    .bind(now)
     .fetch_all(&mut *conn)
     .await?;
     for id in &ids {
