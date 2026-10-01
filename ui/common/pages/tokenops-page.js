@@ -99,6 +99,7 @@ import '/common/design-system/app-table/app-table.js';
 import { call } from '../core/data-sources.js';
 import { navigate } from '../core/router.js';
 import { authService } from '/common/services/auth-service.js';
+import { markerAnomalies } from '/common/utils/alerts.js';
 import { insightsRequestBody, insightsViewModel } from '/common/utils/finops-insights.js';
 import { errorStateHtml } from '/common/design-system/app-empty-state/error-state.js';
 
@@ -326,6 +327,8 @@ class TokenopsPage extends HTMLElement {
   #attrView = 'agent';
   /** `{ bucket: 'hour'|'day', points: [...] }` from `/finops/spend-timeseries`. */
   #spend = { bucket: 'day', points: [] };
+  /** Spike markers from `/alerts/spike-markers`; empty on failure so the chart never breaks. */
+  #spikeMarkers = [];
 
   /**
    * Whether the panel's own fetch failed, as opposed to returning nothing.
@@ -378,9 +381,23 @@ class TokenopsPage extends HTMLElement {
    *  otherwise a slow August response overwrites the September numbers. */
   #loadId = 0;
 
+  /** Alert links open `/tokenops?agent=<uuid>&range=24h`. The agent id is only
+   *  ever used as a select value and API param; range is whitelisted. */
+  #applyDeepLink() {
+    const q = new URLSearchParams(window.location.search);
+    const agent = q.get('agent');
+    if (agent) this.#agentFilter = agent;
+    const range = q.get('range');
+    if (range && RANGES.some((r) => r.value === range)) {
+      this.#range = range;
+      this.#windowSource = 'range';
+    }
+  }
+
   connectedCallback() {
     if (this.#initialized) return;
     this.#initialized = true;
+    this.#applyDeepLink();
 
     this.innerHTML = `
       <div class="page-head">
@@ -799,7 +816,7 @@ class TokenopsPage extends HTMLElement {
     // `data.agents` comes back already filtered by `agent_id`, so adopting it
     // while an agent is selected would leave that agent as the dropdown's only
     // option — no way back to any other agent. Keep the last unfiltered list.
-    if (!this.#agentFilter) this.#agents = data.agents || [];
+    if (!this.#agentFilter || !this.#agents.length) this.#agents = data.agents || [];
     this.#summary = data.summary || {};
     this.#kpis = data.kpis || null;
     const rawRows = data.attributions?.rows ?? data.agents ?? [];
@@ -816,9 +833,26 @@ class TokenopsPage extends HTMLElement {
     // "Spend over time" and the concentration day-drill each absorb their own
     // failure — one bad call must not blank the whole page.
     this.#loadSpend(id, params);
+    this.#loadSpikeMarkers(id, params);
     // The day picker is independent of the window, but the agent filter still
     // applies to it — re-pull it on every load, not only when the day changes.
     this.#loadDay(id);
+  }
+
+  async #loadSpikeMarkers(id, params) {
+    try {
+      const resp = await call('fetchSpikeMarkers', {
+        range: params.range, startTime: params.startTime, endTime: params.endTime, agentId: params.agentId,
+      });
+      if (id !== this.#loadId) return;
+      const data = resp?.data ?? resp ?? [];
+      this.#spikeMarkers = Array.isArray(data) ? data : [];
+    } catch (e) {
+      this.#reportError(e, 'spike-markers');
+      if (id !== this.#loadId) return;
+      this.#spikeMarkers = [];
+    }
+    this.#renderSpend();
   }
 
   async #loadSpend(id, params) {
@@ -990,7 +1024,11 @@ class TokenopsPage extends HTMLElement {
     chart.data = points.length ? {
       labels: points.map((p) => fmtLabel.format(new Date(p.bucket_start))),
       datasets: [
-        { label: 'Spend', data: points.map((p) => p.spend_usd ?? 0) },
+        {
+          label: 'Spend',
+          data: points.map((p) => p.spend_usd ?? 0),
+          anomalies: markerAnomalies(points, this.#spend.bucket, this.#spikeMarkers),
+        },
         { label: 'Operations', axis: 'y2', data: points.map((p) => p.operations ?? 0) },
       ],
     } : { labels: [], datasets: [] };
