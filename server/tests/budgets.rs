@@ -533,3 +533,715 @@ async fn status_states() {
     }
     server.cleanup().await;
 }
+
+// ─── router enforcement ──────────────────────────────────────────────────────
+//
+// The router reads `GatewayConfig::from_env()` once when the app boots, so every
+// test here is `#[serial]` and points the environment at its stub upstream
+// before `TestServer::start()`. Agent identity is a real agent JWT; the billed
+// user comes from a live flow (`common::open_flow`) except for coding agents.
+
+const ROUTER_JWT_SECRET: &str = "budgets-router-test-secret";
+const BIG_PROMPT_TOKENS: u64 = 100_000;
+
+fn set_router_env(upstream_url: &str) {
+    // SAFETY: serialized by #[serial] within this test binary.
+    unsafe {
+        std::env::set_var("OPENAI_API_BASE", upstream_url);
+        std::env::set_var("AGENT_JWT_SECRET", ROUTER_JWT_SECRET);
+        std::env::set_var("PLATFORM_OPENAI_API_KEY", "sk-platform-test");
+        std::env::set_var("PLATFORM_ANTHROPIC_API_KEY", "sk-ant-platform-test");
+        std::env::set_var("PLATFORM_GEMINI_API_KEY", "gem-platform-test");
+    }
+}
+
+/// Upstream whose every response carries a large usage block, so one call costs
+/// far more than the tiny limits the tests use. Streaming requests get an SSE
+/// body ending in a usage chunk.
+async fn stub_upstream_big_usage() -> mockito::ServerGuard {
+    let mut upstream = mockito::Server::new_async().await;
+    let sse = format!(
+        "data: {{\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o-mini\",\
+         \"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":\"hi\"}}}}]}}\n\n\
+         data: {{\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o-mini\",\
+         \"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}],\
+         \"usage\":{{\"prompt_tokens\":{BIG_PROMPT_TOKENS},\"completion_tokens\":7,\
+         \"total_tokens\":{}}}}}\n\ndata: [DONE]\n\n",
+        BIG_PROMPT_TOKENS + 7
+    );
+    upstream
+        .mock("POST", "/chat/completions")
+        .match_body(mockito::Matcher::PartialJson(json!({"stream": true})))
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(sse)
+        .expect_at_least(0)
+        .create_async()
+        .await;
+    upstream
+        .mock("POST", "/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(format!(
+            r#"{{"id":"chatcmpl-1","object":"chat.completion","created":1,
+                "model":"gpt-4o-mini",
+                "choices":[{{"index":0,"message":{{"role":"assistant","content":"hi"}},
+                            "finish_reason":"stop"}}],
+                "usage":{{"prompt_tokens":{BIG_PROMPT_TOKENS},"completion_tokens":7,
+                          "total_tokens":{}}}}}"#,
+            BIG_PROMPT_TOKENS + 7
+        ))
+        .expect_at_least(0)
+        .create_async()
+        .await;
+    upstream
+        .mock("POST", "/embeddings")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(format!(
+            r#"{{"object":"list","model":"text-embedding-3-small",
+                "data":[{{"object":"embedding","index":0,"embedding":[0.1,0.2]}}],
+                "usage":{{"prompt_tokens":{BIG_PROMPT_TOKENS},"total_tokens":{BIG_PROMPT_TOKENS}}}}}"#
+        ))
+        .expect_at_least(0)
+        .create_async()
+        .await;
+    set_router_env(&upstream.url());
+    upstream
+}
+
+fn router_agent_jwt(agent_id: Uuid, owner_id: Uuid) -> String {
+    nasiko_llm_router::auth::mint_agent_token(
+        &agent_id.to_string(),
+        &owner_id.to_string(),
+        ROUTER_JWT_SECRET,
+        3600,
+        jsonwebtoken::Algorithm::HS256,
+    )
+    .expect("mint agent token")
+}
+
+async fn post_llm(
+    server: &TestServer,
+    path: &str,
+    bearer: &str,
+    traceparent: Option<&str>,
+    body: &Value,
+) -> reqwest::Response {
+    post_llm_at(
+        &server.base_url,
+        &server.client,
+        path,
+        bearer,
+        traceparent,
+        body,
+    )
+    .await
+}
+
+async fn post_llm_at(
+    base_url: &str,
+    client: &reqwest::Client,
+    path: &str,
+    bearer: &str,
+    traceparent: Option<&str>,
+    body: &Value,
+) -> reqwest::Response {
+    let mut req = client
+        .post(format!("{base_url}{path}"))
+        .bearer_auth(bearer)
+        .json(body);
+    if let Some(tp) = traceparent {
+        req = req.header("traceparent", tp);
+    }
+    req.send().await.expect("llm request")
+}
+
+fn chat_body() -> Value {
+    json!({"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hello"}]})
+}
+
+fn stream_chat_body() -> Value {
+    json!({"model": "gpt-4o-mini", "stream": true,
+           "messages": [{"role": "user", "content": "hello"}]})
+}
+
+fn embeddings_body() -> Value {
+    json!({"model": "text-embedding-3-small", "input": "hello"})
+}
+
+/// A user with an agent, a live flow, and an agent JWT: everything a router call needs.
+struct Caller {
+    user: Uuid,
+    agent: Uuid,
+    jwt: String,
+    traceparent: String,
+}
+
+async fn caller(server: &TestServer, name: &str) -> Caller {
+    let user = seed_user(server, name, "member").await;
+    let agent = seed_agent(server, user, &format!("{name}-agent")).await;
+    let (_flow, traceparent) = common::open_flow(&server.db, user, agent).await;
+    Caller {
+        user,
+        agent,
+        jwt: router_agent_jwt(agent, user),
+        traceparent,
+    }
+}
+
+async fn chat(server: &TestServer, c: &Caller) -> reqwest::Response {
+    post_llm(
+        server,
+        "/v1/chat/completions",
+        &c.jwt,
+        Some(&c.traceparent),
+        &chat_body(),
+    )
+    .await
+}
+
+fn current_key(budget_id: &str) -> String {
+    spend_key(
+        budget_id.parse().unwrap(),
+        period_bounds(Period::Monthly, Utc::now()).0,
+    )
+}
+
+fn in_current_period() -> DateTime<Utc> {
+    month_start(Utc::now()) + chrono::Duration::seconds(5)
+}
+
+/// Poll `key` until `pred` holds or `within` elapses; returns the last value.
+async fn wait_for_key(
+    key: &str,
+    within: std::time::Duration,
+    pred: impl Fn(Option<i64>) -> bool,
+) -> Option<i64> {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        let v = get_key(key).await;
+        if pred(v) || std::time::Instant::now() >= deadline {
+            return v;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+fn retry_after(resp: &reqwest::Response) -> u64 {
+    resp.headers()
+        .get("retry-after")
+        .expect("Retry-After header")
+        .to_str()
+        .unwrap()
+        .parse()
+        .expect("numeric Retry-After")
+}
+
+fn assert_nasiko_budget(body: &Value, budget_id: &str, scope: &str, period: &str) {
+    let nb = &body["nasiko_budget"];
+    assert_eq!(nb["budget_id"], budget_id, "{body}");
+    assert_eq!(nb["scope"], scope, "{body}");
+    assert_eq!(nb["period"], period, "{body}");
+    assert!(nb["limit_usd"].as_f64().is_some(), "{body}");
+    assert!(nb["spend_usd"].as_f64().is_some(), "{body}");
+    nb["resets_at"]
+        .as_str()
+        .and_then(|s| s.parse::<DateTime<Utc>>().ok())
+        .unwrap_or_else(|| panic!("resets_at not RFC 3339: {body}"));
+}
+
+#[tokio::test]
+#[serial]
+async fn block_budget_rejects_every_dialect_before_upstream() {
+    let mut upstream = mockito::Server::new_async().await;
+    let chat_mock = upstream
+        .mock("POST", "/chat/completions")
+        .expect(0)
+        .create_async()
+        .await;
+    let embed_mock = upstream
+        .mock("POST", "/embeddings")
+        .expect(0)
+        .create_async()
+        .await;
+    set_router_env(&upstream.url());
+
+    let server = TestServer::start().await;
+    let root = seed_root(&server).await;
+    let c = caller(&server, "dialect-user").await;
+    seed_usage(
+        &server,
+        c.user,
+        None,
+        "direct_llm",
+        0.001,
+        in_current_period(),
+    )
+    .await;
+    let budget = create_budget(&server, root, user_budget("dialects", c.user, 0.0001)).await;
+    let id = budget["id"].as_str().unwrap().to_owned();
+    del_key(&current_key(&id)).await;
+
+    let anthropic = json!({"model": "claude-3-5-sonnet-latest", "max_tokens": 16,
+                           "messages": [{"role": "user", "content": "hi"}]});
+    let gemini = json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]});
+    let responses = json!({"model": "gpt-4o-mini", "input": "hi"});
+    let cases: [(&str, Value); 5] = [
+        ("/v1/chat/completions", chat_body()),
+        ("/v1/messages", anthropic),
+        ("/v1beta/models/gemini-2.0-flash:generateContent", gemini),
+        ("/v1/responses", responses),
+        ("/v1/embeddings", embeddings_body()),
+    ];
+    for (path, body) in cases {
+        let resp = post_llm(&server, path, &c.jwt, Some(&c.traceparent), &body).await;
+        assert_eq!(resp.status(), 429, "{path}");
+        let secs = retry_after(&resp);
+        let json = resp.json::<Value>().await.unwrap();
+        assert_nasiko_budget(&json, &id, "user", "monthly");
+        let resets: DateTime<Utc> = json["nasiko_budget"]["resets_at"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let until_reset = (resets - Utc::now()).num_seconds();
+        assert!(
+            secs > 0 && (secs as i64) <= until_reset + 1,
+            "{path}: Retry-After {secs} vs {until_reset}"
+        );
+        match path {
+            "/v1/messages" => {
+                assert_eq!(json["type"], "error", "{json}");
+                assert_eq!(json["error"]["type"], "rate_limit_error", "{json}");
+            }
+            p if p.contains("generateContent") => {
+                assert_eq!(json["error"]["code"], 429, "{json}");
+                assert_eq!(json["error"]["status"], "RESOURCE_EXHAUSTED", "{json}");
+            }
+            _ => {
+                assert_eq!(json["error"]["type"], "insufficient_quota", "{json}");
+                assert_eq!(json["error"]["code"], "budget_exceeded", "{json}");
+                assert!(json["error"]["param"].is_null(), "{json}");
+            }
+        }
+    }
+    chat_mock.assert_async().await;
+    embed_mock.assert_async().await;
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn agent_and_platform_budgets_block() {
+    let _upstream = stub_upstream_big_usage().await;
+    let server = TestServer::start().await;
+    let root = seed_root(&server).await;
+    let a = caller(&server, "scope-a").await;
+    let b = caller(&server, "scope-b").await;
+
+    let agent_budget = create_budget(
+        &server,
+        root,
+        json!({"name": "agent cap", "scope": "agent", "target_id": a.agent,
+               "period": "monthly", "limit_usd": 0.0001, "action": "block"}),
+    )
+    .await;
+    let agent_id = agent_budget["id"].as_str().unwrap().to_owned();
+    seed_usage(
+        &server,
+        a.user,
+        Some(a.agent),
+        "direct_llm",
+        0.001,
+        in_current_period(),
+    )
+    .await;
+    del_key(&current_key(&agent_id)).await;
+
+    let resp = chat(&server, &a).await;
+    assert_eq!(resp.status(), 429);
+    let body = resp.json::<Value>().await.unwrap();
+    assert_nasiko_budget(&body, &agent_id, "agent", "monthly");
+    assert_eq!(
+        chat(&server, &b).await.status(),
+        200,
+        "other agent unaffected"
+    );
+
+    let platform = create_budget(
+        &server,
+        root,
+        json!({"name": "platform cap", "scope": "platform",
+               "period": "monthly", "limit_usd": 0.0001, "action": "block"}),
+    )
+    .await;
+    let platform_id = platform["id"].as_str().unwrap().to_owned();
+    del_key(&current_key(&platform_id)).await;
+    for c in [&a, &b] {
+        let resp = chat(&server, c).await;
+        assert_eq!(resp.status(), 429);
+    }
+    let resp = chat(&server, &b).await;
+    let body = resp.json::<Value>().await.unwrap();
+    assert_nasiko_budget(&body, &platform_id, "platform", "monthly");
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn disabled_budget_is_ignored() {
+    let _upstream = stub_upstream_big_usage().await;
+    let server = TestServer::start().await;
+    let root = seed_root(&server).await;
+    let c = caller(&server, "disabled-user").await;
+    seed_usage(
+        &server,
+        c.user,
+        None,
+        "direct_llm",
+        0.001,
+        in_current_period(),
+    )
+    .await;
+    let mut body = user_budget("disabled", c.user, 0.0001);
+    body["enabled"] = json!(false);
+    let budget = create_budget(&server, root, body).await;
+    del_key(&current_key(budget["id"].as_str().unwrap())).await;
+
+    assert_eq!(chat(&server, &c).await.status(), 200);
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn sequential_calls_never_pass_after_exhaustion() {
+    let _upstream = stub_upstream_big_usage().await;
+    let server = TestServer::start().await;
+    let root = seed_root(&server).await;
+    let c = caller(&server, "enf06-user").await;
+    let budget = create_budget(&server, root, user_budget("enf06", c.user, 0.0001)).await;
+    let id = budget["id"].as_str().unwrap().to_owned();
+
+    assert_eq!(
+        chat(&server, &c).await.status(),
+        200,
+        "first call is within budget"
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        let view = get_budget(&server, root, &id).await;
+        let spend = view["spend_usd"].as_f64().unwrap_or(0.0);
+        if spend >= view["limit_usd"].as_f64().unwrap() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "counter did not reflect the call within 1s (BUDG-03)"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    for n in 0..3 {
+        assert_eq!(
+            chat(&server, &c).await.status(),
+            429,
+            "call {n} after exhaustion"
+        );
+    }
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn counter_increments_within_one_second() {
+    let _upstream = stub_upstream_big_usage().await;
+    let server = TestServer::start().await;
+    let root = seed_root(&server).await;
+    let c = caller(&server, "incr-user").await;
+    let budget = create_budget(&server, root, user_budget("incr", c.user, 1000.0)).await;
+    let id = budget["id"].as_str().unwrap().to_owned();
+    // The status read materializes the counter; increments never create keys.
+    get_budget(&server, root, &id).await;
+    let key = current_key(&id);
+    let mut last = get_key(&key).await.expect("counter materialized");
+
+    let calls: [(&str, &str, Value); 3] = [
+        ("non-stream chat", "/v1/chat/completions", chat_body()),
+        ("stream chat", "/v1/chat/completions", stream_chat_body()),
+        ("embeddings", "/v1/embeddings", embeddings_body()),
+    ];
+    for (label, path, body) in calls {
+        let resp = post_llm(&server, path, &c.jwt, Some(&c.traceparent), &body).await;
+        assert_eq!(resp.status(), 200, "{label}");
+        let _ = resp.bytes().await.expect("drain body");
+        let before = last;
+        let now = wait_for_key(&key, std::time::Duration::from_secs(1), |v| {
+            v.is_some_and(|v| v > before)
+        })
+        .await
+        .unwrap_or(before);
+        assert!(now > before, "{label}: counter stayed at {before}");
+        last = now;
+    }
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn flush_rebuilds_and_still_blocks() {
+    let _upstream = stub_upstream_big_usage().await;
+    let server = TestServer::start().await;
+    let root = seed_root(&server).await;
+    let c = caller(&server, "flush-user").await;
+    seed_usage(
+        &server,
+        c.user,
+        None,
+        "direct_llm",
+        0.002,
+        in_current_period(),
+    )
+    .await;
+    let budget = create_budget(&server, root, user_budget("flush", c.user, 0.001)).await;
+    let id = budget["id"].as_str().unwrap().to_owned();
+    let key = current_key(&id);
+
+    get_budget(&server, root, &id).await;
+    assert_eq!(get_key(&key).await, Some(2_000));
+    del_key(&key).await;
+
+    assert_eq!(chat(&server, &c).await.status(), 429);
+    assert_eq!(get_key(&key).await, Some(2_000), "rebuilt from token_usage");
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn store_down_fails_closed() {
+    let _upstream = stub_upstream_big_usage().await;
+    let server = TestServer::start().await;
+    let root = seed_root(&server).await;
+    let a = caller(&server, "down-a").await;
+    let b = caller(&server, "down-b").await;
+    create_budget(&server, root, user_budget("down", a.user, 1000.0)).await;
+
+    // A second router over the same database whose counter store is unreachable.
+    let engine = nasiko_llm_router::budget::BudgetEngine::new(
+        server.db.clone(),
+        Some(redis::Client::open("redis://127.0.0.1:1").expect("redis url")),
+    );
+    let ctx =
+        nasiko_llm_router::LlmRouterCtx::from_shared(server.db.clone(), reqwest::Client::new())
+            .with_budgets(std::sync::Arc::new(engine));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    tokio::spawn(async move {
+        axum::serve(listener, nasiko_llm_router::router(ctx))
+            .await
+            .unwrap();
+    });
+    let client = reqwest::Client::new();
+
+    let started = std::time::Instant::now();
+    let resp = post_llm_at(
+        &base,
+        &client,
+        "/v1/chat/completions",
+        &a.jwt,
+        Some(&a.traceparent),
+        &chat_body(),
+    )
+    .await;
+    assert_eq!(resp.status(), 503);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "fails fast"
+    );
+    let body = resp.json::<Value>().await.unwrap();
+    assert_eq!(body["error"]["code"], "budget_store_unavailable", "{body}");
+    assert!(body.get("nasiko_budget").is_none(), "{body}");
+
+    let resp = post_llm_at(
+        &base,
+        &client,
+        "/v1/chat/completions",
+        &b.jwt,
+        Some(&b.traceparent),
+        &chat_body(),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        200,
+        "no applicable budget: store not consulted"
+    );
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn check_makes_one_mget() {
+    use nasiko_llm_router::budget::{BudgetEngine, BudgetSubject, DowngradePolicy};
+
+    let server = TestServer::start().await;
+    let root = seed_root(&server).await;
+    let user = seed_user(&server, "mget-user", "member").await;
+    let other = seed_user(&server, "mget-other", "member").await;
+    let agent = seed_agent(&server, user, "mget-agent").await;
+    let engine = BudgetEngine::new(server.db.clone(), Some(redis_client()));
+    let subject = |user_id| BudgetSubject {
+        user_id: Some(user_id),
+        agent_id: Some(agent),
+        downgrade: DowngradePolicy::Allowed,
+    };
+    let now = Utc::now();
+
+    // Only a user budget for `user` exists: a subject matching nothing makes no Redis call.
+    create_budget(&server, root, user_budget("mget user", user, 1000.0)).await;
+    let before = engine.store_stats().mget_calls;
+    engine.check(&subject(other), now).await.expect("check");
+    assert_eq!(
+        engine.store_stats().mget_calls,
+        before,
+        "unbudgeted subject"
+    );
+
+    create_budget(
+        &server,
+        root,
+        json!({"name": "mget agent", "scope": "agent", "target_id": agent,
+               "period": "monthly", "limit_usd": 1000.0, "action": "block"}),
+    )
+    .await;
+    create_budget(
+        &server,
+        root,
+        json!({"name": "mget platform", "scope": "platform",
+               "period": "monthly", "limit_usd": 1000.0, "action": "block"}),
+    )
+    .await;
+    engine.invalidate().await;
+    let defs = engine.definitions().await.unwrap();
+    let all: Vec<&_> = defs.iter().collect();
+    assert_eq!(all.len(), 3);
+    engine.spend_micros(&all, now).await.expect("prime keys");
+
+    let before = engine.store_stats().mget_calls;
+    engine.check(&subject(user), now).await.expect("check");
+    assert_eq!(
+        engine.store_stats().mget_calls,
+        before + 1,
+        "one MGET for 3 budgets"
+    );
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn coding_agent_call_is_blocked() {
+    let _upstream = stub_upstream_big_usage().await;
+    let server = TestServer::start().await;
+    let root = seed_root(&server).await;
+    let user = seed_user(&server, "coding-owner", "member").await;
+    let agent = seed_agent(&server, user, "coding-agent").await;
+    sqlx::query("UPDATE agents SET coding_agent_integration_id = 'claude' WHERE id = $1")
+        .bind(agent)
+        .execute(&server.db)
+        .await
+        .expect("mark coding agent");
+    let jwt = router_agent_jwt(agent, user);
+    let budget = create_budget(&server, root, user_budget("coding", user, 1000.0)).await;
+    let id = budget["id"].as_str().unwrap().to_owned();
+    get_budget(&server, root, &id).await;
+    let key = current_key(&id);
+    let before = get_key(&key).await.expect("counter materialized");
+
+    let resp = post_llm(&server, "/v1/chat/completions", &jwt, None, &chat_body()).await;
+    assert_eq!(resp.status(), 200, "coding agent needs no traceparent");
+    let after = wait_for_key(&key, std::time::Duration::from_secs(1), |v| {
+        v.is_some_and(|v| v > before)
+    })
+    .await;
+    assert!(after.is_some_and(|v| v > before), "billed to the JWT owner");
+
+    // Exhaust the budget: the next call without a traceparent is blocked.
+    let mut tight = json!({"limit_usd": 0.0001});
+    tight["enabled"] = json!(true);
+    let resp = admin(
+        root,
+        server.client.put(server.url(&format!("/api/budgets/{id}"))),
+    )
+    .json(&tight)
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    let resp = post_llm(&server, "/v1/chat/completions", &jwt, None, &chat_body()).await;
+    assert_eq!(resp.status(), 429);
+    let body = resp.json::<Value>().await.unwrap();
+    assert_nasiko_budget(&body, &id, "user", "monthly");
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn block_ensures_hard_limit_event() {
+    let _upstream = stub_upstream_big_usage().await;
+    let server = TestServer::start().await;
+    let root = seed_root(&server).await;
+    let c = caller(&server, "event-user").await;
+    let budget = create_budget(&server, root, user_budget("event", c.user, 0.001)).await;
+    let id = budget["id"].as_str().unwrap().to_owned();
+    let key = current_key(&id);
+    // Set directly: no rebuild and no crossing, so nothing has written an event yet.
+    let mut conn = redis_client()
+        .get_multiplexed_async_connection()
+        .await
+        .expect("redis conn");
+    let _: () = conn
+        .set_ex(&key, 1_001_i64, 3600)
+        .await
+        .expect("set counter");
+    assert!(event_kinds(&server, &id).await.is_empty());
+
+    assert_eq!(chat(&server, &c).await.status(), 429);
+    let hard = |kinds: Vec<String>| kinds.iter().filter(|k| *k == "hard_limit").count();
+    assert_eq!(hard(event_kinds(&server, &id).await), 1);
+    for _ in 0..2 {
+        assert_eq!(chat(&server, &c).await.status(), 429);
+    }
+    assert_eq!(hard(event_kinds(&server, &id).await), 1);
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn increment_failure_forces_rebuild() {
+    use nasiko_llm_router::budget::BudgetEngine;
+
+    let server = TestServer::start().await;
+    let root = seed_root(&server).await;
+    let user = seed_user(&server, "incr-fail-user", "member").await;
+    let budget = create_budget(&server, root, user_budget("incr fail", user, 100.0)).await;
+    let id = budget["id"].as_str().unwrap().to_owned();
+    let key = current_key(&id);
+    let engine = BudgetEngine::new(server.db.clone(), Some(redis_client()));
+    let now = Utc::now();
+    let defs = engine.definitions().await.unwrap();
+    let all: Vec<&_> = defs.iter().collect();
+    del_key(&key).await;
+    assert_eq!(engine.spend_micros(&all, now).await.unwrap(), vec![0]);
+
+    seed_usage(&server, user, None, "direct_llm", 0.5, in_current_period()).await;
+    engine.fail_next_increment();
+    let outcome = engine.record(user, None, 500_000, now).await;
+    drop(outcome);
+
+    assert_eq!(
+        engine.spend_micros(&all, now).await.unwrap(),
+        vec![500_000],
+        "rebuilt from token_usage, not the stale 0"
+    );
+    server.cleanup().await;
+}
