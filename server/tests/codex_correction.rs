@@ -19,10 +19,12 @@
 mod common;
 
 use chrono::{TimeZone, Utc};
+use nasiko_server::observability::codex_correction;
 use nasiko_types::{
     CODEX_ADAPTER_VERSION_EXCLUSIVE_INPUT, CODING_AGENT_EVENT_VERSION, CapturePolicy,
-    CodingAgentEventV1, CodingAgentLlmCall, CodingAgentSession, CodingAgentSource, CodingAgentTurn,
-    coding_agent_event_id, coding_agent_session_id,
+    CodingAgentEventV1, CodingAgentLlmCall, CodingAgentScope, CodingAgentScopeKind,
+    CodingAgentSession, CodingAgentSource, CodingAgentTurn, coding_agent_event_id,
+    coding_agent_session_id,
 };
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
@@ -359,6 +361,60 @@ async fn chat_transcript_corrects_legacy_codex_message() {
             assert_eq!(message["input_tokens"], 1000, "{message}");
         }
     }
+    server.cleanup().await;
+}
+
+// ─── session overlay ────────────────────────────────────────────────────────
+
+#[tokio::test]
+#[serial]
+async fn session_overlay_lists_scoped_traces_and_legacy_deltas() {
+    let server = common::TestServer::start().await;
+    let user_id = setup(&server, &["codex", "claude"]).await;
+    let legacy = event("codex", "legacy", "turn-1");
+    ingest(&server, user_id, &legacy).await;
+    let (codex_session, codex_trace, delta) = rollup(&server, &legacy.event_id).await;
+
+    let main = event("claude", "claude-s", "turn-1");
+    let mut sub = event("claude", "claude-s", "agent-a1:1");
+    sub.turn.agent_scope = Some(CodingAgentScope {
+        kind: CodingAgentScopeKind::Subagent,
+        agent_id: "a1".into(),
+        agent_type: Some("Explore".into()),
+        parent_tool_call_id: Some("toolu_parent".into()),
+        parent_agent_id: None,
+        spawn_depth: Some(1),
+        description: None,
+        name: None,
+    });
+    ingest(&server, user_id, &main).await;
+    ingest(&server, user_id, &sub).await;
+    let (claude_session, main_trace, _) = rollup(&server, &main.event_id).await;
+    let (_, sub_trace, _) = rollup(&server, &sub.event_id).await;
+    assert_ne!(main_trace, sub_trace);
+
+    let overlay =
+        codex_correction::load_for_sessions(&server.db, &[codex_session.clone(), claude_session])
+            .await
+            .unwrap();
+    assert!(overlay.scoped_traces().contains(&sub_trace));
+    assert!(!overlay.scoped_traces().contains(&main_trace));
+    assert!(!overlay.scoped_traces().contains(&codex_trace));
+    assert!(
+        overlay.trace(&main_trace).is_none(),
+        "claude is never corrected"
+    );
+    let codex = overlay.trace(&codex_trace).expect("legacy trace corrected");
+    assert_eq!(codex.input_tokens, 800);
+    assert_close(codex.cost_usd, delta, "trace cost delta");
+    assert_eq!(overlay.session(&codex_session).unwrap().input_tokens, 800);
+
+    let by_trace =
+        codex_correction::load_for_traces(&server.db, &[codex_trace.clone(), main_trace])
+            .await
+            .unwrap();
+    assert_eq!(by_trace.trace(&codex_trace).unwrap().input_tokens, 800);
+    assert!(by_trace.scoped_traces().is_empty());
     server.cleanup().await;
 }
 

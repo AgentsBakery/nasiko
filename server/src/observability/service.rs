@@ -21,6 +21,7 @@ use serde_json::Value;
 use sqlx::PgPool;
 use utoipa::ToSchema;
 
+use super::codex_correction;
 use crate::agents::hours_meter;
 
 // ─── Session listing tuning ───────────────────────────────────────────────────
@@ -469,6 +470,11 @@ pub struct SessionSummary {
     pub session_annotations: Vec<Value>,
     #[schema(value_type = Vec<Object>)]
     pub session_annotation_summaries: Vec<Value>,
+    /// True when the figures exclude the legacy Codex cached-input double
+    /// count (`observability::codex_correction`). Omitted when false, so
+    /// uncorrected responses are unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub usage_corrected: bool,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -527,6 +533,11 @@ pub struct SessionDetail {
     pub metrics_complete: bool,
     pub traces: Vec<TraceEntry>,
     pub pagination: Pagination,
+    /// True when the figures exclude the legacy Codex cached-input double
+    /// count (`observability::codex_correction`). Omitted when false, so
+    /// uncorrected responses are unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub usage_corrected: bool,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -574,6 +585,11 @@ pub struct RootSpanEntry {
     pub input: ContentField,
     pub output: ContentField,
     pub trace: TraceRef,
+    /// True when the figures exclude the legacy Codex cached-input double
+    /// count (`observability::codex_correction`). Omitted when false, so
+    /// uncorrected responses are unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub usage_corrected: bool,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -1339,12 +1355,23 @@ impl ObservabilityService {
     // ── 1. session/list ──────────────────────────────────────────────────────
 
     /// Row for a session the trace store knows about: token counts, latency and
-    /// cost come from its traces.
+    /// cost come from its traces, minus any legacy Codex double count in
+    /// `overlay`. Subagent / teammate traces count toward the totals (their
+    /// spend is real) but never supply `first_input` / `last_output`: they are
+    /// not the user's ask.
     fn session_summary_from_traces(
         session_id: String,
         agent_name: String,
         details: &nasiko_observability::SessionDetails,
+        overlay: &codex_correction::CorrectionOverlay,
     ) -> SessionSummary {
+        let is_user_turn = |t: &&nasiko_observability::TraceSummary| {
+            !codex_correction::is_scoped_trace(
+                &t.trace_id,
+                &t.root_span.attributes,
+                overlay.scoped_traces(),
+            )
+        };
         let total_tokens = details.input_tokens
             + details.output_tokens
             + details.cache_read_tokens
@@ -1360,7 +1387,7 @@ impl ObservabilityService {
             .zip(ended_at)
             .map(|(s, e)| (e - s).num_milliseconds().max(0) as u64);
 
-        SessionSummary {
+        let mut summary = SessionSummary {
             id: session_id.clone(),
             session_id,
             agent_id: agent_name,
@@ -1370,8 +1397,17 @@ impl ObservabilityService {
             // to start_time when no end time is known.
             end_time: ended_at.or(started_at).map(fmt_ts),
             duration_ms,
-            first_input: details.traces.first().and_then(|t| t.input_content.clone()),
-            last_output: details.traces.last().and_then(|t| t.output_content.clone()),
+            first_input: details
+                .traces
+                .iter()
+                .find(is_user_turn)
+                .and_then(|t| t.input_content.clone()),
+            last_output: details
+                .traces
+                .iter()
+                .rev()
+                .find(is_user_turn)
+                .and_then(|t| t.output_content.clone()),
             token_usage: TokenUsageSummary {
                 total: (complete && total_tokens > 0).then_some(total_tokens),
             },
@@ -1385,7 +1421,11 @@ impl ObservabilityService {
             },
             session_annotations: vec![],
             session_annotation_summaries: vec![],
-        }
+            usage_corrected: false,
+        };
+        let delta = overlay.sum_for_traces(details.traces.iter().map(|t| t.trace_id.as_str()));
+        codex_correction::correct_session_summary(&mut summary, delta.as_ref());
+        summary
     }
 
     /// Row for a session with no traces — the agent isn't OTel-instrumented, or
@@ -1413,6 +1453,7 @@ impl ObservabilityService {
             },
             session_annotations: vec![],
             session_annotation_summaries: vec![],
+            usage_corrected: false,
         }
     }
 
@@ -1502,6 +1543,18 @@ impl ObservabilityService {
             .map(|(id, name, _display, _version)| (id, name))
             .collect();
 
+        // Legacy Codex corrections and scoped trace ids for exactly this
+        // (already authorized) page, one query. A failure degrades to
+        // uncorrected, unflagged rows rather than failing the list.
+        let page_ids: Vec<String> = db_sessions.iter().map(|(id, _, _)| id.clone()).collect();
+        let overlay = codex_correction::load_for_sessions(&self.db, &page_ids)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, sessions = page_ids.len(), "get_all_sessions: codex correction overlay unavailable");
+                codex_correction::CorrectionOverlay::default()
+            });
+        let overlay = &overlay;
+
         // 3. Enrich each session from the trace store, concurrently. For agents
         //    without OTel the provider returns NotFound and we fall back to a
         //    minimal summary built from the DB row — the session still appears
@@ -1522,6 +1575,7 @@ impl ObservabilityService {
                             session_id,
                             agent_name,
                             &details,
+                            overlay,
                         ),
                         Err(e) => {
                             if !matches!(e, ObservabilityError::NotFound(_)) {
@@ -1645,6 +1699,12 @@ impl ObservabilityService {
         // Postgres can never find its historical traces.
         let (title, start, end) = self.session_window(session_id).await;
         let details = self.provider.get_session(session_id, start, end).await?;
+        let overlay = codex_correction::load_for_sessions(&self.db, &[session_id.to_owned()])
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(%session_id, error = %e, "get_session_details: codex correction overlay unavailable");
+                codex_correction::CorrectionOverlay::default()
+            });
 
         let trace_entries: Vec<TraceEntry> = details
             .traces
@@ -1663,43 +1723,46 @@ impl ObservabilityService {
                 );
                 let trace_id_enc = encode_trace_id(&t.trace_id);
 
-                TraceEntry {
-                    id: trace_id_enc.clone(),
-                    trace_id: t.trace_id.clone(),
-                    root_span: RootSpanEntry {
-                        id: encode_span_id(&t.root_span.span_id),
-                        span_id: t.root_span.span_id.clone(),
-                        attributes: serde_json::to_string(&flat_attrs).unwrap_or_default(),
-                        cumulative_token_count_total: t.input_tokens
-                            + t.output_tokens
-                            + t.cache_read_tokens
-                            + t.cache_creation_tokens,
-                        input_tokens: t.input_tokens,
-                        output_tokens: t.output_tokens,
-                        cache_read_tokens: t.cache_read_tokens,
-                        cache_creation_tokens: t.cache_creation_tokens,
-                        latency_ms: round6(t.duration_ms.unwrap_or(0) as f64),
-                        start_time: Some(fmt_ts(t.root_span.started_at)),
-                        span_annotations: vec![],
-                        span_annotation_summaries: vec![],
-                        project: ProjectRef { id: String::new() },
-                        input: ContentField {
-                            value: t.input_content.clone().unwrap_or_default(),
-                            mime_type: "text".into(),
-                            parsed_value: None,
-                        },
-                        output: ContentField {
-                            value: t.output_content.clone().unwrap_or_default(),
-                            mime_type: "text".into(),
-                            parsed_value: None,
-                        },
-                        trace: TraceRef {
-                            id: trace_id_enc,
-                            cost_summary: serde_json::json!({
-                                "total": { "cost": t.cost.total_usd }
-                            }),
-                        },
+                let mut root_span = RootSpanEntry {
+                    id: encode_span_id(&t.root_span.span_id),
+                    span_id: t.root_span.span_id.clone(),
+                    attributes: serde_json::to_string(&flat_attrs).unwrap_or_default(),
+                    cumulative_token_count_total: t.input_tokens
+                        + t.output_tokens
+                        + t.cache_read_tokens
+                        + t.cache_creation_tokens,
+                    input_tokens: t.input_tokens,
+                    output_tokens: t.output_tokens,
+                    cache_read_tokens: t.cache_read_tokens,
+                    cache_creation_tokens: t.cache_creation_tokens,
+                    latency_ms: round6(t.duration_ms.unwrap_or(0) as f64),
+                    start_time: Some(fmt_ts(t.root_span.started_at)),
+                    span_annotations: vec![],
+                    span_annotation_summaries: vec![],
+                    project: ProjectRef { id: String::new() },
+                    input: ContentField {
+                        value: t.input_content.clone().unwrap_or_default(),
+                        mime_type: "text".into(),
+                        parsed_value: None,
                     },
+                    output: ContentField {
+                        value: t.output_content.clone().unwrap_or_default(),
+                        mime_type: "text".into(),
+                        parsed_value: None,
+                    },
+                    trace: TraceRef {
+                        id: trace_id_enc,
+                        cost_summary: serde_json::json!({
+                            "total": { "cost": t.cost.total_usd }
+                        }),
+                    },
+                    usage_corrected: false,
+                };
+                codex_correction::correct_root_entry(&mut root_span, overlay.trace(&t.trace_id));
+                TraceEntry {
+                    id: encode_trace_id(&t.trace_id),
+                    trace_id: t.trace_id.clone(),
+                    root_span,
                     cursor,
                 }
             })
@@ -1711,52 +1774,55 @@ impl ObservabilityService {
             + details.cache_creation_tokens;
         let end_cursor = trace_entries.last().map(|e| e.cursor.clone());
 
-        Ok(SessionDetailResponse {
-            data: SessionDetailData {
-                session: SessionDetail {
-                    id: details.session_id.clone(),
-                    session_id: details.session_id.clone(),
-                    title,
-                    agent_name,
-                    num_traces: details.trace_count,
-                    token_usage: TokenUsageSummary {
-                        total: details.metrics_complete.then_some(total_tokens),
-                    },
-                    cost_summary: FullCostSummary {
-                        total: CostWithTokens {
-                            cost: details.cost.total_usd,
-                            tokens: total_tokens,
-                        },
-                        prompt: CostWithTokens {
-                            cost: details.cost.prompt_usd,
-                            tokens: details.input_tokens,
-                        },
-                        completion: CostWithTokens {
-                            cost: details.cost.completion_usd,
-                            tokens: details.output_tokens,
-                        },
-                        cache_read: CostWithTokens {
-                            cost: details.cost.cache_read_usd,
-                            tokens: details.cache_read_tokens,
-                        },
-                        cache_creation: CostWithTokens {
-                            cost: details.cost.cache_creation_usd,
-                            tokens: details.cache_creation_tokens,
-                        },
-                    },
-                    latency_p50: details.latency_ms_p50,
-                    latency_p99: details.latency_ms_p99,
-                    latency_avg: details.latency_ms_avg,
-                    cache_read_tokens: details.cache_read_tokens,
-                    cache_creation_tokens: details.cache_creation_tokens,
-                    metrics_complete: details.metrics_complete,
-                    traces: trace_entries,
-                    pagination: Pagination {
-                        end_cursor,
-                        has_next_page: details.has_more_traces,
-                    },
+        let delta = overlay.sum_for_traces(details.traces.iter().map(|t| t.trace_id.as_str()));
+        let mut session = SessionDetail {
+            id: details.session_id.clone(),
+            session_id: details.session_id.clone(),
+            title,
+            agent_name,
+            num_traces: details.trace_count,
+            token_usage: TokenUsageSummary {
+                total: details.metrics_complete.then_some(total_tokens),
+            },
+            cost_summary: FullCostSummary {
+                total: CostWithTokens {
+                    cost: details.cost.total_usd,
+                    tokens: total_tokens,
+                },
+                prompt: CostWithTokens {
+                    cost: details.cost.prompt_usd,
+                    tokens: details.input_tokens,
+                },
+                completion: CostWithTokens {
+                    cost: details.cost.completion_usd,
+                    tokens: details.output_tokens,
+                },
+                cache_read: CostWithTokens {
+                    cost: details.cost.cache_read_usd,
+                    tokens: details.cache_read_tokens,
+                },
+                cache_creation: CostWithTokens {
+                    cost: details.cost.cache_creation_usd,
+                    tokens: details.cache_creation_tokens,
                 },
             },
+            latency_p50: details.latency_ms_p50,
+            latency_p99: details.latency_ms_p99,
+            latency_avg: details.latency_ms_avg,
+            cache_read_tokens: details.cache_read_tokens,
+            cache_creation_tokens: details.cache_creation_tokens,
+            metrics_complete: details.metrics_complete,
+            traces: trace_entries,
+            pagination: Pagination {
+                end_cursor,
+                has_next_page: details.has_more_traces,
+            },
+            usage_corrected: false,
+        };
+        codex_correction::correct_session_detail(&mut session, delta.as_ref());
+
+        Ok(SessionDetailResponse {
+            data: SessionDetailData { session },
         })
     }
 
@@ -3678,7 +3744,7 @@ mod tests {
     use std::collections::HashMap;
 
     use chrono::{TimeZone, Utc};
-    use nasiko_observability::{CostBreakdown, SessionDetails, Span};
+    use nasiko_observability::{CostBreakdown, SessionDetails, Span, TraceSummary};
 
     use super::*;
 
@@ -3846,9 +3912,158 @@ mod tests {
             "session".into(),
             "agent".into(),
             &details,
+            &codex_correction::CorrectionOverlay::default(),
         );
         assert_eq!(summary.token_usage.total, Some(20));
         assert_eq!(summary.cost_summary.total.cost, Some(4.0));
+    }
+
+    // ── codex correction / scoped traces ─────────────────────────────────────
+
+    fn turn(trace_id: &str, attributes: HashMap<String, Value>) -> TraceSummary {
+        let started_at = Utc.with_ymd_and_hms(2026, 8, 27, 12, 0, 0).unwrap();
+        TraceSummary {
+            trace_id: trace_id.into(),
+            root_span: Span {
+                span_id: format!("root-{trace_id}"),
+                parent_span_id: None,
+                name: "coding_agent.turn".into(),
+                started_at,
+                ended_at: Some(started_at),
+                duration_ms: Some(1),
+                service_name: "agent".into(),
+                kind: 1,
+                status_code: 0,
+                status_message: String::new(),
+                attributes,
+                events: vec![],
+            },
+            input_tokens: 1000,
+            output_tokens: 50,
+            cache_read_tokens: 800,
+            cache_creation_tokens: 0,
+            model_used: None,
+            duration_ms: Some(1),
+            cost: CostBreakdown {
+                total_usd: 0.01,
+                ..Default::default()
+            },
+            input_content: Some(format!("ask {trace_id}")),
+            output_content: Some(format!("answer {trace_id}")),
+        }
+    }
+
+    fn session_of(traces: Vec<TraceSummary>) -> SessionDetails {
+        let n = traces.len() as u64;
+        SessionDetails {
+            session_id: "session".into(),
+            trace_count: traces.len(),
+            traces,
+            input_tokens: 1000 * n,
+            output_tokens: 50 * n,
+            cache_read_tokens: 800 * n,
+            cache_creation_tokens: 0,
+            model_used: None,
+            latency_ms_p50: None,
+            latency_ms_p99: None,
+            latency_ms_avg: None,
+            has_more_traces: false,
+            metrics_complete: true,
+            cost: CostBreakdown {
+                total_usd: 0.01 * n as f64,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn legacy_delta() -> codex_correction::Delta {
+        codex_correction::Delta {
+            input_tokens: 800,
+            cost_usd: 0.004,
+            cache_read_tokens: 800,
+        }
+    }
+
+    #[test]
+    fn scoped_rollup_trace_without_attributes_is_never_first_input() {
+        // Attributes absent (as if the trace store dropped them): the rollup
+        // alone marks the subagent traces as scoped.
+        let details = session_of(vec![
+            turn("sub-1", HashMap::new()),
+            turn("main", HashMap::new()),
+            turn("sub-2", HashMap::new()),
+        ]);
+        let overlay = codex_correction::CorrectionOverlay::for_test(&[], &["sub-1", "sub-2"]);
+        let summary = ObservabilityService::session_summary_from_traces(
+            "session".into(),
+            "agent".into(),
+            &details,
+            &overlay,
+        );
+        assert_eq!(summary.first_input.as_deref(), Some("ask main"));
+        assert_eq!(summary.last_output.as_deref(), Some("answer main"));
+        // Subagent spend still counts.
+        assert_eq!(summary.token_usage.total, Some(3 * 1050 + 3 * 800));
+        assert!(!summary.usage_corrected);
+    }
+
+    #[test]
+    fn scoped_attribute_trace_is_never_first_input_and_all_scoped_gives_none() {
+        let scoped_attrs = HashMap::from([(
+            codex_correction::AGENT_KIND_ATTRIBUTE.to_owned(),
+            serde_json::json!("subagent"),
+        )]);
+        let details = session_of(vec![
+            turn("sub", scoped_attrs.clone()),
+            turn("main", HashMap::new()),
+        ]);
+        let empty = codex_correction::CorrectionOverlay::default();
+        let summary = ObservabilityService::session_summary_from_traces(
+            "session".into(),
+            "agent".into(),
+            &details,
+            &empty,
+        );
+        assert_eq!(summary.first_input.as_deref(), Some("ask main"));
+
+        let only_scoped = session_of(vec![turn("sub", scoped_attrs)]);
+        let summary = ObservabilityService::session_summary_from_traces(
+            "session".into(),
+            "agent".into(),
+            &only_scoped,
+            &empty,
+        );
+        assert_eq!(
+            summary.first_input, None,
+            "never fall back to a subagent prompt"
+        );
+        assert_eq!(summary.last_output, None);
+    }
+
+    #[test]
+    fn session_summary_subtracts_only_shown_legacy_traces() {
+        let details = session_of(vec![
+            turn("legacy", HashMap::new()),
+            turn("claude", HashMap::new()),
+        ]);
+        let overlay = codex_correction::CorrectionOverlay::for_test(
+            &[
+                ("legacy", "session", legacy_delta()),
+                // Outside the provider's window: must not be subtracted.
+                ("not-shown", "session", legacy_delta()),
+            ],
+            &[],
+        );
+        let summary = ObservabilityService::session_summary_from_traces(
+            "session".into(),
+            "agent".into(),
+            &details,
+            &overlay,
+        );
+        assert_eq!(summary.token_usage.total, Some(2 * 1850 - 800));
+        let cost = summary.cost_summary.total.cost.unwrap();
+        assert!((cost - (0.02 - 0.004)).abs() < 1e-12, "{cost}");
+        assert!(summary.usage_corrected);
     }
 
     // ── KpiValue::new ────────────────────────────────────────────────────────
