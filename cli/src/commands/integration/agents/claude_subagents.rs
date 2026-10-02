@@ -115,8 +115,95 @@ pub fn scan_subagents(
     deadline: Instant,
     progress: &BTreeMap<String, SubagentFileProgress>,
 ) -> SubagentScan {
-    let _ = (transcript_path, main_content, main_turns, deadline, progress);
-    SubagentScan::default()
+    let dir = transcript_path.with_extension("").join(SUBAGENTS_DIR);
+    let Some(candidates) = discover(&dir) else {
+        return SubagentScan::default();
+    };
+
+    let mut signals = Signals::default();
+    signals.collect(main_content, None);
+    for (agent_id, file) in progress {
+        for id in &file.spawn_tool_use_ids {
+            signals
+                .spawn_parents
+                .entry(id.clone())
+                .or_insert_with(|| Some(agent_id.clone()));
+        }
+    }
+
+    let mut agents = Vec::new();
+    for (agent_id, candidate) in candidates {
+        let (Some(transcript), Some(meta)) = (candidate.transcript, candidate.meta) else {
+            continue;
+        };
+        if progress
+            .get(&agent_id)
+            .is_some_and(|known| known.complete && known.size == transcript.size)
+        {
+            continue;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        let Some(meta) = read_meta(&meta.path) else {
+            continue;
+        };
+        if meta.is_teammate() {
+            continue;
+        }
+        let Some(content) = read_bounded(&transcript.path, MAX_SUBAGENT_FILE_BYTES) else {
+            continue;
+        };
+        signals.collect(&content, Some(&agent_id));
+        let parsed = parse_agent(&agent_id, &content);
+        agents.push((agent_id, meta, content.len() as u64, parsed));
+    }
+
+    let mut seen: HashSet<String> = main_turns
+        .iter()
+        .flat_map(|turn| turn.calls.iter().map(|call| call.uuid.clone()))
+        .collect();
+    seen.extend(
+        progress
+            .values()
+            .flat_map(|file| file.call_ids.iter().cloned()),
+    );
+
+    let mut scan = SubagentScan::default();
+    for (agent_id, meta, size, parsed) in agents {
+        let segment_count = parsed.segments.len();
+        let mut all_terminal = true;
+        for (index, segment) in parsed.segments.into_iter().enumerate() {
+            let terminal = index + 1 < segment_count
+                || signals.notified_after(&agent_id, segment.last_at)
+                || (index == 0
+                    && meta
+                        .tool_use_id
+                        .as_ref()
+                        .is_some_and(|id| signals.finished_spawns.contains(id)));
+            let turn = exclude_seen_calls(segment.turn, &mut seen);
+            if !terminal {
+                all_terminal = false;
+                continue;
+            }
+            if turn.calls.is_empty() && turn.tool_calls.is_empty() {
+                continue;
+            }
+            scan.scoped_turns.push(ScopedTurn {
+                scope: scope_for(&agent_id, &meta, &signals),
+                turn,
+            });
+        }
+        scan.files.insert(
+            agent_id,
+            ScannedFile {
+                size,
+                all_terminal,
+                spawn_tool_use_ids: parsed.spawn_tool_use_ids,
+            },
+        );
+    }
+    scan
 }
 
 // ─── discovery ───────────────────────────────────────────────────────────────
