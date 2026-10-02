@@ -71,27 +71,250 @@ pub struct TurnUsageRollup {
 }
 
 /// Whether a receipt is a legacy Codex receipt whose input includes cache reads.
+///
+/// Codex reports `input_tokens` inclusive of cached input; CLIs before
+/// `CODEX_ADAPTER_VERSION_EXCLUSIVE_INPUT` forwarded it unchanged, so cache
+/// reads were counted twice. The rule keys only on the adapter marker. Value
+/// heuristics such as `input >= cache_read` are forbidden: a fixed CLI's
+/// exclusive input can legitimately exceed its cache reads, and subtracting
+/// again would undercount real spend.
 pub fn is_legacy_codex_inclusive(event: &CodingAgentEventV1) -> bool {
-    todo!()
+    event.source.agent_id == CODEX_SOURCE_AGENT_ID && event.source.adapter_version.is_none()
+}
+
+/// Agent/Task tool names that launch another agent.
+const SPAWN_TOOL_NAMES: &[&str] = &["Agent", "Task"];
+
+/// Tool-call outcomes after which no agent was launched.
+const NOT_SPAWNED_STATUSES: &[CodingAgentToolCallStatus] = &[
+    CodingAgentToolCallStatus::Failed,
+    CodingAgentToolCallStatus::Denied,
+    CodingAgentToolCallStatus::TimedOut,
+    CodingAgentToolCallStatus::Cancelled,
+];
+
+fn corrected_input(call: &CodingAgentLlmCall, legacy_inclusive: bool) -> u64 {
+    if legacy_inclusive {
+        call.input_tokens.saturating_sub(call.cache_read_tokens)
+    } else {
+        call.input_tokens
+    }
+}
+
+fn sum_calls(calls: &[CodingAgentLlmCall], tokens: impl Fn(&CodingAgentLlmCall) -> u64) -> u64 {
+    calls
+        .iter()
+        .fold(0_u64, |total, call| total.saturating_add(tokens(call)))
+}
+
+fn saturating_count(len: usize) -> u32 {
+    u32::try_from(len).unwrap_or(u32::MAX)
 }
 
 /// Build the rollup for one receipt. Pure; costs are filled by [`price_rollup`].
+///
+/// `server_session_id` is the scoped session id the receipt is stored under;
+/// the trace id is derived from it exactly as the OTLP exporter does, so rows
+/// join `trace_usage.trace_id`.
 pub fn rollup_for_event(event: &CodingAgentEventV1, server_session_id: &str) -> TurnUsageRollup {
-    todo!()
+    let legacy_inclusive = is_legacy_codex_inclusive(event);
+    let is_content = event.capture_policy == CapturePolicy::Content;
+    let calls = &event.turn.llm_calls;
+
+    let mut spawned_agent_call_ids = Vec::new();
+    let mut named_agent_call_ids = Vec::new();
+    for tool_call in &event.turn.tool_calls {
+        if !SPAWN_TOOL_NAMES.contains(&tool_call.name.as_str())
+            || NOT_SPAWNED_STATUSES.contains(&tool_call.status)
+        {
+            continue;
+        }
+        // Metadata-only receipts carry no arguments, so every spawn lands in
+        // the unnamed list there; that is a documented limitation.
+        let named = tool_call
+            .arguments
+            .as_ref()
+            .and_then(|arguments| arguments.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|name| !name.trim().is_empty());
+        if named {
+            named_agent_call_ids.push(tool_call.id.clone());
+        } else {
+            spawned_agent_call_ids.push(tool_call.id.clone());
+        }
+    }
+
+    let scope = event.turn.agent_scope.as_ref();
+    let agent_kind = match scope.map(|scope| scope.kind) {
+        None => "main",
+        Some(CodingAgentScopeKind::Subagent) => "subagent",
+        Some(CodingAgentScopeKind::Teammate) => "teammate",
+        Some(CodingAgentScopeKind::Unknown) => "unknown",
+    };
+    // Description and display name are content: never copied from a
+    // metadata-only receipt (validation already rejects them there; this keeps
+    // the derived row safe even if that ever changes).
+    let content_only = |value: Option<&String>| value.filter(|_| is_content).cloned();
+
+    TurnUsageRollup {
+        session_id: server_session_id.to_owned(),
+        trace_id: trace_id_for_server_session(event, server_session_id),
+        source_agent_id: event.source.agent_id.clone(),
+        capture_policy: if is_content {
+            "content"
+        } else {
+            "metadata_only"
+        },
+        adapter_version: event.source.adapter_version,
+        agent_kind,
+        scope_agent_id: scope.map(|scope| scope.agent_id.clone()),
+        agent_type: scope.and_then(|scope| scope.agent_type.clone()),
+        parent_tool_call_id: scope.and_then(|scope| scope.parent_tool_call_id.clone()),
+        parent_agent_id: scope.and_then(|scope| scope.parent_agent_id.clone()),
+        spawn_depth: scope.and_then(|scope| scope.spawn_depth),
+        description: content_only(scope.and_then(|scope| scope.description.as_ref())),
+        agent_display_name: content_only(scope.and_then(|scope| scope.name.as_ref())),
+        started_at: event.turn.started_at,
+        ended_at: event.turn.ended_at,
+        llm_calls: saturating_count(calls.len()),
+        tool_calls: saturating_count(event.turn.tool_calls.len()),
+        input_tokens: sum_calls(calls, |call| corrected_input(call, legacy_inclusive)),
+        output_tokens: sum_calls(calls, |call| call.output_tokens),
+        cache_read_tokens: sum_calls(calls, |call| call.cache_read_tokens),
+        cache_creation_tokens: sum_calls(calls, |call| call.cache_creation_tokens),
+        reported_input_tokens: sum_calls(calls, |call| call.input_tokens),
+        cost_usd: None,
+        reported_cost_usd: None,
+        cost_estimated: None,
+        output_incomplete: calls.iter().any(|call| {
+            call.accounting
+                .as_ref()
+                .is_some_and(|accounting| accounting.output_tokens_final == Some(false))
+        }),
+        spawned_agent_call_ids,
+        named_agent_call_ids,
+        correction: legacy_inclusive.then_some(CODEX_INCLUSIVE_INPUT_CORRECTION),
+    }
+}
+
+/// The OTLP trace id for a receipt stored under `server_session_id`.
+///
+/// The exporter derives trace ids from the server (scoped) session id, not the
+/// client's, so the event is re-keyed first. Content fields are dropped from
+/// the clone because the id never depends on them.
+fn trace_id_for_server_session(event: &CodingAgentEventV1, server_session_id: &str) -> String {
+    let keyed = CodingAgentEventV1 {
+        version: event.version,
+        event_id: event.event_id.clone(),
+        captured_at: event.captured_at,
+        source: event.source.clone(),
+        session: nasiko_types::CodingAgentSession {
+            id: server_session_id.to_owned(),
+            source_id: event.session.source_id.clone(),
+            title: None,
+        },
+        turn: nasiko_types::CodingAgentTurn {
+            id: event.turn.id.clone(),
+            prompt: None,
+            response: None,
+            started_at: event.turn.started_at,
+            ended_at: event.turn.ended_at,
+            llm_calls: Vec::new(),
+            tool_calls: Vec::new(),
+            agent_scope: None,
+        },
+        capture_policy: event.capture_policy.clone(),
+    };
+    crate::coding_agent_otlp::trace_id_for_event(&keyed)
+}
+
+/// Price one call's usage with `input` substituted for its reported input.
+async fn price_call(
+    pricing: &PricingEngine,
+    call: &CodingAgentLlmCall,
+    input: u64,
+) -> CostBreakdown {
+    let context = call
+        .accounting
+        .as_ref()
+        .map(|accounting| PricingContext {
+            cache_creation_5m: accounting.cache_creation_5m_tokens,
+            cache_creation_1h: accounting.cache_creation_1h_tokens,
+            speed: accounting.speed.as_deref(),
+            service_tier: accounting.service_tier.as_deref(),
+            inference_geo: accounting.inference_geo.as_deref(),
+            conflicting_observations: accounting.conflicting_observations,
+        })
+        .unwrap_or_default();
+    pricing
+        .price_with_context(
+            Some(&call.provider),
+            &call.model,
+            RawUsage {
+                input,
+                output: call.output_tokens,
+                cache_read: call.cache_read_tokens,
+                cache_creation: call.cache_creation_tokens,
+                total: None,
+            },
+            // Coding-agent usage is cache-exclusive once corrected, which is
+            // Anthropic's convention and what the adapters normalize to.
+            PromptConvention::Exclusive,
+            call.started_at,
+            context,
+        )
+        .await
+        .cost
+}
+
+/// Round to the pricing engine's micro-dollar precision, keeping real zeros.
+fn usd(total: &CostBreakdown) -> Option<Decimal> {
+    Decimal::from_f64_retain(total.total_usd).map(|cost| cost.round_dp(6))
 }
 
 /// Price the rollup's reported and (when corrected) corrected usage.
+///
+/// Priced per call, not per turn: a turn can switch models mid-way, and one
+/// model's rate must not be applied to another model's tokens. A turn with no
+/// calls stays unpriced (`None`), which is distinct from a priced zero.
+/// Pricing takes its own pool connection, so never call this while holding a
+/// write transaction.
 pub async fn price_rollup(
     pricing: &PricingEngine,
     event: &CodingAgentEventV1,
     rollup: &mut TurnUsageRollup,
 ) {
-    todo!()
+    if event.turn.llm_calls.is_empty() {
+        rollup.cost_usd = None;
+        rollup.reported_cost_usd = None;
+        rollup.cost_estimated = None;
+        return;
+    }
+    let corrected = rollup.correction.is_some();
+    let mut reported = CostBreakdown::default();
+    let mut actual = CostBreakdown::default();
+    for call in &event.turn.llm_calls {
+        let reported_cost = price_call(pricing, call, call.input_tokens).await;
+        if corrected {
+            actual.add(price_call(pricing, call, corrected_input(call, true)).await);
+        } else {
+            actual.add(reported_cost);
+        }
+        reported.add(reported_cost);
+    }
+    rollup.reported_cost_usd = usd(&reported);
+    rollup.cost_usd = usd(&actual);
+    rollup.cost_estimated = Some(reported.estimated || actual.estimated);
 }
 
 /// The reported cost and estimate flag the chat transcript stores for a turn.
+///
+/// Chat keeps the receipt's reported figure (today's semantics); read paths
+/// apply the correction overlay.
 pub fn reported_cost_for_chat(rollup: &TurnUsageRollup) -> Option<(Decimal, bool)> {
-    todo!()
+    rollup
+        .reported_cost_usd
+        .map(|cost| (cost, rollup.cost_estimated.unwrap_or(false)))
 }
 
 #[cfg(test)]
