@@ -3,10 +3,11 @@ use axum::{
     extract::{DefaultBodyLimit, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::post,
+    routing::{get, post},
 };
 use nasiko_types::{
-    CapturePolicy, CodingAgentEventBatchRequest, CodingAgentEventBatchResponse,
+    CODING_AGENT_EVENT_VERSION, CODING_AGENT_TELEMETRY_FEATURES, CapturePolicy,
+    CodingAgentCapabilities, CodingAgentEventBatchRequest, CodingAgentEventBatchResponse,
     CodingAgentEventResult, CodingAgentEventStatus, CodingAgentEventV1, coding_agent_session_id,
 };
 use serde_json::json;
@@ -23,7 +24,35 @@ const CODING_SESSION_PLACEHOLDER: &str = "Coding session";
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/telemetry/coding-agent/events/batch", post(ingest_batch))
+        .route("/telemetry/coding-agent/capabilities", get(capabilities))
         .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
+}
+
+/// Advertise the additive v1 telemetry features this server accepts.
+///
+/// A CLI sends a new event shape only when its slug is listed here. Servers
+/// that predate this route answer 404, which the CLI reads as "no features",
+/// so it keeps sending exactly the v1.0 shapes an old server understands.
+#[utoipa::path(
+    get,
+    path = "/api/telemetry/coding-agent/capabilities",
+    tag = "coding-agent-telemetry",
+    responses(
+        (status = 200, description = "`data` is `{event_version, features}`: the validated \
+            event version (always 1) and the accepted feature slugs, e.g. \
+            `[\"agent_scope\", \"adapter_version\"]`"),
+        (status = 401, description = "Missing or invalid session"),
+    ),
+)]
+pub(crate) async fn capabilities(_claims: Claims) -> Json<serde_json::Value> {
+    let capabilities = CodingAgentCapabilities {
+        event_version: CODING_AGENT_EVENT_VERSION,
+        features: CODING_AGENT_TELEMETRY_FEATURES
+            .iter()
+            .map(|feature| (*feature).to_owned())
+            .collect(),
+    };
+    Json(json!({ "data": capabilities }))
 }
 
 async fn ingest_batch(
@@ -129,6 +158,15 @@ async fn process_event(
         )));
     };
     let server_session_id = scoped_session_id(agent_id, &event.session.source_id);
+    // A scoped (subagent/teammate) turn never names the session: its context is
+    // the subagent's, not the user's conversation.
+    let is_main_turn = event.turn.agent_scope.is_none();
+    let session_title = event
+        .session
+        .title
+        .as_deref()
+        .filter(|_| is_main_turn)
+        .unwrap_or(CODING_SESSION_PLACEHOLDER);
 
     sqlx::query(
         r#"INSERT INTO chat_sessions
@@ -139,13 +177,7 @@ async fn process_event(
     .bind(&server_session_id)
     .bind(user_id)
     .bind(agent_id)
-    .bind(
-        event
-            .session
-            .title
-            .as_deref()
-            .unwrap_or(CODING_SESSION_PLACEHOLDER),
-    )
+    .bind(session_title)
     .bind(event.turn.started_at)
     .bind(event.turn.ended_at)
     .execute(&mut *tx)
@@ -198,7 +230,7 @@ async fn process_event(
         .bind(&event.event_id)
         .fetch_one(&mut *tx)
         .await?;
-        if stored != payload {
+        if !is_tolerated_replay(&stored, &payload) {
             return Err(ProcessError::Rejected(
                 "event_id already exists with a different payload".into(),
             ));
@@ -208,7 +240,14 @@ async fn process_event(
     }
 
     // Replays must never rename a session; only newly accepted receipts can upgrade it.
-    if let Some(title) = &event.session.title {
+    // Scoped turns never rename it either (Pitfall 5: subagent context is not the
+    // user's conversation).
+    if let Some(title) = event
+        .session
+        .title
+        .as_ref()
+        .filter(|_| event.turn.agent_scope.is_none())
+    {
         sqlx::query(
             r#"UPDATE chat_sessions SET title = $4
                WHERE session_id = $1 AND user_id = $2 AND agent_id = $3
@@ -223,7 +262,10 @@ async fn process_event(
         .await?;
     }
 
-    if event.capture_policy == CapturePolicy::Content {
+    // Scoped turns stay out of the chat transcript: a subagent's prompt is written
+    // by the parent agent, not the user, so it must not appear as a user message,
+    // and `external_turn` requires the prompt/response a scoped turn may omit.
+    if event.capture_policy == CapturePolicy::Content && event.turn.agent_scope.is_none() {
         let mut turn = external_turn(event, &server_session_id);
         if let (Some(usage), Some((cost, estimated))) = (turn.assistant_usage.as_mut(), cost) {
             usage.cost_usd = Some(cost);
@@ -253,6 +295,21 @@ async fn process_event(
     .await?;
     tx.commit().await?;
     Ok(CodingAgentEventStatus::Accepted)
+}
+
+/// Whether a conflicting `event_id` is a legitimate replay of the stored receipt.
+///
+/// Identical payloads are plain replays. Beyond that, the CLI's legacy-progress
+/// migration (`migrated_legacy_counts` in the CLI integration state) rebuilds
+/// and re-sends complete turns; a newer CLI's rebuild carries
+/// `source.adapter_version` (and, for Codex, corrected token numbers), so it no
+/// longer equals a receipt stored before the marker existed. That rebuild is the
+/// same turn, so it is a Duplicate and the first receipt wins (receipts are
+/// immutable). Two different payloads of the same marker generation are still a
+/// genuine conflict and stay Rejected.
+fn is_tolerated_replay(stored: &serde_json::Value, new: &serde_json::Value) -> bool {
+    let has_marker = |payload: &serde_json::Value| !payload["source"]["adapter_version"].is_null();
+    stored == new || (!has_marker(stored) && has_marker(new))
 }
 
 fn scoped_session_id(agent_id: Uuid, source_session_id: &str) -> String {

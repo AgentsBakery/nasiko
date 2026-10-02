@@ -3,8 +3,8 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use nasiko_types::{
-    CapturePolicy, CodingAgentEventV1, CodingAgentTimestampQuality, CodingAgentToolAssociation,
-    CodingAgentToolCallStatus,
+    CapturePolicy, CodingAgentEventV1, CodingAgentScope, CodingAgentScopeKind,
+    CodingAgentTimestampQuality, CodingAgentToolAssociation, CodingAgentToolCallStatus,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -231,6 +231,9 @@ pub(crate) fn trace_payload(event: &CodingAgentEventV1) -> Value {
     );
     let mut root_attributes = common_attributes(event);
     root_attributes.push(string_attr("gen_ai.operation.name", "invoke_agent"));
+    if let Some(scope) = &event.turn.agent_scope {
+        root_attributes.extend(agent_scope_attributes(scope));
+    }
     if event.capture_policy == CapturePolicy::Content {
         if let Some(prompt) = &event.turn.prompt {
             root_attributes.push(string_attr(
@@ -487,6 +490,31 @@ pub(crate) fn log_payload(event: &CodingAgentEventV1) -> Value {
             }]
         }]
     })
+}
+
+/// Root-span attributes identifying which agent did a scoped turn. Only
+/// metadata leaves Postgres: `description` and `name` are content (task intent,
+/// teammate name) and are never exported as span attributes.
+fn agent_scope_attributes(scope: &CodingAgentScope) -> Vec<Value> {
+    let kind = match scope.kind {
+        CodingAgentScopeKind::Subagent => "subagent",
+        CodingAgentScopeKind::Teammate => "teammate",
+        CodingAgentScopeKind::Unknown => "unknown",
+    };
+    let mut attributes = vec![
+        string_attr("coding_agent.agent.kind", kind),
+        string_attr("coding_agent.agent.id", &scope.agent_id),
+    ];
+    if let Some(agent_type) = &scope.agent_type {
+        attributes.push(string_attr("coding_agent.agent.type", agent_type));
+    }
+    if let Some(parent) = &scope.parent_tool_call_id {
+        attributes.push(string_attr(
+            "coding_agent.agent.parent_tool_call_id",
+            parent,
+        ));
+    }
+    attributes
 }
 
 fn tool_status(status: CodingAgentToolCallStatus) -> &'static str {

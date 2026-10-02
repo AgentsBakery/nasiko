@@ -1220,7 +1220,7 @@ mod tests {
             serde_json::to_value(&capabilities).expect("serializes"),
             serde_json::json!({"event_version": 1, "features": ["agent_scope", "adapter_version"]})
         );
-        assert!(CLAUDE_ADAPTER_VERSION_TEAMMATES > CLAUDE_ADAPTER_VERSION_SUBAGENTS);
+        const { assert!(CLAUDE_ADAPTER_VERSION_TEAMMATES > CLAUDE_ADAPTER_VERSION_SUBAGENTS) };
         assert_eq!(CODEX_ADAPTER_VERSION_EXCLUSIVE_INPUT, 1);
     }
 }
