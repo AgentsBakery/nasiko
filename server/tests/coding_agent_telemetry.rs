@@ -3,9 +3,10 @@ mod common;
 use chrono::{TimeZone, Utc};
 use nasiko_types::{
     CODING_AGENT_EVENT_VERSION, CODING_AGENT_SESSION_TITLE_MAX_BYTES, CapturePolicy,
-    CodingAgentEventV1, CodingAgentLlmCall, CodingAgentSession, CodingAgentSource,
-    CodingAgentTimestampQuality, CodingAgentToolAssociation, CodingAgentToolCall,
-    CodingAgentToolCallStatus, CodingAgentTurn, coding_agent_event_id, coding_agent_session_id,
+    CodingAgentEventV1, CodingAgentLlmCall, CodingAgentScope, CodingAgentScopeKind,
+    CodingAgentSession, CodingAgentSource, CodingAgentTimestampQuality, CodingAgentToolAssociation,
+    CodingAgentToolCall, CodingAgentToolCallStatus, CodingAgentTurn, coding_agent_event_id,
+    coding_agent_session_id,
 };
 use serde_json::{Value, json};
 use serial_test::serial;
@@ -1023,5 +1024,221 @@ async fn deleting_the_chat_session_cascades_its_receipts() {
             .await
             .unwrap();
     assert_eq!(sessions, 0);
+    server.cleanup().await;
+}
+
+// ─── contract evolution (TELE-08, AGNT-02, AGNT-05) ─────────────────────────
+
+const CLAUDE_V1_0_CONTENT: &str =
+    include_str!("../../types/tests/fixtures/coding_agent_v1_0_claude_content.json");
+
+/// The frozen v1.0 fixture, re-identified for the integration `setup` creates.
+/// Only identity fields change; the shape stays exactly what a v1.0 CLI sends.
+fn v1_0_fixture_event(session: &str) -> CodingAgentEventV1 {
+    let mut event: CodingAgentEventV1 =
+        serde_json::from_str(CLAUDE_V1_0_CONTENT).expect("v1.0 fixture decodes");
+    event.source.agent_id = "claude".into();
+    event.source.agent_name = "coding-agent".into();
+    event.session.source_id = session.into();
+    event.session.id = coding_agent_session_id("claude", session);
+    event.event_id = coding_agent_event_id("claude", session, &event.turn.id);
+    event
+}
+
+fn scoped_event(session: &str, turn: &str, policy: CapturePolicy) -> CodingAgentEventV1 {
+    let mut scoped = event(session, turn, policy);
+    scoped.turn.agent_scope = Some(CodingAgentScope {
+        kind: CodingAgentScopeKind::Subagent,
+        agent_id: "a1b2c3d4".into(),
+        agent_type: Some("Explore".into()),
+        parent_tool_call_id: Some("toolu_parent".into()),
+        parent_agent_id: None,
+        spawn_depth: Some(1),
+        description: None,
+        name: None,
+    });
+    scoped
+}
+
+async fn session_message_count(server: &common::TestServer, agent_id: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM chat_messages m JOIN chat_sessions s USING (session_id) \
+         WHERE s.agent_id = $1",
+    )
+    .bind(agent_id)
+    .fetch_one(&server.db)
+    .await
+    .expect("count messages")
+}
+
+#[tokio::test]
+#[serial]
+async fn capabilities_requires_auth_and_lists_features() {
+    let server = common::TestServer::start().await;
+    let (user_id, _) = setup(&server).await;
+    let anonymous = server
+        .client
+        .get(server.url("/api/telemetry/coding-agent/capabilities"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let response = common::as_member(
+        server
+            .client
+            .get(server.url("/api/telemetry/coding-agent/capabilities")),
+        &user_id.to_string(),
+        "admin",
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(
+        body,
+        json!({"data": {"event_version": 1, "features": ["agent_scope", "adapter_version"]}})
+    );
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn v1_0_fixture_ingests_then_replays_as_duplicate() {
+    let server = common::TestServer::start().await;
+    let (user_id, agent_id) = setup(&server).await;
+    let fixture = v1_0_fixture_event("golden");
+    let first = post(&server, user_id, std::slice::from_ref(&fixture)).await;
+    assert_eq!(first["data"]["results"][0]["status"], "accepted");
+    let replay = post(&server, user_id, std::slice::from_ref(&fixture)).await;
+    assert_eq!(replay["data"]["results"][0]["status"], "duplicate");
+    assert_eq!(session_message_count(&server, agent_id).await, 2);
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn pre_marker_receipt_replayed_with_marker_is_duplicate() {
+    let server = common::TestServer::start().await;
+    let (user_id, _) = setup(&server).await;
+    let legacy = event("migrated", "turn-1", CapturePolicy::MetadataOnly);
+    assert_eq!(
+        post(&server, user_id, std::slice::from_ref(&legacy)).await["data"]["results"][0]["status"],
+        "accepted"
+    );
+    let stored_before: Value = sqlx::query_scalar(
+        "SELECT payload FROM coding_agent_telemetry_events WHERE user_id = $1 AND event_id = $2",
+    )
+    .bind(user_id)
+    .bind(&legacy.event_id)
+    .fetch_one(&server.db)
+    .await
+    .unwrap();
+
+    // A newer CLI's legacy-progress migration rebuilds the same turn with the
+    // marker and corrected numbers; the first receipt wins.
+    let mut rebuilt = legacy.clone();
+    rebuilt.source.adapter_version = Some(1);
+    rebuilt.turn.llm_calls[0].input_tokens = 8;
+    let replay = post(&server, user_id, &[rebuilt]).await;
+    assert_eq!(replay["data"]["results"][0]["status"], "duplicate");
+    let stored_after: Value = sqlx::query_scalar(
+        "SELECT payload FROM coding_agent_telemetry_events WHERE user_id = $1 AND event_id = $2",
+    )
+    .bind(user_id)
+    .bind(&legacy.event_id)
+    .fetch_one(&server.db)
+    .await
+    .unwrap();
+    assert_eq!(stored_after, stored_before);
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn same_generation_conflict_still_rejected() {
+    let server = common::TestServer::start().await;
+    let (user_id, _) = setup(&server).await;
+    for (session, marker) in [("unmarked", None), ("marked", Some(1))] {
+        let mut first = event(session, "turn-1", CapturePolicy::MetadataOnly);
+        first.source.adapter_version = marker;
+        assert_eq!(
+            post(&server, user_id, std::slice::from_ref(&first)).await["data"]["results"][0]["status"],
+            "accepted"
+        );
+        let mut second = first.clone();
+        second.turn.llm_calls[0].output_tokens = 99;
+        let conflict = post(&server, user_id, &[second]).await;
+        assert_eq!(conflict["data"]["results"][0]["status"], "rejected");
+        assert_eq!(
+            conflict["data"]["results"][0]["error"],
+            "event_id already exists with a different payload"
+        );
+    }
+    // A marker-bearing receipt is never downgraded by an unmarked rebuild either.
+    let mut marked = event("marked", "turn-1", CapturePolicy::MetadataOnly);
+    marked.source.adapter_version = None;
+    let downgrade = post(&server, user_id, &[marked]).await;
+    assert_eq!(downgrade["data"]["results"][0]["status"], "rejected");
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn scoped_content_turn_skips_chat_and_title() {
+    let server = common::TestServer::start().await;
+    let (user_id, agent_id) = setup(&server).await;
+    let mut scoped = scoped_event("scoped", "agent-a1b2c3d4:1", CapturePolicy::Content);
+    scoped.turn.response = None;
+    scoped.session.title = Some("Subagent prompt must not title the session".into());
+    let result = post(&server, user_id, std::slice::from_ref(&scoped)).await;
+    assert_eq!(result["data"]["results"][0]["status"], "accepted");
+    assert_eq!(session_message_count(&server, agent_id).await, 0);
+    assert_eq!(session_title(&server, agent_id).await, "Coding session");
+
+    let mut untitled = scoped_event("scoped", "agent-a1b2c3d4:2", CapturePolicy::Content);
+    untitled.turn.prompt = None;
+    untitled.turn.response = None;
+    let result = post(&server, user_id, &[untitled]).await;
+    assert_eq!(result["data"]["results"][0]["status"], "accepted");
+    assert_eq!(session_message_count(&server, agent_id).await, 0);
+    assert_eq!(session_title(&server, agent_id).await, "Coding session");
+
+    // The main agent's turn in the same session still lands in chat.
+    let main = event("scoped", "turn-1", CapturePolicy::Content);
+    assert_eq!(
+        post(&server, user_id, &[main]).await["data"]["results"][0]["status"],
+        "accepted"
+    );
+    assert_eq!(session_message_count(&server, agent_id).await, 2);
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn metadata_scoped_turn_with_description_is_rejected() {
+    let server = common::TestServer::start().await;
+    let (user_id, _) = setup(&server).await;
+    let mut scoped = scoped_event("scoped-metadata", "agent-1:1", CapturePolicy::MetadataOnly);
+    scoped
+        .turn
+        .agent_scope
+        .as_mut()
+        .expect("scoped")
+        .description = Some("Find where the budget check lives".into());
+    let result = post(&server, user_id, &[scoped]).await;
+    assert_eq!(result["data"]["results"][0]["status"], "rejected");
+    assert_eq!(
+        result["data"]["results"][0]["error"],
+        "metadata-only events must not contain agent scope content"
+    );
+    let receipts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM coding_agent_telemetry_events WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(&server.db)
+            .await
+            .unwrap();
+    assert_eq!(receipts, 0);
     server.cleanup().await;
 }

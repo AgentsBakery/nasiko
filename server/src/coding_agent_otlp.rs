@@ -778,6 +778,47 @@ mod tests {
     }
 
     #[test]
+    fn scoped_turns_tag_the_root_span_with_agent_metadata_only() {
+        const AGENT_KEYS: [&str; 4] = [
+            "coding_agent.agent.kind",
+            "coding_agent.agent.id",
+            "coding_agent.agent.type",
+            "coding_agent.agent.parent_tool_call_id",
+        ];
+        let unscoped = event(CapturePolicy::Content);
+        let unscoped_trace = serde_json::to_string(&trace_payload(&unscoped)).unwrap();
+        for key in AGENT_KEYS {
+            assert!(!unscoped_trace.contains(key), "{key} on an unscoped trace");
+        }
+
+        let mut scoped = unscoped.clone();
+        scoped.turn.agent_scope = Some(nasiko_types::CodingAgentScope {
+            kind: nasiko_types::CodingAgentScopeKind::Subagent,
+            agent_id: "a1b2c3".into(),
+            agent_type: Some("Explore".into()),
+            parent_tool_call_id: Some("toolu_parent".into()),
+            parent_agent_id: None,
+            spawn_depth: Some(1),
+            description: Some("private task description".into()),
+            name: Some("private teammate name".into()),
+        });
+        let payload = trace_payload(&scoped);
+        let root = &spans(&payload)[0]["attributes"];
+        for (key, expected) in [
+            ("coding_agent.agent.kind", "subagent"),
+            ("coding_agent.agent.id", "a1b2c3"),
+            ("coding_agent.agent.type", "Explore"),
+            ("coding_agent.agent.parent_tool_call_id", "toolu_parent"),
+        ] {
+            assert_eq!(attr(root, key).unwrap()["stringValue"], expected, "{key}");
+        }
+        let encoded = serde_json::to_string(&payload).unwrap();
+        assert!(!encoded.contains("private task description"));
+        assert!(!encoded.contains("private teammate name"));
+        assert_eq!(trace_id_for_event(&scoped), trace_id_for_event(&unscoped));
+    }
+
+    #[test]
     fn content_is_bounded_by_unicode_characters() {
         let mut event = event(CapturePolicy::Content);
         event.turn.prompt = Some("x".repeat(MAX_CONTENT_CHARS + 10));
