@@ -32,6 +32,7 @@ import { errorStateHtml, bindRetry } from '/common/design-system/app-empty-state
 import { call } from '../core/data-sources.js';
 import { navigate } from '../core/router.js';
 import '/common/services/alerts-service.js';
+import '/common/services/budgets-service.js';
 import { authService } from '/common/services/auth-service.js';
 import {
   ALERT_KINDS, CHANNEL_KINDS, METRICS, MONITOR_SCOPES, SEVERITIES,
@@ -124,6 +125,7 @@ class AlertsPage extends HTMLElement {
   #channels = [];
   #deliveries = [];
   #agents = [];
+  #users = [];
   #filters = { status: 'open', kind: '', severity: '', scope: '', since: '', until: '' };
   /** @type {Map<string, string>} channel id -> last test result text (with tone) */
   #testResults = new Map();
@@ -216,12 +218,18 @@ class AlertsPage extends HTMLElement {
     this.#loadAlerts();
     this.#loadMonitors();
     this.#loadChannels();
-    this.#loadAgents();
+    this.#loadTargets();
   }
 
-  async #loadAgents() {
-    const resp = await call('fetchAgentList', { limit: AGENT_PICKER_LIMIT }).catch(() => null);
-    this.#agents = asRows(resp).map((a) => ({ id: String(a.id), name: a.name || String(a.id) }));
+  async #loadTargets() {
+    const [agents, users] = await Promise.all([
+      call('fetchAgentList', { limit: AGENT_PICKER_LIMIT }).catch(() => null),
+      call('fetchBudgetUsers').catch(() => null),
+    ]);
+    this.#agents = asRows(agents).map((a) => ({ id: String(a.id), name: a.name || String(a.id) }));
+    this.#users = asRows(users).map((u) => ({
+      id: String(u.id), name: u.display_name || u.username || u.email || String(u.id),
+    }));
     if (this.#monitors.length) this.#renderMonitors();
     if (this.#alerts.length) this.#renderAlerts();
   }
@@ -262,7 +270,7 @@ class AlertsPage extends HTMLElement {
         <td>${escHtml(kindLabel(a.kind))}</td>
         <td><div class="name">${escHtml(a.title)}</div>
           <div class="sub">${escHtml(a.message)}</div></td>
-        <td>${escHtml(a.scope)}${a.scope_ref ? ` <span class="sub">${escHtml(scopeRefLabel(a.scope, a.scope_ref, this.#agentNames()))}</span>` : ''}</td>
+        <td>${escHtml(a.scope)}${a.scope_ref ? ` <span class="sub">${escHtml(scopeRefLabel(a.scope, a.scope_ref, this.#targetNames()))}</span>` : ''}</td>
         <td class="nowrap">${escHtml(fmtDate(a.first_seen_at))}<div class="sub">last ${escHtml(fmtDate(a.last_seen_at))}</div></td>
         <td class="num">${escHtml(String(a.occurrences ?? 1))}</td>
         <td>${badge(a.status === 'open' ? 'warning' : a.status === 'resolved' ? 'success' : 'neutral', a.status)}</td>
@@ -325,12 +333,12 @@ class AlertsPage extends HTMLElement {
 
   #monitorTarget(m) {
     if (m.scope === 'platform') return 'Platform';
-    const label = scopeRefLabel(m.scope, m.scope_ref, this.#agentNames());
+    const label = scopeRefLabel(m.scope, m.scope_ref, this.#targetNames());
     return m.scope === 'agent' ? `Agent: ${label}` : `Model: ${label}`;
   }
 
-  #agentNames() {
-    return new Map(this.#agents.map((a) => [a.id, a.name]));
+  #targetNames() {
+    return new Map([...this.#agents, ...this.#users].map((t) => [t.id, t.name]));
   }
 
   #renderMonitors() {

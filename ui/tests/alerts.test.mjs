@@ -174,9 +174,14 @@ test('deliveryStatusTone maps statuses', () => {
   assert.equal(A.deliveryStatusTone('x'), 'neutral');
 });
 
-test('scopeRefLabel resolves agent names and shortens unknown ids', () => {
-  const names = new Map([['f7819085-e5cf-4000-8000-000000000000', 'Support bot']]);
+test('scopeRefLabel resolves agent and user names and shortens unknown ids', () => {
+  const names = new Map([
+    ['f7819085-e5cf-4000-8000-000000000000', 'Support bot'],
+    ['0e34cb22-cace-40d4-acaa-380d81979a06', 'member1'],
+  ]);
   assert.equal(A.scopeRefLabel('agent', 'f7819085-e5cf-4000-8000-000000000000', names), 'Support bot');
+  assert.equal(A.scopeRefLabel('user', '0e34cb22-cace-40d4-acaa-380d81979a06', names), 'member1');
+  assert.equal(A.scopeRefLabel('user', '9a9a9a9a-0000-4000-8000-000000000000', names), '9a9a9a9a');
   assert.equal(A.scopeRefLabel('agent', 'abcdef12-3456', names), 'abcdef12');
   assert.equal(A.scopeRefLabel('model', 'gpt-4o', names), 'gpt-4o');
   assert.equal(A.scopeRefLabel('platform', null, names), '');

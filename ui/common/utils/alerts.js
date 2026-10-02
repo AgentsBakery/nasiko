@@ -110,21 +110,22 @@ export function kindLabel(kind) {
 }
 
 const SHORT_ID_LEN = 8;
+const NAMED_SCOPES = new Set(['agent', 'user']);
 
 /**
- * Display text for an alert/monitor scope reference. Agent refs resolve to the
- * agent name via `agentNames` (id -> name), falling back to a shortened id.
- * Callers must still escape the result.
+ * Display text for an alert/monitor scope reference. Agent and user refs are
+ * ids, so they resolve to a name via `targetNames` (id -> name), falling back
+ * to a shortened id. Callers must still escape the result.
  * @param {string} scope
  * @param {string|null|undefined} ref
- * @param {Map<string, string>} [agentNames]
+ * @param {Map<string, string>} [targetNames]
  * @returns {string}
  */
-export function scopeRefLabel(scope, ref, agentNames) {
+export function scopeRefLabel(scope, ref, targetNames) {
   if (ref === null || ref === undefined || ref === '') return '';
   const id = String(ref);
-  if (scope !== 'agent') return id;
-  return agentNames?.get(id) ?? id.slice(0, SHORT_ID_LEN);
+  if (!NAMED_SCOPES.has(scope)) return id;
+  return targetNames?.get(id) ?? id.slice(0, SHORT_ID_LEN);
 }
 
 const DELIVERY_TONES = { delivered: 'success', failed: 'error', pending: 'neutral', sending: 'info' };
