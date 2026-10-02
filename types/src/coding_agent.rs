@@ -482,6 +482,7 @@ mod tests {
             source: CodingAgentSource {
                 agent_id: "claude".into(),
                 agent_name: "claude-code".into(),
+                adapter_version: None,
             },
             session: CodingAgentSession {
                 id: coding_agent_session_id("claude", "session"),
@@ -496,6 +497,7 @@ mod tests {
                 ended_at: at,
                 llm_calls: vec![],
                 tool_calls: vec![],
+                agent_scope: None,
             },
             capture_policy: CapturePolicy::MetadataOnly,
         }
@@ -741,5 +743,329 @@ mod tests {
         assert!(value.validate().unwrap_err().contains("non-exact"));
         value.turn.tool_calls[0].model_call_id = None;
         assert!(value.validate().is_ok());
+    }
+    // ─── cross-version contract (TELE-08) ───────────────────────────────────
+
+    const CLAUDE_V1_0_CONTENT: &str =
+        include_str!("../tests/fixtures/coding_agent_v1_0_claude_content.json");
+    const CODEX_V1_0_METADATA: &str =
+        include_str!("../tests/fixtures/coding_agent_v1_0_codex_metadata.json");
+
+    /// Frozen copies of the v1.0 wire structs as shipped before the additive
+    /// fields existed. They stand in for an old server decoding a new CLI's
+    /// payload; like the originals they do not deny unknown fields.
+    mod legacy_v1_0 {
+        use super::super::{
+            CapturePolicy, CodingAgentTimestampQuality, CodingAgentToolAssociation,
+            CodingAgentToolCallStatus,
+        };
+        use chrono::{DateTime, Utc};
+        use serde::Deserialize;
+
+        #[derive(Debug, Deserialize)]
+        pub struct Source {
+            pub agent_id: String,
+            #[allow(dead_code, reason = "frozen wire shape; only decoded")]
+            pub agent_name: String,
+        }
+
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code, reason = "frozen wire shape; only decoded")]
+        pub struct Session {
+            pub id: String,
+            pub source_id: String,
+            #[serde(default)]
+            pub title: Option<String>,
+        }
+
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code, reason = "frozen wire shape; only decoded")]
+        pub struct Accounting {
+            pub version: u32,
+            #[serde(default)]
+            pub request_id: Option<String>,
+            #[serde(default)]
+            pub message_id: Option<String>,
+            #[serde(default)]
+            pub cache_creation_5m_tokens: Option<u64>,
+            #[serde(default)]
+            pub cache_creation_1h_tokens: Option<u64>,
+            #[serde(default)]
+            pub speed: Option<String>,
+            #[serde(default)]
+            pub service_tier: Option<String>,
+            #[serde(default)]
+            pub inference_geo: Option<String>,
+            #[serde(default)]
+            pub conflicting_observations: bool,
+        }
+
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code, reason = "frozen wire shape; only decoded")]
+        pub struct LlmCall {
+            pub id: String,
+            pub provider: String,
+            pub model: String,
+            pub input_tokens: u64,
+            pub output_tokens: u64,
+            pub cache_read_tokens: u64,
+            pub cache_creation_tokens: u64,
+            #[serde(default)]
+            pub accounting: Option<Accounting>,
+            pub started_at: DateTime<Utc>,
+            pub ended_at: DateTime<Utc>,
+        }
+
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code, reason = "frozen wire shape; only decoded")]
+        pub struct ToolCall {
+            pub id: String,
+            pub name: String,
+            pub kind: String,
+            pub model_call_id: Option<String>,
+            pub status: CodingAgentToolCallStatus,
+            pub arguments: Option<serde_json::Value>,
+            pub output: Option<serde_json::Value>,
+            pub raw: Option<String>,
+            pub error: Option<String>,
+            pub started_at: Option<DateTime<Utc>>,
+            pub ended_at: Option<DateTime<Utc>>,
+            pub duration_ms: Option<u64>,
+            pub association: CodingAgentToolAssociation,
+            pub timestamp_quality: CodingAgentTimestampQuality,
+        }
+
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code, reason = "frozen wire shape; only decoded")]
+        pub struct Turn {
+            pub id: String,
+            pub prompt: Option<String>,
+            pub response: Option<String>,
+            pub started_at: DateTime<Utc>,
+            pub ended_at: DateTime<Utc>,
+            pub llm_calls: Vec<LlmCall>,
+            #[serde(default)]
+            pub tool_calls: Vec<ToolCall>,
+        }
+
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code, reason = "frozen wire shape; only decoded")]
+        pub struct Event {
+            pub version: u32,
+            pub event_id: String,
+            pub captured_at: DateTime<Utc>,
+            pub source: Source,
+            pub session: Session,
+            pub turn: Turn,
+            pub capture_policy: CapturePolicy,
+        }
+    }
+
+    fn scope(kind: CodingAgentScopeKind) -> CodingAgentScope {
+        CodingAgentScope {
+            kind,
+            agent_id: "a1b2c3d4e5f6".into(),
+            agent_type: Some("Explore".into()),
+            parent_tool_call_id: Some("toolu_01Parent".into()),
+            parent_agent_id: None,
+            spawn_depth: Some(1),
+            description: None,
+            name: None,
+        }
+    }
+
+    fn scoped_content_event() -> CodingAgentEventV1 {
+        let mut event = event();
+        event.capture_policy = CapturePolicy::Content;
+        event.turn.agent_scope = Some(scope(CodingAgentScopeKind::Subagent));
+        event
+    }
+
+    #[test]
+    fn event_version_stays_one() {
+        assert_eq!(CODING_AGENT_EVENT_VERSION, 1);
+    }
+
+    #[test]
+    fn v1_0_payloads_round_trip_byte_identical() {
+        for fixture in [CLAUDE_V1_0_CONTENT, CODEX_V1_0_METADATA] {
+            let original: serde_json::Value =
+                serde_json::from_str(fixture).expect("fixture is JSON");
+            let decoded: CodingAgentEventV1 =
+                serde_json::from_value(original.clone()).expect("v1.0 fixture decodes");
+            assert_eq!(decoded.source.adapter_version, None);
+            assert_eq!(decoded.turn.agent_scope, None);
+            assert!(
+                decoded
+                    .turn
+                    .llm_calls
+                    .iter()
+                    .filter_map(|call| call.accounting.as_ref())
+                    .all(|accounting| accounting.output_tokens_final.is_none())
+            );
+            assert_eq!(decoded.validate(), Ok(()));
+            assert_eq!(
+                serde_json::to_value(&decoded).expect("event serializes"),
+                original
+            );
+        }
+    }
+
+    #[test]
+    fn v1_0_types_ignore_v1_1_fields() {
+        let mut event: CodingAgentEventV1 =
+            serde_json::from_str(CLAUDE_V1_0_CONTENT).expect("fixture decodes");
+        event.source.adapter_version = Some(CLAUDE_ADAPTER_VERSION_SUBAGENTS);
+        event.turn.agent_scope = Some(CodingAgentScope {
+            description: Some("Find where reconcile is defined".into()),
+            name: Some("researcher".into()),
+            ..scope(CodingAgentScopeKind::Subagent)
+        });
+        for call in &mut event.turn.llm_calls {
+            if let Some(accounting) = call.accounting.as_mut() {
+                accounting.output_tokens_final = Some(false);
+            }
+        }
+        assert_eq!(event.validate(), Ok(()));
+        let encoded = serde_json::to_value(&event).expect("event serializes");
+        assert_eq!(encoded["source"]["adapter_version"], 1);
+        assert_eq!(encoded["turn"]["agent_scope"]["kind"], "subagent");
+
+        let legacy: legacy_v1_0::Event =
+            serde_json::from_value(encoded).expect("old structs tolerate new fields");
+        assert_eq!(legacy.event_id, event.event_id);
+        assert_eq!(
+            coding_agent_event_id(
+                &legacy.source.agent_id,
+                &legacy.session.source_id,
+                &legacy.turn.id
+            ),
+            event.event_id
+        );
+    }
+
+    #[test]
+    fn unknown_scope_kind_maps_to_unknown() {
+        let kind: CodingAgentScopeKind =
+            serde_json::from_str("\"swarm_member\"").expect("unknown kind decodes");
+        assert_eq!(kind, CodingAgentScopeKind::Unknown);
+        for (kind, wire) in [
+            (CodingAgentScopeKind::Subagent, "\"subagent\""),
+            (CodingAgentScopeKind::Teammate, "\"teammate\""),
+        ] {
+            assert_eq!(serde_json::to_string(&kind).expect("serializes"), wire);
+            assert_eq!(
+                serde_json::from_str::<CodingAgentScopeKind>(wire).expect("decodes"),
+                kind
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_content_turns_may_omit_prompt_and_response() {
+        assert_eq!(scoped_content_event().validate(), Ok(()));
+
+        let mut with_prompt = scoped_content_event();
+        with_prompt.turn.prompt = Some("Find where reconcile is defined".into());
+        assert_eq!(with_prompt.validate(), Ok(()));
+
+        let mut blank = scoped_content_event();
+        blank.turn.prompt = Some("  ".into());
+        assert!(blank.validate().is_err());
+
+        let mut blank_response = scoped_content_event();
+        blank_response.turn.response = Some("\n".into());
+        assert!(blank_response.validate().is_err());
+
+        let mut unscoped = content_event();
+        unscoped.turn.response = None;
+        assert_eq!(
+            unscoped
+                .validate()
+                .expect_err("main turns still need content"),
+            "content events must contain nonempty prompt and response content"
+        );
+    }
+
+    #[test]
+    fn metadata_only_scoped_turns_reject_intent_content() {
+        let mut metadata = event();
+        metadata.turn.agent_scope = Some(CodingAgentScope {
+            parent_agent_id: Some("parent-agent".into()),
+            ..scope(CodingAgentScopeKind::Subagent)
+        });
+        assert_eq!(metadata.validate(), Ok(()));
+
+        for scope in [
+            CodingAgentScope {
+                description: Some("Find where X is defined".into()),
+                ..scope(CodingAgentScopeKind::Subagent)
+            },
+            CodingAgentScope {
+                name: Some("researcher".into()),
+                ..scope(CodingAgentScopeKind::Teammate)
+            },
+        ] {
+            metadata.turn.agent_scope = Some(scope);
+            assert_eq!(
+                metadata.validate().expect_err("intent is content"),
+                "metadata-only events must not contain agent scope content"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_scope_fields_are_bounded() {
+        let cases: Vec<fn(&mut CodingAgentScope)> = vec![
+            |scope| scope.agent_id = String::new(),
+            |scope| scope.agent_id = "  ".into(),
+            |scope| scope.agent_id = "x".repeat(CODING_AGENT_ID_MAX_BYTES + 1),
+            |scope| scope.agent_type = Some("x".repeat(CODING_AGENT_NAME_MAX_BYTES + 1)),
+            |scope| scope.name = Some("x".repeat(CODING_AGENT_NAME_MAX_BYTES + 1)),
+            |scope| {
+                scope.description = Some("x".repeat(CODING_AGENT_SCOPE_DESCRIPTION_MAX_BYTES + 1))
+            },
+            |scope| scope.parent_tool_call_id = Some("x".repeat(CODING_AGENT_ID_MAX_BYTES + 1)),
+            |scope| scope.parent_agent_id = Some("x".repeat(CODING_AGENT_ID_MAX_BYTES + 1)),
+            |scope| scope.description = Some(" ".into()),
+            |scope| scope.name = Some(String::new()),
+            |scope| scope.description = Some("task\0with nul".into()),
+        ];
+        for (index, mutate) in cases.into_iter().enumerate() {
+            let mut event = scoped_content_event();
+            let scope = event.turn.agent_scope.as_mut().expect("scoped");
+            mutate(scope);
+            assert!(event.validate().is_err(), "case {index} must be rejected");
+        }
+
+        let mut at_limit = scoped_content_event();
+        let scope = at_limit.turn.agent_scope.as_mut().expect("scoped");
+        scope.description = Some("x".repeat(CODING_AGENT_SCOPE_DESCRIPTION_MAX_BYTES));
+        scope.name = Some("x".repeat(CODING_AGENT_NAME_MAX_BYTES));
+        assert_eq!(at_limit.validate(), Ok(()));
+    }
+
+    #[test]
+    fn capabilities_list_the_shared_feature_slugs() {
+        assert_eq!(
+            CODING_AGENT_TELEMETRY_FEATURES,
+            &[
+                CODING_AGENT_FEATURE_AGENT_SCOPE,
+                CODING_AGENT_FEATURE_ADAPTER_VERSION
+            ]
+        );
+        let capabilities = CodingAgentCapabilities {
+            event_version: CODING_AGENT_EVENT_VERSION,
+            features: CODING_AGENT_TELEMETRY_FEATURES
+                .iter()
+                .map(|feature| feature.to_string())
+                .collect(),
+        };
+        assert_eq!(
+            serde_json::to_value(&capabilities).expect("serializes"),
+            serde_json::json!({"event_version": 1, "features": ["agent_scope", "adapter_version"]})
+        );
+        assert!(CLAUDE_ADAPTER_VERSION_TEAMMATES > CLAUDE_ADAPTER_VERSION_SUBAGENTS);
+        assert_eq!(CODEX_ADAPTER_VERSION_EXCLUSIVE_INPUT, 1);
     }
 }

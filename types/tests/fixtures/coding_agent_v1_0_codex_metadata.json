@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "event_id": "0f3d2cc2-ed83-5d13-b271-0b4fb2cc8aba",
+  "captured_at": "2026-09-14T10:00:12Z",
+  "source": {
+    "agent_id": "codex",
+    "agent_name": "Codex"
+  },
+  "session": {
+    "id": "codex:019a3c1e-77f0-7b52-a1d4-6c0e5f2b9a10",
+    "source_id": "019a3c1e-77f0-7b52-a1d4-6c0e5f2b9a10"
+  },
+  "turn": {
+    "id": "turn-7",
+    "started_at": "2026-09-14T10:00:00Z",
+    "ended_at": "2026-09-14T10:00:12Z",
+    "llm_calls": [
+      {
+        "id": "turn-7:1",
+        "provider": "openai",
+        "model": "gpt-5-codex",
+        "input_tokens": 25600,
+        "output_tokens": 840,
+        "cache_read_tokens": 24320,
+        "cache_creation_tokens": 0,
+        "started_at": "2026-09-14T10:00:00Z",
+        "ended_at": "2026-09-14T10:00:12Z"
+      }
+    ],
+    "tool_calls": [
+      {
+        "id": "call_9",
+        "name": "shell",
+        "kind": "tool",
+        "status": "succeeded",
+        "started_at": "2026-09-14T10:00:07Z",
+        "ended_at": "2026-09-14T10:00:12Z",
+        "duration_ms": 5000,
+        "association": "turn",
+        "timestamp_quality": "inferred"
+      }
+    ]
+  },
+  "capture_policy": "metadata_only"
+}
