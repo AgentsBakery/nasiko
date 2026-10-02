@@ -1,0 +1,67 @@
+/* Coding sessions: header, the "Coding agents only" toolbar, the session
+   table and the Load more pager. Layout only; colours come from tokens. */
+
+@scope (coding-sessions-page) {
+  /* Host box and the module-nav gutter: common/styles/page-layout.css. */
+
+  .coding-sessions-header {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s-4);
+    margin-bottom: var(--s-16);
+  }
+
+  .coding-sessions-subtitle {
+    margin: 0;
+    max-width: 68ch;
+    font-size: var(--font-size-sm);
+    color: var(--color-text-muted);
+    text-wrap: pretty;
+  }
+
+  .coding-sessions-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: var(--s-8);
+    margin-bottom: var(--s-16);
+  }
+
+  /* Bare wrapper so the empty/error state can take the table's slot. */
+  .coding-sessions-list { display: block; }
+
+  /* The whole row opens the session (delegated on the list). */
+  .coding-sessions-list tbody tr:has(.coding-session-link) { cursor: pointer; }
+
+  a.coding-session-link {
+    display: block;
+    text-decoration: none;
+  }
+
+  /* Session ids are long; truncate and keep the full id in the title. */
+  .coding-session-id {
+    display: block;
+    max-width: 24ch;
+    font-family: var(--font-mono);
+    font-size: var(--font-size-xs);
+    color: var(--color-text-main);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .coding-sessions-more {
+    display: flex;
+    align-items: center;
+    gap: var(--s-16);
+    justify-content: center;
+    margin-top: var(--s-16);
+
+    &[hidden] { display: none; }
+  }
+
+  .coding-sessions-count {
+    font-size: var(--font-size-xs);
+    color: var(--color-text-muted);
+  }
+}

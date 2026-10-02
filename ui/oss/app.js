@@ -39,6 +39,7 @@ const BASE_ROUTES = [
   { path: '/sessions',        tag: 'sessions-page',            module: '/common/pages/sessions-page.js',            title: 'Nasiko — Session history' },
   { path: '/session-trace',   tag: 'session-trace-page',       module: '/common/pages/session-trace-page.js',       title: 'Nasiko — Session Trace' },
   { path: '/observability-session', tag: 'observability-session-page', module: '/common/pages/observability-session-page.js', title: 'Nasiko — Session' },
+  { path: '/coding-sessions', tag: 'coding-sessions-page',     module: '/common/pages/coding-sessions-page.js',     title: 'Nasiko — Coding sessions' },
   { path: '/mcp',             tag: 'mcp-page',                 module: '/common/pages/mcp-page.js',                 title: 'Nasiko — MCP Gateway' },
   { path: '/mcp-detail',      tag: 'mcp-detail-page',          module: '/common/pages/mcp-detail-page.js',          title: 'Nasiko — MCP Server' },
   { path: '/llm-router',      tag: 'llm-router-page',          module: '/common/pages/llm-router-page.js',          title: 'Nasiko — LLM Router' },

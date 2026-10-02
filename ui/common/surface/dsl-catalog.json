@@ -1,6 +1,6 @@
 {
   "_generated": "by ui/scripts/gen-dsl-catalog.mjs from design-system/catalog.json + surface/dsl-overrides.json — do not hand-edit",
-  "catalogVersion": "f2dbd15d5751",
+  "catalogVersion": "7d85091f2be5",
   "contract": "The components a generated surface may name, and the only attributes it may set on each. Arguments are positional: paramOrder is the contract, and it changes whenever the underlying @attr order does. A component absent from here is either blocked (see blocked, with a reason) or does not exist.",
   "sourceCatalogVersion": "1.0",
   "componentCount": 42,
@@ -2765,6 +2765,7 @@
     "/builds",
     "/chat",
     "/chats",
+    "/coding-sessions",
     "/custom-views",
     "/design-system",
     "/executions",

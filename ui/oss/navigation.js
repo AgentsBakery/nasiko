@@ -53,6 +53,7 @@ const BASE_ITEMS = () => [
   { title: "Add Agent", url: "/add-agent", icon: "plus", module: "agents" },
   { title: "Set up CLI", url: "/setup-cli", icon: "terminal" },
   { title: "Flows", url: "/flows", icon: "cornerUpRight", module: "observability" },
+  { title: "Coding sessions", url: "/coding-sessions", icon: "terminal", module: "observability" },
   // In the Observability module tree but missing here, so ⌘F couldn't find it
   // and the rail lost its selection on the page.
   { title: "Resources", url: "/resources", icon: "activity", module: "observability" },
@@ -121,6 +122,7 @@ const MODULE_NAVS = {
       // entry points sit above the dynamic "Recent sessions" group rather
       // than under a "Home" label that names nothing.
       { label: 'All sessions', url: '/sessions' },
+      { label: 'Coding sessions', url: '/coding-sessions' },
       { label: 'Resources', url: '/resources' },
     ],
   },
