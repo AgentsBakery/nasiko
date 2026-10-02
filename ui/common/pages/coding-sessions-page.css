@@ -41,7 +41,7 @@
   /* Session ids are long; truncate and keep the full id in the title. */
   .coding-session-id {
     display: block;
-    max-width: 24ch;
+    max-width: 18ch;
     font-family: var(--font-mono);
     font-size: var(--font-size-xs);
     color: var(--color-text-main);

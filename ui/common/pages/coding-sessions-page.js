@@ -127,8 +127,6 @@ class CodingSessionsPage extends HTMLElement {
       { key: 'duration', label: 'Duration', render: textCell },
       { key: 'traces', label: 'Traces', render: textCell },
       { key: 'tokens', label: 'Tokens', render: textCell },
-      { key: 'p50', label: 'p50', render: textCell },
-      { key: 'p99', label: 'p99', render: textCell },
       { key: 'cost', label: 'Cost', render: textCell },
     ];
     table.dataFn = async () => ({ data: this.#rows });
