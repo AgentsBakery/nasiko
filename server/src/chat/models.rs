@@ -71,6 +71,12 @@ pub struct ChatMessage {
     pub usage_estimated: Option<bool>,
     pub trace_id: Option<String>,
     pub metadata: Option<sqlx::types::Json<serde_json::Value>>,
+    /// Set on read when `input_tokens` / `cost_usd` exclude the legacy Codex
+    /// cached-input double count (never stored; see
+    /// `observability::codex_correction`). Omitted from JSON when false.
+    #[sqlx(skip)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub usage_corrected: bool,
 }
 
 #[derive(Debug, Deserialize)]

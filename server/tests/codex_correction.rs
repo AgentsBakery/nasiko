@@ -320,28 +320,29 @@ async fn chat_transcript_corrects_legacy_codex_message() {
     ingest(&server, user_id, &claude).await;
     let (claude_session, _, _) = rollup(&server, &claude.event_id).await;
 
-    let messages = get(
-        &server,
-        user_id,
-        &format!("/api/chat/sessions/{codex_session}"),
-    )
-    .await;
-    let assistant = messages["data"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|m| m["role"] == "assistant")
-        .expect("assistant message")
-        .clone();
-    assert_eq!(assistant["input_tokens"], 200, "{assistant}");
-    assert_eq!(assistant["cache_read_tokens"], 800, "{assistant}");
-    let cost: f64 = assistant["cost_usd"]
-        .as_str()
-        .map(|s| s.parse().unwrap())
-        .or_else(|| assistant["cost_usd"].as_f64())
-        .unwrap();
-    assert_close(cost, reported_cost - delta, "corrected chat cost");
-    assert_eq!(assistant["usage_corrected"], true, "{assistant}");
+    // Both transcript reads: the session read and the paged messages read the UI uses.
+    for path in [
+        format!("/api/chat/sessions/{codex_session}"),
+        format!("/api/chat/sessions/{codex_session}/messages"),
+    ] {
+        let messages = get(&server, user_id, &path).await;
+        let assistant = messages["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("assistant message")
+            .clone();
+        assert_eq!(assistant["input_tokens"], 200, "{path}: {assistant}");
+        assert_eq!(assistant["cache_read_tokens"], 800, "{assistant}");
+        let cost: f64 = assistant["cost_usd"]
+            .as_str()
+            .map(|s| s.parse().unwrap())
+            .or_else(|| assistant["cost_usd"].as_f64())
+            .unwrap();
+        assert_close(cost, reported_cost - delta, "corrected chat cost");
+        assert_eq!(assistant["usage_corrected"], true, "{assistant}");
+    }
 
     let messages = get(
         &server,

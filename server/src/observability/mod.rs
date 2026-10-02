@@ -1,3 +1,4 @@
+pub mod codex_correction;
 pub mod handler;
 pub mod logs;
 pub mod receipt_materializer;

@@ -794,6 +794,10 @@ pub struct FinopsDashboardData {
     /// plus an "Others" catchall, ready to feed a pie/donut chart without any
     /// client-side aggregation.
     pub spend_by_agent: SpendByAgentBreakdown,
+    /// True when any figure in the window excludes the legacy Codex
+    /// cached-input double count (read through `trace_usage_corrected`).
+    #[serde(default)]
+    pub usage_corrected: bool,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -2067,7 +2071,7 @@ impl ObservabilityService {
                       COALESCE(SUM(completion_cost_usd), 0)::FLOAT8 AS completion_cost,
                       percentile_cont(0.5) WITHIN GROUP (ORDER BY latency_ms)::FLOAT8 AS p50,
                       percentile_cont(0.99) WITHIN GROUP (ORDER BY latency_ms)::FLOAT8 AS p99
-               FROM trace_usage
+               FROM trace_usage_corrected
                WHERE agent_name = $1 AND started_at >= $2 AND started_at < $3"#,
         )
         .bind(agent_id)
@@ -2164,7 +2168,7 @@ impl ObservabilityService {
         let rows: Vec<(Option<String>, Option<String>, i64)> = sqlx::query_as(
             r#"SELECT model, provider,
                       COALESCE(SUM(cache_read_tokens), 0)::BIGINT AS cache_read_tokens
-               FROM trace_usage
+               FROM trace_usage_corrected
                WHERE started_at >= $1 AND started_at < $2
                  AND ($3::TEXT IS NULL OR agent_name = $3)
                  AND ($4::TEXT IS NULL OR model = $4)
@@ -2344,6 +2348,7 @@ impl ObservabilityService {
             p50_latency: Option<f64>,
             p95_latency: Option<f64>,
             p99_latency: Option<f64>,
+            usage_corrected: bool,
         }
 
         let agent_filter: Option<&str> = agent_name;
@@ -2373,8 +2378,9 @@ impl ObservabilityService {
                       COALESCE(SUM(tool_call_count), 0)::BIGINT AS tool_call_count,
                       percentile_cont(0.5)  WITHIN GROUP (ORDER BY latency_ms)::FLOAT8 AS p50_latency,
                       percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms)::FLOAT8 AS p95_latency,
-                      percentile_cont(0.99) WITHIN GROUP (ORDER BY latency_ms)::FLOAT8 AS p99_latency
-               FROM trace_usage
+                      percentile_cont(0.99) WITHIN GROUP (ORDER BY latency_ms)::FLOAT8 AS p99_latency,
+                      COALESCE(bool_or(usage_corrected), false) AS usage_corrected
+               FROM trace_usage_corrected
                WHERE started_at >= $1 AND started_at < $2
                  AND ($3::TEXT IS NULL OR agent_name = $3)
                  AND ($4::TEXT IS NULL OR model = $4)
@@ -2419,7 +2425,7 @@ impl ObservabilityService {
         }
         let ops_24h_rows: Vec<OpsCount> = sqlx::query_as(
             r#"SELECT agent_name, COUNT(*)::BIGINT AS cnt
-               FROM trace_usage
+               FROM trace_usage_corrected
                WHERE started_at >= $1
                  AND ($2::TEXT IS NULL OR agent_name = $2)
                  AND ($3::TEXT IS NULL OR model = $3)
@@ -2444,7 +2450,7 @@ impl ObservabilityService {
         //    surface the count as a known gap. Same filters as the main aggregation.
         let unpriced_calls: i64 = sqlx::query_scalar(
             r#"SELECT COUNT(*)::BIGINT
-               FROM trace_usage
+               FROM trace_usage_corrected
                WHERE started_at >= $1 AND started_at < $2
                  AND ($3::TEXT IS NULL OR agent_name = $3)
                  AND ($4::TEXT IS NULL OR model = $4)
@@ -2502,9 +2508,11 @@ impl ObservabilityService {
         let mut grand_tool_calls = 0u64;
         let mut prev_grand_tool_calls = 0u64;
         let mut prev_active = 0usize;
+        let mut usage_corrected = false;
 
         for (agent_uuid, name, display_name, version) in &agents {
             let cur = current_by_name.get(name.as_str());
+            usage_corrected |= cur.is_some_and(|c| c.usage_corrected);
             let prev = prev_by_name.get(name.as_str());
             let ops_24h = ops24h_by_name.get(name.as_str()).copied().unwrap_or(0) as usize;
 
@@ -2756,6 +2764,7 @@ impl ObservabilityService {
                 kpis,
                 attributions,
                 spend_by_agent,
+                usage_corrected,
             },
             status_code: 200,
             message: "FinOps dashboard data retrieved successfully".into(),
@@ -2810,7 +2819,7 @@ impl ObservabilityService {
                           SUM(cost_usd) AS agent_spend,
                           COUNT(*)::BIGINT AS ops,
                           COALESCE(SUM(tool_call_count), 0)::BIGINT AS agent_tool_calls
-                   FROM trace_usage
+                   FROM trace_usage_corrected
                    WHERE started_at >= $1 AND started_at < $2
                      AND ($3::TEXT IS NULL OR agent_name = $3)
                      AND ($4::TEXT IS NULL OR model = $4)
@@ -2828,7 +2837,7 @@ impl ObservabilityService {
                           percentile_cont(0.5)  WITHIN GROUP (ORDER BY latency_ms)::FLOAT8 AS p50,
                           percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms)::FLOAT8 AS p95,
                           percentile_cont(0.99) WITHIN GROUP (ORDER BY latency_ms)::FLOAT8 AS p99
-                   FROM trace_usage
+                   FROM trace_usage_corrected
                    WHERE started_at >= $1 AND started_at < $2
                      AND latency_ms IS NOT NULL
                      AND ($3::TEXT IS NULL OR agent_name = $3)
@@ -2929,7 +2938,7 @@ impl ObservabilityService {
             r#"SELECT DATE(started_at) AS date,
                       COALESCE(SUM(cost_usd), 0)::FLOAT8 AS spend_usd,
                       COUNT(*)::BIGINT AS operations
-               FROM trace_usage
+               FROM trace_usage_corrected
                WHERE started_at >= $1 AND started_at < $2
                  AND ($3::TEXT IS NULL OR agent_name = $3)
                  AND ($4::TEXT IS NULL OR model = $4)
@@ -3023,7 +3032,7 @@ impl ObservabilityService {
             r#"SELECT EXTRACT(HOUR FROM started_at)::INT AS hour,
                       agent_name,
                       COALESCE(SUM(cost_usd), 0)::FLOAT8 AS spend_usd
-               FROM trace_usage
+               FROM trace_usage_corrected
                WHERE started_at >= $1 AND started_at < $2
                  AND ($3::TEXT IS NULL OR agent_name = $3)
                  AND ($4::TEXT IS NULL OR model = $4)
@@ -3657,6 +3666,7 @@ fn empty_finops_response(total_container_hours: f64) -> FinopsDashboardResponse 
                 slices: vec![],
                 total_spend_usd: 0.0,
             },
+            usage_corrected: false,
         },
         status_code: 200,
         message: "FinOps dashboard data retrieved successfully".into(),

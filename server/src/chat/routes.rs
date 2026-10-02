@@ -531,7 +531,7 @@ async fn get_session(
 
     let limit = params.limit.clamp(1, 500);
 
-    let messages = match sqlx::query_as::<_, ChatMessage>(
+    let mut messages = match sqlx::query_as::<_, ChatMessage>(
         r#"SELECT * FROM chat_messages
            WHERE session_id = $1
            ORDER BY timestamp ASC, id ASC
@@ -548,12 +548,57 @@ async fn get_session(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
+    correct_legacy_codex_usage(&state.db, &session_id, &mut messages).await;
 
     #[derive(serde::Serialize)]
     struct Response {
         data: Vec<ChatMessage>,
     }
     Json(Response { data: messages }).into_response()
+}
+
+/// Apply the legacy Codex correction (from `coding_agent_turn_usage`, joined on
+/// `chat_messages.trace_id`) to assistant messages of this already-authorized
+/// session. On an overlay load failure the transcript is served uncorrected
+/// and unflagged: degraded, never failed.
+async fn correct_legacy_codex_usage(
+    db: &sqlx::PgPool,
+    session_id: &str,
+    messages: &mut [ChatMessage],
+) {
+    use crate::observability::codex_correction;
+
+    let trace_ids: Vec<String> = messages
+        .iter()
+        .filter(|m| m.role == "assistant")
+        .filter_map(|m| m.trace_id.clone())
+        .collect();
+    if trace_ids.is_empty() {
+        return;
+    }
+    let overlay = match codex_correction::load_for_traces(db, &trace_ids).await {
+        Ok(overlay) => overlay,
+        Err(e) => {
+            tracing::warn!(%e, session_id, "get_session: codex correction overlay unavailable");
+            return;
+        }
+    };
+    for message in messages.iter_mut().filter(|m| m.role == "assistant") {
+        let Some(delta) = message.trace_id.as_deref().and_then(|t| overlay.trace(t)) else {
+            continue;
+        };
+        if let Some(input) = message.input_tokens {
+            let corrected = codex_correction::apply_tokens(input.max(0) as u64, delta.input_tokens);
+            message.input_tokens = Some(corrected.min(i32::MAX as u64) as i32);
+        }
+        if let Some(cost) = message.cost_usd {
+            let delta_cost = rust_decimal::Decimal::try_from(delta.cost_usd)
+                .unwrap_or_default()
+                .round_dp(6);
+            message.cost_usd = Some((cost - delta_cost).max(rust_decimal::Decimal::ZERO));
+        }
+        message.usage_corrected = true;
+    }
 }
 
 async fn update_session(
@@ -794,6 +839,7 @@ async fn list_messages(
     if !fetched_asc {
         rows.reverse();
     }
+    correct_legacy_codex_usage(&state.db, &session_id, &mut rows).await;
 
     let out_prev_cursor = rows
         .first()
