@@ -241,7 +241,7 @@ fn session_title(content: &str, session_id: &str) -> Option<String> {
     custom.or(generated)
 }
 
-fn turns_from_lines(content: &str) -> Vec<Turn> {
+pub(super) fn turns_from_lines(content: &str) -> Vec<Turn> {
     let mut turns: Vec<Turn> = Vec::new();
     let mut owners: HashMap<String, usize> = HashMap::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -347,23 +347,7 @@ fn turns_from_lines(content: &str) -> Vec<Turn> {
             let results = entry.tool_results();
             if !results.is_empty() {
                 if let Some(owner) = parent_owner {
-                    for result in results {
-                        if let Some(&(tool_owner, index)) = tools.get(&result.id) {
-                            let tool = &mut turns[tool_owner].tool_calls[index];
-                            tool.output = result.output;
-                            tool.error = result.error;
-                            tool.status = if result.is_error {
-                                CodingAgentToolCallStatus::Failed
-                            } else {
-                                CodingAgentToolCallStatus::Succeeded
-                            };
-                            tool.ended_at = entry.timestamp;
-                            tool.duration_ms = tool
-                                .started_at
-                                .zip(tool.ended_at)
-                                .map(|(start, end)| (end - start).num_milliseconds().max(0) as u64);
-                        }
-                    }
+                    apply_tool_results(results, entry.timestamp, &mut turns, &tools);
                     if let Some(uuid) = &entry.uuid {
                         owners.insert(uuid.clone(), owner);
                     }
@@ -435,20 +419,48 @@ fn turns_from_lines(content: &str) -> Vec<Turn> {
     turns
 }
 
+/// Completes the tool calls indexed in `tools` with their native results.
+pub(super) fn apply_tool_results(
+    results: Vec<ToolResult>,
+    at: Option<DateTime<Utc>>,
+    turns: &mut [Turn],
+    tools: &HashMap<String, (usize, usize)>,
+) {
+    for result in results {
+        if let Some(&(tool_owner, index)) = tools.get(&result.id) {
+            let tool = &mut turns[tool_owner].tool_calls[index];
+            tool.output = result.output;
+            tool.error = result.error;
+            tool.status = if result.is_error {
+                CodingAgentToolCallStatus::Failed
+            } else {
+                CodingAgentToolCallStatus::Succeeded
+            };
+            tool.ended_at = at;
+            tool.duration_ms = tool
+                .started_at
+                .zip(tool.ended_at)
+                .map(|(start, end)| (end - start).num_milliseconds().max(0) as u64);
+        }
+    }
+}
+
 struct PendingAssistant {
     entry: Entry,
     started_at: DateTime<Utc>,
     ended_at: DateTime<Utc>,
 }
 
-struct AssistantIndexes<'a> {
-    owners: &'a mut HashMap<String, usize>,
-    calls: &'a mut HashMap<String, (usize, usize, bool, DateTime<Utc>)>,
-    tools: &'a mut HashMap<String, (usize, usize)>,
-    fallback_turns: &'a mut HashSet<usize>,
+/// Per-parse indexes shared by every assistant record. `calls` maps a call
+/// identity to `(turn, index, final observation seen, observed at)`.
+pub(super) struct AssistantIndexes<'a> {
+    pub(super) owners: &'a mut HashMap<String, usize>,
+    pub(super) calls: &'a mut HashMap<String, (usize, usize, bool, DateTime<Utc>)>,
+    pub(super) tools: &'a mut HashMap<String, (usize, usize)>,
+    pub(super) fallback_turns: &'a mut HashSet<usize>,
 }
 
-fn attach_assistant(
+pub(super) fn attach_assistant(
     entry: &Entry,
     owner: usize,
     started_at: DateTime<Utc>,
@@ -582,7 +594,7 @@ fn ancestry_reaches(start: &str, target: &str, parents: &HashMap<String, String>
     }
 }
 
-fn parse_entry(line: &str) -> Option<Entry> {
+pub(super) fn parse_entry(line: &str) -> Option<Entry> {
     let line = line.trim();
     (!line.is_empty())
         .then(|| serde_json::from_str::<Entry>(line).ok())
@@ -590,32 +602,45 @@ fn parse_entry(line: &str) -> Option<Entry> {
 }
 
 #[derive(Debug, Deserialize)]
-struct Entry {
+pub(super) struct Entry {
     #[serde(rename = "type")]
-    kind: String,
-    uuid: Option<String>,
+    pub(super) kind: String,
+    pub(super) uuid: Option<String>,
     #[serde(rename = "parentUuid")]
-    parent_uuid: Option<String>,
+    pub(super) parent_uuid: Option<String>,
     #[serde(rename = "leafUuid")]
     leaf_uuid: Option<String>,
     #[serde(rename = "sessionId")]
     session_id: Option<String>,
     #[serde(rename = "isSidechain", default)]
     is_sidechain: bool,
-    timestamp: Option<DateTime<Utc>>,
-    message: Option<Message>,
+    pub(super) timestamp: Option<DateTime<Utc>>,
+    pub(super) message: Option<Message>,
     #[serde(rename = "requestId")]
     request_id: Option<String>,
     #[serde(rename = "lastPrompt")]
     last_prompt: Option<String>,
+    /// Claude-injected user records (system reminders, coordinator resumes).
+    #[allow(
+        dead_code,
+        reason = "read by subagent capture, wired by the next 04-06 commit"
+    )]
+    #[serde(rename = "isMeta", default)]
+    pub(super) is_meta: bool,
+    /// `{"kind": ...}`; kept untyped so an unexpected shape never drops the record.
+    #[allow(
+        dead_code,
+        reason = "read by subagent capture, wired by the next 04-06 commit"
+    )]
+    pub(super) origin: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
-struct Message {
+pub(super) struct Message {
     id: Option<String>,
     provider: Option<String>,
     model: Option<String>,
-    content: Option<serde_json::Value>,
+    pub(super) content: Option<serde_json::Value>,
     usage: Option<Usage>,
     stop_reason: Option<String>,
 }
@@ -658,7 +683,7 @@ impl Entry {
         }
     }
 
-    fn stable_identity(&self, line_index: usize) -> String {
+    pub(super) fn stable_identity(&self, line_index: usize) -> String {
         self.uuid
             .as_ref()
             .or(self.leaf_uuid.as_ref())
@@ -672,7 +697,7 @@ impl Entry {
             })
     }
 
-    fn user_prompt(&self) -> Option<String> {
+    pub(super) fn user_prompt(&self) -> Option<String> {
         if self.kind == "last-prompt" {
             return nonempty(self.last_prompt.as_deref()?);
         }
@@ -766,7 +791,7 @@ impl Entry {
         }
     }
 
-    fn assistant_text(&self) -> Option<String> {
+    pub(super) fn assistant_text(&self) -> Option<String> {
         let content = self.message.as_ref()?.content.as_ref()?;
         if let Some(text) = content.as_str() {
             return nonempty(text);
@@ -821,7 +846,7 @@ impl Entry {
             .collect()
     }
 
-    fn tool_results(&self) -> Vec<ToolResult> {
+    pub(super) fn tool_results(&self) -> Vec<ToolResult> {
         if self.kind != "user" {
             return Vec::new();
         }
@@ -849,7 +874,7 @@ impl Entry {
     }
 }
 
-struct ToolResult {
+pub(super) struct ToolResult {
     id: String,
     output: Option<Value>,
     error: Option<String>,

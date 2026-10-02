@@ -8,6 +8,7 @@ use super::catalog::{AgentSpec, Support};
 use super::model::{SessionSnapshot, SnapshotOptions};
 
 pub mod claude;
+pub mod claude_subagents;
 pub mod codex;
 pub mod cursor;
 pub mod opencode;
