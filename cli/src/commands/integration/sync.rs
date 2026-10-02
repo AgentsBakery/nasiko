@@ -368,6 +368,7 @@ mod tests {
         let retry = sync_records(
             &config("original", "https://new.example", Some(&token(Uuid::nil()))),
             vec![queued.clone()],
+            dir.path(),
         )
         .unwrap();
         assert!(
@@ -458,7 +459,7 @@ mod tests {
             registry_url: None,
         };
 
-        assert!(sync_records(&config, vec![first.clone(), second.clone()]).unwrap());
+        assert!(sync_records(&config, vec![first.clone(), second.clone()], dir.path()).unwrap());
         delivery.assert();
         assert!(!first.0.exists());
         assert!(!second.0.exists());
@@ -482,6 +483,7 @@ mod tests {
         sync_records(
             &config("bound", &server.url(), Some(&token(Uuid::nil()))),
             vec![queued.clone()],
+            dir.path(),
         )
         .unwrap();
         assert!(!queued.0.exists());
@@ -504,6 +506,7 @@ mod tests {
         sync_records(
             &config("bound", &server.url(), Some(&token(Uuid::nil()))),
             vec![queued.clone()],
+            dir.path(),
         )
         .unwrap();
         let retained = queue::load(&queued.0).unwrap();
@@ -537,5 +540,73 @@ mod tests {
         let rejected_record = queue::load(&rejected_path).unwrap();
         assert_eq!(rejected_record.delivery_state, DeliveryState::Rejected);
         assert_eq!(rejected_record.attempts, MAX_DELIVERY_ATTEMPTS);
+    }
+
+    fn batch_accepting(server: &mut mockito::Server, event_id: &str) -> mockito::Mock {
+        server
+            .mock("POST", "/api/telemetry/coding-agent/events/batch")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"data":{{"results":[{{"event_id":"{event_id}","status":"accepted"}}]}},"status_code":200,"message":"ok"}}"#
+            ))
+            .create()
+    }
+
+    #[test]
+    fn sync_refreshes_capabilities_before_delivery() {
+        let mut server = mockito::Server::new();
+        let dir = tempfile::tempdir().unwrap();
+        let queued = queued(&dir, record("bound", &server.url(), "s", "caps"));
+        let probe = server
+            .mock("GET", "/api/telemetry/coding-agent/capabilities")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"data":{"event_version":1,"features":["agent_scope","adapter_version"]}}"#,
+            )
+            .create();
+        let delivery = batch_accepting(&mut server, &queued.1.event.event_id);
+
+        sync_records(
+            &config("bound", &server.url(), Some(&token(Uuid::nil()))),
+            vec![queued.clone()],
+            dir.path(),
+        )
+        .unwrap();
+        probe.assert();
+        delivery.assert();
+        assert!(!queued.0.exists());
+        assert!(
+            super::super::capabilities::load_cached_at(dir.path(), &queued.1.destination)
+                .supports(nasiko_types::CODING_AGENT_FEATURE_ADAPTER_VERSION)
+        );
+    }
+
+    #[test]
+    fn capability_probe_failure_never_blocks_delivery() {
+        let mut server = mockito::Server::new();
+        let dir = tempfile::tempdir().unwrap();
+        let queued = queued(&dir, record("bound", &server.url(), "s", "caps-500"));
+        let probe = server
+            .mock("GET", "/api/telemetry/coding-agent/capabilities")
+            .with_status(500)
+            .with_body(r#"{"error":"boom","code":"internal"}"#)
+            .create();
+        let delivery = batch_accepting(&mut server, &queued.1.event.event_id);
+
+        sync_records(
+            &config("bound", &server.url(), Some(&token(Uuid::nil()))),
+            vec![queued.clone()],
+            dir.path(),
+        )
+        .unwrap();
+        probe.assert();
+        delivery.assert();
+        assert!(!queued.0.exists());
+        assert!(!super::super::capabilities::has_cache_at(
+            dir.path(),
+            &queued.1.destination
+        ));
     }
 }
