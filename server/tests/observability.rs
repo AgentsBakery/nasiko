@@ -1429,3 +1429,78 @@ async fn agent_logs_since_parameter_filters_old_entries() {
 
     server.cleanup().await;
 }
+
+// ─── session list coding_only filter ─────────────────────────────────────────
+
+/// `coding_only=true` narrows `/session/list` to agents registered through a
+/// coding-agent integration. The filter is applied in SQL so offset paging
+/// stays correct; omitting the param must keep today's behaviour (the CLI).
+#[tokio::test]
+#[serial]
+async fn observe_session_list_coding_only_filters_to_coding_agents() {
+    let server = common::TestServer::start().await;
+    let _admin = init_admin(&server).await;
+    let owner = seed_user(&server, "session-list-owner").await;
+    let coding_agent = seed_agent(&server, owner, "session-list-claude").await;
+    let plain_agent = seed_agent(&server, owner, "session-list-plain").await;
+    sqlx::query("UPDATE agents SET coding_agent_integration_id = 'claude' WHERE id = $1")
+        .bind(coding_agent)
+        .execute(&server.db)
+        .await
+        .unwrap();
+    for (session_id, agent) in [
+        ("coding-list-session", coding_agent),
+        ("plain-list-session", plain_agent),
+    ] {
+        sqlx::query(
+            "INSERT INTO chat_sessions (session_id, user_id, agent_id, title) VALUES ($1, $2, $3, 'List')",
+        )
+        .bind(session_id)
+        .bind(owner)
+        .bind(agent)
+        .execute(&server.db)
+        .await
+        .unwrap();
+    }
+
+    let token = common::sign_token(&owner.to_string(), "session-list-owner", true, "admin");
+    let list = |query: &'static str| {
+        let request = server
+            .client
+            .get(server.url(&format!("/api/observability/session/list{query}")))
+            .bearer_auth(&token);
+        async move {
+            let response = request.send().await.unwrap();
+            assert_eq!(response.status(), 200, "{query}");
+            let body: Value = response.json().await.unwrap();
+            body["data"]["sessions"]
+                .as_array()
+                .expect("sessions array")
+                .iter()
+                .map(|s| s["session_id"].as_str().unwrap_or_default().to_owned())
+                .collect::<Vec<_>>()
+        }
+    };
+
+    let all = list("").await;
+    assert!(all.contains(&"coding-list-session".to_owned()), "{all:?}");
+    assert!(all.contains(&"plain-list-session".to_owned()), "{all:?}");
+
+    let coding = list("?coding_only=true").await;
+    assert!(
+        coding.contains(&"coding-list-session".to_owned()),
+        "{coding:?}"
+    );
+    assert!(
+        !coding.contains(&"plain-list-session".to_owned()),
+        "{coding:?}"
+    );
+
+    let explicit_off = list("?coding_only=false").await;
+    assert!(
+        explicit_off.contains(&"plain-list-session".to_owned()),
+        "{explicit_off:?}"
+    );
+
+    server.cleanup().await;
+}

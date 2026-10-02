@@ -79,6 +79,9 @@ pub struct SessionListParams {
     pub limit: Option<i64>,
     /// Rows to skip, for offset paging (default 0).
     pub offset: Option<i64>,
+    /// Only sessions of coding agents (agents registered through a coding-agent
+    /// integration). Default false.
+    pub coding_only: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -246,6 +249,7 @@ pub async fn get_all_sessions(
             claims.is_superuser,
             params.limit,
             params.offset,
+            params.coding_only.unwrap_or(false),
         )
         .await
     {

@@ -1423,6 +1423,7 @@ impl ObservabilityService {
         is_superuser: bool,
         limit: Option<i64>,
         offset: Option<i64>,
+        coding_only: bool,
     ) -> Result<SessionListResponse, ObservabilityError> {
         let start = parse_iso_or_default(start_time, 7);
         let end = Utc::now();
@@ -1439,17 +1440,24 @@ impl ObservabilityService {
         // 1. Query chat_sessions as the authoritative source — every session
         //    shows up here regardless of whether the agent is OTel-instrumented.
         //    Non-superusers only see their own sessions.
+        //    `coding_only` narrows to coding-agent sessions in SQL rather than
+        //    on the client: filtering a fetched page would break offset paging
+        //    (a page of 25 could hold zero coding rows).
         let mut db_sessions: Vec<(String, Option<uuid::Uuid>, DateTime<Utc>)> = if is_superuser {
             sqlx::query_as(
                 "SELECT session_id, agent_id, created_at \
                  FROM chat_sessions \
                  WHERE deleted_at IS NULL AND created_at >= $1 \
+                 AND ($4::bool IS NOT TRUE OR EXISTS (SELECT 1 FROM agents a \
+                     WHERE a.id = chat_sessions.agent_id \
+                     AND a.coding_agent_integration_id IS NOT NULL)) \
                  ORDER BY created_at DESC, session_id DESC \
                  LIMIT $2 OFFSET $3",
             )
             .bind(start)
             .bind(fetch)
             .bind(offset)
+            .bind(coding_only)
             .fetch_all(&self.db)
             .await
             .map_err(|e| ObservabilityError::Internal(e.to_string()))?
@@ -1461,6 +1469,9 @@ impl ObservabilityService {
                 "SELECT session_id, agent_id, created_at \
                  FROM chat_sessions \
                  WHERE user_id = $1 AND deleted_at IS NULL AND created_at >= $2 \
+                 AND ($5::bool IS NOT TRUE OR EXISTS (SELECT 1 FROM agents a \
+                     WHERE a.id = chat_sessions.agent_id \
+                     AND a.coding_agent_integration_id IS NOT NULL)) \
                  ORDER BY created_at DESC, session_id DESC \
                  LIMIT $3 OFFSET $4",
             )
@@ -1468,6 +1479,7 @@ impl ObservabilityService {
             .bind(start)
             .bind(fetch)
             .bind(offset)
+            .bind(coding_only)
             .fetch_all(&self.db)
             .await
             .map_err(|e| ObservabilityError::Internal(e.to_string()))?
