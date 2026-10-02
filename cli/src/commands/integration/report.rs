@@ -612,6 +612,321 @@ mod tests {
         assert_eq!(report_once(dir.path(), INCOMPLETE_TRANSCRIPT), 0);
     }
 
+    // ─── run_in: Claude subagent capture ───────────────────────────────────
+
+    const SUBAGENT_ID: &str = "a1";
+    const SUBAGENT_TURN_ID: &str = "subagent:a1:sub-u1";
+
+    fn json_line(value: serde_json::Value) -> String {
+        format!("{value}\n")
+    }
+
+    /// An installed Claude integration with an explicit content policy.
+    fn installed_with(dir: &std::path::Path, capture_content: bool) -> QueueDestination {
+        let destination = installed(dir);
+        let path = dir.join("config.json");
+        let mut state: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        state["agents"]["claude"]["capture_content"] = capture_content.into();
+        std::fs::write(&path, state.to_string()).unwrap();
+        destination
+    }
+
+    fn cache_features(dir: &std::path::Path, destination: &QueueDestination, features: &[&str]) {
+        std::fs::write(
+            dir.join("capabilities.json"),
+            serde_json::json!({"destinations": {
+                format!("{}|{}", destination.cluster_url, destination.principal_id):
+                    {"features": features, "fetched_at": "2026-01-01T00:00:00Z"}
+            }})
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    const BOTH_FEATURES: &[&str] = &[
+        nasiko_types::CODING_AGENT_FEATURE_AGENT_SCOPE,
+        nasiko_types::CODING_AGENT_FEATURE_ADAPTER_VERSION,
+    ];
+
+    /// A complete main turn that spawned `toolu_1`. `foreground` decides whether
+    /// the spawn result says the run completed or was launched in the background.
+    fn main_transcript(foreground: bool) -> String {
+        let status = if foreground {
+            "completed"
+        } else {
+            "async_launched"
+        };
+        [
+            serde_json::json!({"type":"user","uuid":"u","timestamp":"2026-01-01T00:00:00Z","sessionId":"s","message":{"content":"hello"}}),
+            serde_json::json!({"type":"assistant","uuid":"a","parentUuid":"u","requestId":"main-req-1","timestamp":"2026-01-01T00:00:01Z","sessionId":"s","message":{"id":"main-msg-1","model":"test","stop_reason":"tool_use","content":[{"type":"tool_use","id":"toolu_1","name":"Agent","input":{"subagent_type":"Explore","description":"find X","prompt":"find X please"}}],"usage":{"input_tokens":1,"output_tokens":2}}}),
+            serde_json::json!({"type":"user","uuid":"r","parentUuid":"a","timestamp":"2026-01-01T00:00:30Z","sessionId":"s","toolUseResult":{"status":status,"agentId":SUBAGENT_ID,"totalTokens":99999},"message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}}),
+            serde_json::json!({"type":"assistant","uuid":"b","parentUuid":"r","requestId":"main-req-2","timestamp":"2026-01-01T00:00:31Z","sessionId":"s","message":{"id":"main-msg-2","model":"test","stop_reason":"end_turn","content":"done","usage":{"input_tokens":1,"output_tokens":2}}}),
+            serde_json::json!({"type":"ai-title","aiTitle":"Session title","sessionId":"s"}),
+        ]
+        .into_iter()
+        .map(json_line)
+        .collect()
+    }
+
+    fn completed_notification() -> String {
+        json_line(serde_json::json!({
+            "type":"queue-operation","operation":"enqueue","timestamp":"2026-01-01T00:01:00Z","sessionId":"s",
+            "content": format!("<task-notification><task-id>{SUBAGENT_ID}</task-id><status>completed</status><usage><subagent_tokens>99999</subagent_tokens></usage></task-notification>")
+        }))
+    }
+
+    fn subagent_transcript(segment_uuid: &str) -> String {
+        [
+            serde_json::json!({"parentUuid":null,"isSidechain":true,"agentId":SUBAGENT_ID,"type":"user","message":{"role":"user","content":"find X please"},"uuid":segment_uuid,"timestamp":"2026-01-01T00:00:02Z","sessionId":"s"}),
+            serde_json::json!({"parentUuid":segment_uuid,"isSidechain":true,"agentId":SUBAGENT_ID,"type":"assistant","requestId":"sub-req-1","message":{"model":"test","id":"sub-msg-1","content":[{"type":"tool_use","id":"toolu_read","name":"Read","input":{"path":"redacted"}}],"stop_reason":null,"usage":{"input_tokens":2,"cache_creation_input_tokens":10,"cache_read_input_tokens":100,"output_tokens":3}},"uuid":"sub-a1","timestamp":"2026-01-01T00:00:03Z","sessionId":"s"}),
+            serde_json::json!({"parentUuid":"sub-a1","isSidechain":true,"agentId":SUBAGENT_ID,"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_read","content":"secret file text"}]},"uuid":"sub-r1","timestamp":"2026-01-01T00:00:04Z","sessionId":"s"}),
+            serde_json::json!({"parentUuid":"sub-r1","isSidechain":true,"agentId":SUBAGENT_ID,"type":"assistant","requestId":"sub-req-2","message":{"model":"test","id":"sub-msg-2","content":[{"type":"tool_use","id":"toolu_hb","name":"SubagentHandback","input":{"message":"X is in redacted.rs"}}],"stop_reason":null,"usage":{"input_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":110,"output_tokens":4}},"uuid":"sub-a2","timestamp":"2026-01-01T00:00:05Z","sessionId":"s"}),
+        ]
+        .into_iter()
+        .map(json_line)
+        .collect()
+    }
+
+    fn write_subagent(dir: &std::path::Path, meta: serde_json::Value, transcript: &str) {
+        let subagents = dir.join("session").join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        std::fs::write(
+            subagents.join(format!("agent-{SUBAGENT_ID}.meta.json")),
+            meta.to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            subagents.join(format!("agent-{SUBAGENT_ID}.jsonl")),
+            transcript,
+        )
+        .unwrap();
+    }
+
+    fn subagent_meta() -> serde_json::Value {
+        serde_json::json!({"agentType":"Explore","description":"find X","toolUseId":"toolu_1","spawnDepth":1,"requestShape":"foreground"})
+    }
+
+    /// Report with a live deadline (subagent scanning honours it).
+    fn report_live(dir: &std::path::Path, transcript: &str) -> usize {
+        let path = dir.join("session.jsonl");
+        std::fs::write(&path, transcript).unwrap();
+        let raw = serde_json::json!({"session_id": "s", "transcript_path": path}).to_string();
+        let spawned = Cell::new(0);
+        run_in(
+            Agent::Claude,
+            &raw,
+            Instant::now() + Duration::from_secs(5),
+            dir,
+            &mut || {
+                spawned.set(spawned.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        spawned.get()
+    }
+
+    fn queued_events(dir: &std::path::Path) -> Vec<CodingAgentEventV1> {
+        let mut events = Vec::new();
+        let Ok(clusters) = std::fs::read_dir(dir.join("queue")) else {
+            return events;
+        };
+        for cluster in clusters.flatten() {
+            for entry in std::fs::read_dir(cluster.path()).unwrap().flatten() {
+                events.push(queue::load(&entry.path()).unwrap().event);
+            }
+        }
+        events.sort_by(|left, right| left.turn.id.cmp(&right.turn.id));
+        events
+    }
+
+    fn scoped_events(dir: &std::path::Path) -> Vec<CodingAgentEventV1> {
+        queued_events(dir)
+            .into_iter()
+            .filter(|event| event.turn.agent_scope.is_some())
+            .collect()
+    }
+
+    fn watermark(dir: &std::path::Path) -> serde_json::Value {
+        let path = dir.join("watermarks").join("claude").join("s.json");
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn report_emits_scoped_events_with_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = installed_with(dir.path(), true);
+        cache_features(dir.path(), &destination, BOTH_FEATURES);
+        write_subagent(dir.path(), subagent_meta(), &subagent_transcript("sub-u1"));
+
+        report_live(dir.path(), &main_transcript(true));
+
+        let events = queued_events(dir.path());
+        assert_eq!(events.len(), 2);
+        let main = events
+            .iter()
+            .find(|e| e.turn.agent_scope.is_none())
+            .unwrap();
+        assert_eq!(
+            main.source.adapter_version,
+            Some(nasiko_types::CLAUDE_ADAPTER_VERSION_SUBAGENTS)
+        );
+        assert_eq!(main.session.title.as_deref(), Some("Session title"));
+        let scoped = &scoped_events(dir.path())[0];
+        assert_eq!(scoped.turn.id, SUBAGENT_TURN_ID);
+        assert_eq!(scoped.session.id, main.session.id);
+        assert!(scoped.session.title.is_none());
+        let scope = scoped.turn.agent_scope.as_ref().unwrap();
+        assert_eq!(scope.agent_type.as_deref(), Some("Explore"));
+        assert_eq!(scope.description.as_deref(), Some("find X"));
+        assert_eq!(scope.parent_tool_call_id.as_deref(), Some("toolu_1"));
+        assert_eq!(scoped.turn.prompt.as_deref(), Some("find X please"));
+        assert_eq!(scoped.turn.response.as_deref(), Some("X is in redacted.rs"));
+        assert_eq!(scoped.turn.llm_calls.len(), 2);
+        assert!(
+            scoped.turn.llm_calls.iter().all(|call| {
+                call.accounting.as_ref().unwrap().output_tokens_final == Some(false)
+            })
+        );
+        assert_eq!(
+            scoped.source.adapter_version,
+            Some(nasiko_types::CLAUDE_ADAPTER_VERSION_SUBAGENTS)
+        );
+        assert!(scoped.validate().is_ok());
+        assert!(!dir.path().join("rejected").exists());
+    }
+
+    #[test]
+    fn report_strips_intent_under_no_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = installed_with(dir.path(), false);
+        cache_features(dir.path(), &destination, BOTH_FEATURES);
+        let mut meta = subagent_meta();
+        meta["name"] = "researcher".into();
+        write_subagent(dir.path(), meta, &subagent_transcript("sub-u1"));
+
+        report_live(dir.path(), &main_transcript(true));
+
+        let scoped = scoped_events(dir.path());
+        assert_eq!(scoped.len(), 1);
+        let event = &scoped[0];
+        let scope = event.turn.agent_scope.as_ref().unwrap();
+        assert_eq!(scope.kind, nasiko_types::CodingAgentScopeKind::Subagent);
+        assert_eq!(scope.agent_type.as_deref(), Some("Explore"));
+        assert!(scope.description.is_none());
+        assert!(scope.name.is_none());
+        assert!(event.turn.prompt.is_none());
+        assert!(event.turn.response.is_none());
+        assert!(event.session.title.is_none());
+        assert!(!event.turn.tool_calls.is_empty());
+        assert!(
+            event
+                .turn
+                .tool_calls
+                .iter()
+                .all(|tool| tool.arguments.is_none()
+                    && tool.output.is_none()
+                    && tool.raw.is_none()
+                    && tool.error.is_none())
+        );
+        assert!(event.validate().is_ok());
+    }
+
+    #[test]
+    fn report_without_capability_emits_no_scoped_events_and_no_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = installed_with(dir.path(), true);
+        cache_empty_features(dir.path(), &destination);
+        write_subagent(dir.path(), subagent_meta(), &subagent_transcript("sub-u1"));
+
+        report_live(dir.path(), &main_transcript(true));
+
+        let events = queued_events(dir.path());
+        assert_eq!(events.len(), 1);
+        assert!(events[0].turn.agent_scope.is_none());
+        let encoded = serde_json::to_value(&events[0]).unwrap();
+        assert!(encoded["source"].get("adapter_version").is_none());
+        assert!(watermark(dir.path()).get("subagent_files").is_none());
+    }
+
+    #[test]
+    fn second_stop_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = installed_with(dir.path(), true);
+        cache_features(dir.path(), &destination, BOTH_FEATURES);
+        write_subagent(dir.path(), subagent_meta(), &subagent_transcript("sub-u1"));
+        let main = main_transcript(true);
+
+        assert_eq!(report_live(dir.path(), &main), 1);
+        assert_eq!(report_live(dir.path(), &main), 0);
+        assert_eq!(queued_events(dir.path()).len(), 2);
+        let file = &watermark(dir.path())["subagent_files"][SUBAGENT_ID];
+        assert_eq!(file["complete"], true);
+        assert_eq!(file["call_ids"].as_array().unwrap().len(), 2);
+
+        // Same size, different segment id: a re-parse would queue a new event,
+        // so none appearing proves the unchanged complete file was skipped.
+        write_subagent(dir.path(), subagent_meta(), &subagent_transcript("sub-u9"));
+        assert_eq!(report_live(dir.path(), &main), 0);
+        let ids: Vec<_> = queued_events(dir.path())
+            .into_iter()
+            .map(|event| event.turn.id)
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&SUBAGENT_TURN_ID.to_string()));
+    }
+
+    #[test]
+    fn scoped_only_stop_spawns_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = installed_with(dir.path(), true);
+        cache_features(dir.path(), &destination, BOTH_FEATURES);
+        write_subagent(dir.path(), subagent_meta(), &subagent_transcript("sub-u1"));
+        let main = main_transcript(false);
+        assert_eq!(report_live(dir.path(), &main), 1);
+        assert!(scoped_events(dir.path()).is_empty());
+
+        // Every main turn is already captured; only the finished run is new.
+        let finished = main + &completed_notification();
+        assert_eq!(report_live(dir.path(), &finished), 1);
+        assert_eq!(scoped_events(dir.path()).len(), 1);
+        assert_eq!(report_live(dir.path(), &finished), 0);
+    }
+
+    #[test]
+    fn deferred_run_not_marked() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = installed_with(dir.path(), false);
+        cache_features(dir.path(), &destination, BOTH_FEATURES);
+        write_subagent(dir.path(), subagent_meta(), &subagent_transcript("sub-u1"));
+        let main = main_transcript(false);
+
+        report_live(dir.path(), &main);
+        let captured = watermark(dir.path())["captured_turn_ids"].clone();
+        assert!(
+            !captured
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|id| id == SUBAGENT_TURN_ID)
+        );
+        let file = &watermark(dir.path())["subagent_files"][SUBAGENT_ID];
+        assert_ne!(file["complete"], true);
+
+        report_live(dir.path(), &(main + &completed_notification()));
+        let scoped = scoped_events(dir.path());
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].turn.id, SUBAGENT_TURN_ID);
+        assert!(
+            watermark(dir.path())["captured_turn_ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|id| id == SUBAGENT_TURN_ID)
+        );
+    }
+
     #[test]
     fn tool_content_projection_bounds_large_json_and_unicode_text() {
         let value = serde_json::json!({"value": "x".repeat(CODING_AGENT_CONTENT_MAX_BYTES)});
