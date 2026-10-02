@@ -3,7 +3,8 @@
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use nasiko_types::{
-    CodingAgentTimestampQuality, CodingAgentToolAssociation, CodingAgentToolCallStatus,
+    CODEX_ADAPTER_VERSION_EXCLUSIVE_INPUT, CodingAgentTimestampQuality, CodingAgentToolAssociation,
+    CodingAgentToolCallStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -15,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::super::catalog::{self, AgentSpec, Support};
 use super::super::launcher;
-use super::super::model::{LlmCall, SessionSnapshot, ToolCall, Turn};
+use super::super::model::{LlmCall, SessionSnapshot, SnapshotOptions, ToolCall, Turn};
 use super::super::state;
 
 pub const INSTALL_VERSION: u32 = 2;
@@ -112,8 +113,12 @@ pub fn installed_version() -> Option<u32> {
     hooks_are_current(&hooks, &launcher::script_path(&config)).then_some(version)
 }
 
-pub fn snapshot(raw: &str) -> Result<SessionSnapshot> {
-    snapshot_in(raw, &state::integrations_dir().join("events").join(SPEC.id))
+pub fn snapshot(raw: &str, options: SnapshotOptions) -> Result<SessionSnapshot> {
+    snapshot_in(
+        raw,
+        &state::integrations_dir().join("events").join(SPEC.id),
+        options,
+    )
 }
 
 fn hooks_path(config: &Path) -> PathBuf {
@@ -242,7 +247,7 @@ fn write_json(path: &Path, value: &Value) -> Result<()> {
         .with_context(|| format!("failed to write {}", path.display()))
 }
 
-fn snapshot_in(raw: &str, spool_dir: &Path) -> Result<SessionSnapshot> {
+fn snapshot_in(raw: &str, spool_dir: &Path, options: SnapshotOptions) -> Result<SessionSnapshot> {
     let payload: HookPayload = serde_json::from_str(raw).with_context(|| {
         format!(
             "Codex hook payload is not expected JSON; got: {}",
@@ -271,7 +276,7 @@ fn snapshot_in(raw: &str, spool_dir: &Path) -> Result<SessionSnapshot> {
         .transcript_path
         .as_deref()
         .and_then(parse_token_usage);
-    let snapshot = apply_event(&mut pending, &payload, received_at, usage);
+    let snapshot = apply_event(&mut pending, &payload, received_at, usage, options);
     // Keep complete turns available for retries. The shared delivery
     // watermarks, not this event spool, decide whether export is pending.
     atomic_write(&path, serde_json::to_vec(&pending)?.as_slice())?;
@@ -280,6 +285,8 @@ fn snapshot_in(raw: &str, spool_dir: &Path) -> Result<SessionSnapshot> {
         session_id: payload.session_id,
         title: None,
         turns: Vec::new(),
+        adapter_version: None,
+        scoped_turns: Vec::new(),
     }))
 }
 
@@ -298,6 +305,7 @@ fn apply_event(
     payload: &HookPayload,
     received_at: DateTime<Utc>,
     usage: Option<TokenUsage>,
+    options: SnapshotOptions,
 ) -> Option<SessionSnapshot> {
     match payload.hook_event_name.as_str() {
         "UserPromptSubmit" => {
@@ -438,6 +446,10 @@ fn apply_event(
     Some(SessionSnapshot {
         session_id: payload.session_id.clone(),
         title: None,
+        adapter_version: options
+            .codex_exclusive_input
+            .then_some(CODEX_ADAPTER_VERSION_EXCLUSIVE_INPUT),
+        scoped_turns: Vec::new(),
         turns: vec![Turn {
             uuid: payload.turn_id.clone(),
             prompt,
@@ -448,9 +460,20 @@ fn apply_event(
                 uuid: call_id,
                 provider: provider_for(&model).to_string(),
                 model,
-                input_tokens: usage.input,
+                // Codex `input_tokens` includes `cached_input_tokens`
+                // (codex-rs `TokenUsage::non_cached_input`), while Nasiko prices
+                // coding-agent calls with exclusive prompt input. Subtract only
+                // when the server advertises `adapter_version`, because the
+                // marker set below travels with it: an unmarked receipt must
+                // always mean inclusive input for the legacy correction.
+                input_tokens: if options.codex_exclusive_input {
+                    usage.input.saturating_sub(usage.cache_read)
+                } else {
+                    usage.input
+                },
                 output_tokens: usage.output,
                 cache_read_tokens: usage.cache_read,
+                // Codex reports no cache writes.
                 cache_creation_tokens: 0,
                 accounting: None,
                 started_at,
@@ -769,7 +792,7 @@ mod tests {
     fn incomplete_event_is_spooled_without_touching_home() {
         let dir = tempfile::tempdir().unwrap();
         let raw = r#"{"session_id":"s","turn_id":"t","hook_event_name":"UserPromptSubmit","model":"gpt-5","prompt":"hi"}"#;
-        let snapshot = snapshot_in(raw, dir.path()).unwrap();
+        let snapshot = snapshot_in(raw, dir.path(), SnapshotOptions::default()).unwrap();
         assert!(snapshot.turns.is_empty());
         assert!(spool_path(dir.path(), "s", "t").exists());
     }
@@ -928,10 +951,10 @@ mod tests {
     #[test]
     fn malformed_and_unknown_payloads_are_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(snapshot_in("not json", dir.path()).is_err());
+        assert!(snapshot_in("not json", dir.path(), SnapshotOptions::default()).is_err());
         let unknown =
             r#"{"session_id":"s","turn_id":"t","hook_event_name":"ToolUse","model":"gpt-5"}"#;
-        assert!(snapshot_in(unknown, dir.path()).is_err());
+        assert!(snapshot_in(unknown, dir.path(), SnapshotOptions::default()).is_err());
     }
 
     #[test]

@@ -64,10 +64,6 @@ pub struct SyncLock {
     _file: File,
 }
 
-pub fn enqueue(record: &QueueRecord) -> Result<PathBuf> {
-    enqueue_at(&super::state::integrations_dir(), record)
-}
-
 pub fn load(path: &Path) -> Result<QueueRecord> {
     let bytes =
         std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
@@ -95,10 +91,6 @@ pub fn quarantine(path: &Path, record: &QueueRecord) -> Result<PathBuf> {
     quarantine_at(root, path, record)
 }
 
-pub fn reject_invalid(record: &QueueRecord, error: &str) -> Result<PathBuf> {
-    reject_invalid_at(&super::state::integrations_dir(), record, error)
-}
-
 pub fn records() -> Result<Vec<(PathBuf, QueueRecord)>> {
     records_at(&super::state::integrations_dir())
 }
@@ -111,7 +103,7 @@ pub fn acquire_sync_lock(timeout: Duration) -> Result<SyncLock> {
     acquire_sync_lock_at(&super::state::integrations_dir(), timeout)
 }
 
-fn enqueue_at(root: &Path, record: &QueueRecord) -> Result<PathBuf> {
+pub(super) fn enqueue_at(root: &Path, record: &QueueRecord) -> Result<PathBuf> {
     validate_record(record)?;
     let path = record_path(root, &record.destination, &record.event.event_id);
     create_owner_dirs(&root.join("queue"))?;
@@ -220,7 +212,7 @@ fn quarantine_at(root: &Path, path: &Path, record: &QueueRecord) -> Result<PathB
     Ok(destination)
 }
 
-fn reject_invalid_at(root: &Path, record: &QueueRecord, error: &str) -> Result<PathBuf> {
+pub(super) fn reject_invalid_at(root: &Path, record: &QueueRecord, error: &str) -> Result<PathBuf> {
     let mut rejected = record.clone();
     rejected.delivery_state = DeliveryState::Rejected;
     rejected.last_error = Some(format!("invalid event: {error}"));

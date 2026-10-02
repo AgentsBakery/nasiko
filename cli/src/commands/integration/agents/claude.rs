@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use super::super::catalog::{self, AgentSpec, Support};
 use super::super::launcher;
-use super::super::model::{LlmCall, SessionSnapshot, ToolCall, Turn};
+use super::super::model::{LlmCall, SessionSnapshot, SnapshotOptions, ToolCall, Turn};
 
 pub const INSTALL_VERSION: u32 = 3;
 pub const SPEC: AgentSpec = AgentSpec {
@@ -176,7 +176,13 @@ fn write_settings(path: &Path, settings: &Value) -> Result<()> {
         .with_context(|| format!("failed to write {}", path.display()))
 }
 
-pub fn snapshot(raw: &str, report_deadline: Instant) -> Result<SessionSnapshot> {
+// `_options.capture_subagents` is honoured once subagent transcripts are
+// parsed (plan 04-06); until then Claude always produces the v1.0 shape.
+pub fn snapshot(
+    raw: &str,
+    report_deadline: Instant,
+    _options: SnapshotOptions,
+) -> Result<SessionSnapshot> {
     let payload: HookPayload = serde_json::from_str(raw).with_context(|| {
         format!(
             "Claude hook payload is not expected JSON; got: {}",
@@ -201,6 +207,8 @@ pub fn snapshot(raw: &str, report_deadline: Instant) -> Result<SessionSnapshot> 
                 title: session_title(&content, &payload.session_id),
                 session_id: payload.session_id,
                 turns,
+                adapter_version: None,
+                scoped_turns: Vec::new(),
             });
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -956,7 +964,7 @@ mod tests {
         );
         std::fs::write(&path, records).unwrap();
         let payload = json!({"session_id": "s", "transcript_path": path}).to_string();
-        let snapshot = snapshot(&payload, Instant::now()).unwrap();
+        let snapshot = snapshot(&payload, Instant::now(), SnapshotOptions::default()).unwrap();
         assert_eq!(snapshot.title.as_deref(), Some("Debug integration"));
         assert_eq!(snapshot.turns.len(), 1);
         assert_eq!(snapshot.turns[0].uuid, "u");

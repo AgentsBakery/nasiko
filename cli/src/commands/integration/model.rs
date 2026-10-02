@@ -60,4 +60,34 @@ pub struct SessionSnapshot {
     pub session_id: String,
     pub title: Option<String>,
     pub turns: Vec<Turn>,
+    /// Receipt marker for adapter-specific accounting (`source.adapter_version`).
+    /// `None` keeps the v1.0 meaning of the adapter's token fields.
+    pub adapter_version: Option<u32>,
+    /// Turns run by a subagent or teammate, reported with `turn.agent_scope`.
+    /// Empty until subagent capture lands; unscoped turns stay in `turns`.
+    #[allow(dead_code, reason = "emitted by Claude subagent capture (plan 04-06)")]
+    pub scoped_turns: Vec<ScopedTurn>,
+}
+
+/// A turn attributed to a non-root agent inside the session.
+#[derive(Debug, Clone)]
+#[allow(
+    dead_code,
+    reason = "filled and read by Claude subagent capture (plan 04-06)"
+)]
+pub struct ScopedTurn {
+    pub turn: Turn,
+    pub scope: nasiko_types::CodingAgentScope,
+}
+
+/// Which capability-gated shapes an adapter may produce for this report.
+/// Built from the destination's cached capabilities; the default is the v1.0
+/// shape every server accepts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SnapshotOptions {
+    /// Report Codex fresh input exclusive of cached input, with the marker.
+    pub codex_exclusive_input: bool,
+    /// Capture Claude subagent/teammate turns as scoped turns.
+    #[allow(dead_code, reason = "read by Claude subagent capture (plan 04-06)")]
+    pub capture_subagents: bool,
 }

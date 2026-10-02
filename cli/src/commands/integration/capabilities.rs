@@ -17,12 +17,16 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use nasiko_types::{CODING_AGENT_EVENT_VERSION, CodingAgentCapabilities};
+use nasiko_types::{
+    CODING_AGENT_EVENT_VERSION, CODING_AGENT_FEATURE_ADAPTER_VERSION,
+    CODING_AGENT_FEATURE_AGENT_SCOPE, CodingAgentCapabilities,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use super::model::SnapshotOptions;
 use super::queue::QueueDestination;
 use super::state::{self, InstallationBinding};
 use crate::config::Config;
@@ -43,7 +47,6 @@ impl Capabilities {
         Self::default()
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // read by the report hook (next commit)
     pub fn supports(&self, feature: &str) -> bool {
         self.features.contains(feature)
     }
@@ -56,6 +59,19 @@ impl Capabilities {
         }
         Self {
             features: capabilities.features.iter().cloned().collect(),
+        }
+    }
+}
+
+impl SnapshotOptions {
+    /// Kept here rather than in `model` so adapters stay unaware of the cache.
+    /// The Codex fix and its marker share one gate (`adapter_version`);
+    /// subagent capture needs both scoped turns and the Claude marker.
+    pub fn from_capabilities(capabilities: &Capabilities) -> Self {
+        Self {
+            codex_exclusive_input: capabilities.supports(CODING_AGENT_FEATURE_ADAPTER_VERSION),
+            capture_subagents: capabilities.supports(CODING_AGENT_FEATURE_AGENT_SCOPE)
+                && capabilities.supports(CODING_AGENT_FEATURE_ADAPTER_VERSION),
         }
     }
 }
@@ -81,17 +97,6 @@ pub enum Probe {
     Unavailable(String),
 }
 
-#[allow(dead_code)] // read by the report hook (next commit)
-pub fn load_cached(destination: &QueueDestination) -> Capabilities {
-    load_cached_at(&state::integrations_dir(), destination)
-}
-
-/// Whether any probe result (even "no features") is cached for the destination.
-#[allow(dead_code)] // read by the report hook (next commit)
-pub fn has_cache(destination: &QueueDestination) -> bool {
-    has_cache_at(&state::integrations_dir(), destination)
-}
-
 /// Prime the cache right after install so the first Stop already uses the
 /// server's features. Never fails install: an unreachable server leaves no
 /// cache and the first report spawns a background sync that fills it.
@@ -100,7 +105,8 @@ pub fn prime_after_install(binding: &InstallationBinding) -> Result<()> {
     prime_after_install_at(&state::integrations_dir(), &config, binding)
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // read by the report hook (next commit)
+/// Capabilities cached for the destination. Never errs: a missing or corrupt
+/// cache means "no features", which selects the v1.0 shapes.
 pub(super) fn load_cached_at(dir: &Path, destination: &QueueDestination) -> Capabilities {
     read_cache(dir)
         .destinations
@@ -111,7 +117,7 @@ pub(super) fn load_cached_at(dir: &Path, destination: &QueueDestination) -> Capa
         .unwrap_or_default()
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // read by the report hook (next commit)
+/// Whether any probe result (even "no features") is cached for the destination.
 pub(super) fn has_cache_at(dir: &Path, destination: &QueueDestination) -> bool {
     read_cache(dir)
         .destinations
@@ -329,6 +335,29 @@ mod tests {
             features: vec![nasiko_types::CODING_AGENT_FEATURE_ADAPTER_VERSION.into()],
         });
         assert!(!other_version.supports(nasiko_types::CODING_AGENT_FEATURE_ADAPTER_VERSION));
+    }
+
+    #[test]
+    fn snapshot_options_follow_advertised_features() {
+        let caps = |features: &[&str]| {
+            Capabilities::from_server(&CodingAgentCapabilities {
+                event_version: nasiko_types::CODING_AGENT_EVENT_VERSION,
+                features: features.iter().map(|f| f.to_string()).collect(),
+            })
+        };
+        assert_eq!(
+            SnapshotOptions::from_capabilities(&Capabilities::none()),
+            SnapshotOptions::default()
+        );
+        let marker_only = SnapshotOptions::from_capabilities(&caps(&["adapter_version"]));
+        assert!(marker_only.codex_exclusive_input);
+        assert!(!marker_only.capture_subagents);
+        let scope_only = SnapshotOptions::from_capabilities(&caps(&["agent_scope"]));
+        assert!(!scope_only.codex_exclusive_input);
+        assert!(!scope_only.capture_subagents);
+        let both = SnapshotOptions::from_capabilities(&caps(&["agent_scope", "adapter_version"]));
+        assert!(both.codex_exclusive_input);
+        assert!(both.capture_subagents);
     }
 
     #[test]

@@ -146,6 +146,8 @@ pub fn snapshot(raw: &str) -> Result<SessionSnapshot> {
         session_id: payload.session_id,
         title: None,
         turns: turns_from_messages(&payload.messages),
+        adapter_version: None,
+        scoped_turns: Vec::new(),
     })
 }
 

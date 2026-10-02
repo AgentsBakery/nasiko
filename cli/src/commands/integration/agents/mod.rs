@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use super::catalog::{AgentSpec, Support};
-use super::model::SessionSnapshot;
+use super::model::{SessionSnapshot, SnapshotOptions};
 
 pub mod claude;
 pub mod codex;
@@ -77,11 +77,18 @@ impl Agent {
         }
     }
 
-    pub fn snapshot(self, raw: &str, deadline: Instant) -> Result<SessionSnapshot> {
+    /// `options` gates capability-dependent shapes; adapters without such
+    /// shapes ignore it.
+    pub fn snapshot(
+        self,
+        raw: &str,
+        deadline: Instant,
+        options: SnapshotOptions,
+    ) -> Result<SessionSnapshot> {
         match self {
-            Self::Claude => claude::snapshot(raw, deadline),
+            Self::Claude => claude::snapshot(raw, deadline, options),
             Self::OpenCode => opencode::snapshot(raw),
-            Self::Codex => codex::snapshot(raw),
+            Self::Codex => codex::snapshot(raw, options),
             Self::Cursor => cursor::snapshot(raw),
         }
     }

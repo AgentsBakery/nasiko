@@ -50,7 +50,12 @@ pub struct IntegrationState {
 
 impl IntegrationState {
     pub fn load() -> Result<Self> {
-        let path = config_path();
+        Self::load_in(&integrations_dir())
+    }
+
+    /// Load from an explicit integrations root (tests use a temp dir).
+    pub fn load_in(dir: &Path) -> Result<Self> {
+        let path = config_path_in(dir);
         if !path.exists() {
             return Ok(Self::default());
         }
@@ -251,14 +256,20 @@ impl SessionLock {
     }
 }
 
-/// Acquire the per-session report lock. `report.rs` should hold this guard for
-/// its complete read/export/upload/watermark transaction.
-pub fn lock_session(agent_id: &str, session_id: &str, timeout: Duration) -> Result<SessionLock> {
-    let watermark = watermark_path(agent_id, session_id);
+/// Acquire the per-session report lock under the integrations root `dir`.
+/// `report.rs` should hold this guard for its complete
+/// read/export/upload/watermark transaction.
+pub fn lock_session_in(
+    dir: &Path,
+    agent_id: &str,
+    session_id: &str,
+    timeout: Duration,
+) -> Result<SessionLock> {
+    let watermark = watermark_path_in(dir, agent_id, session_id);
     SessionLock::acquire_with_timeout(
         &watermark.with_extension("lock"),
         watermark,
-        Some(&legacy_watermark_path(session_id)),
+        Some(&legacy_watermark_path_in(dir, session_id)),
         timeout,
     )
 }
@@ -302,7 +313,11 @@ pub fn log_path() -> PathBuf {
 }
 
 fn config_path() -> PathBuf {
-    integrations_dir().join("config.json")
+    config_path_in(&integrations_dir())
+}
+
+fn config_path_in(dir: &Path) -> PathBuf {
+    dir.join("config.json")
 }
 
 /// Session ids come from the coding agent, so they are sanitised before being
@@ -320,16 +335,19 @@ fn safe_component(value: &str) -> String {
     }
 }
 
+#[cfg(test)]
 fn watermark_path(agent_id: &str, session_id: &str) -> PathBuf {
-    integrations_dir()
-        .join("watermarks")
+    watermark_path_in(&integrations_dir(), agent_id, session_id)
+}
+
+fn watermark_path_in(dir: &Path, agent_id: &str, session_id: &str) -> PathBuf {
+    dir.join("watermarks")
         .join(safe_component(agent_id))
         .join(format!("{}.json", safe_component(session_id)))
 }
 
-fn legacy_watermark_path(session_id: &str) -> PathBuf {
-    integrations_dir()
-        .join("watermarks")
+fn legacy_watermark_path_in(dir: &Path, session_id: &str) -> PathBuf {
+    dir.join("watermarks")
         .join(format!("{}.json", safe_component(session_id)))
 }
 

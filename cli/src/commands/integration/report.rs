@@ -9,11 +9,13 @@ use nasiko_types::{
 };
 use std::collections::HashSet;
 use std::io::Read;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use super::agents::Agent;
-use super::model::Turn;
+use super::capabilities;
+use super::model::{SnapshotOptions, Turn};
 use super::queue::{self, QueueDestination, QueueRecord};
 use super::state::{self, IntegrationState, SessionLock};
 
@@ -22,9 +24,28 @@ const REPORT_BUDGET: Duration = Duration::from_secs(9);
 pub fn run(agent: Agent) -> Result<()> {
     let deadline = Instant::now() + REPORT_BUDGET;
     let raw = read_payload()?;
-    let snapshot = agent.snapshot(&raw, deadline)?;
+    run_in(
+        agent,
+        &raw,
+        deadline,
+        &state::integrations_dir(),
+        &mut spawn_sync,
+    )
+}
+
+/// The report transaction against the integrations root `dir`. `spawn` starts
+/// a detached `nasiko agents sync`; tests inject a counter so they never fork
+/// a process or touch the real `~/.nasiko`.
+fn run_in(
+    agent: Agent,
+    raw: &str,
+    deadline: Instant,
+    dir: &Path,
+    spawn: &mut dyn FnMut() -> Result<()>,
+) -> Result<()> {
     let spec = agent.spec();
-    let settings = IntegrationState::load()?;
+    // Local file reads only: the hook never probes the network.
+    let settings = IntegrationState::load_in(dir)?;
     let Some(agent_state) = settings.get(spec.id) else {
         bail!(
             "{} is not installed — run: nasiko agents install {}",
@@ -33,7 +54,23 @@ pub fn run(agent: Agent) -> Result<()> {
         );
     };
     let destination = destination_from_state(agent_state)?;
-    let lock = state::lock_session(
+    if !capabilities::has_cache_at(dir, &destination) {
+        // Before any early return: without a cache this and every later
+        // report would send v1.0 shapes. Sync probes and fills the cache in
+        // the background so the next Stop uses the server's features.
+        log(&format!(
+            "no telemetry capabilities cached for {}; starting background sync",
+            destination.cluster_name
+        ));
+        if let Err(error) = spawn() {
+            log(&format!("failed to start background sync: {error:#}"));
+        }
+    }
+    let options =
+        SnapshotOptions::from_capabilities(&capabilities::load_cached_at(dir, &destination));
+    let snapshot = agent.snapshot(raw, deadline, options)?;
+    let lock = state::lock_session_in(
+        dir,
         spec.id,
         &snapshot.session_id,
         deadline.saturating_duration_since(Instant::now()),
@@ -66,10 +103,11 @@ pub fn run(agent: Agent) -> Result<()> {
                 snapshot.title.as_deref(),
                 turn,
                 agent_state.capture_content,
+                snapshot.adapter_version,
             ),
         );
         if let Err(error) = record.event.validate() {
-            queue::reject_invalid(&record, &error)?;
+            queue::reject_invalid_at(dir, &record, &error)?;
             lock.mark_captured(std::slice::from_ref(&record.event.turn.id))?;
             rejected += 1;
             log(&format!(
@@ -78,13 +116,13 @@ pub fn run(agent: Agent) -> Result<()> {
             ));
             continue;
         }
-        queue_then_mark(&record, &lock)?;
+        queue_then_mark(dir, &record, &lock)?;
         queued += 1;
     }
     drop(lock);
 
     if queued > 0 {
-        spawn_sync()?;
+        spawn()?;
     }
     if !pending.is_empty() {
         log(&format!(
@@ -115,6 +153,7 @@ fn canonical_event(
     title: Option<&str>,
     turn: &Turn,
     capture_content: bool,
+    adapter_version: Option<u32>,
 ) -> CodingAgentEventV1 {
     CodingAgentEventV1 {
         version: CODING_AGENT_EVENT_VERSION,
@@ -123,7 +162,7 @@ fn canonical_event(
         source: CodingAgentSource {
             agent_id: agent_id.to_string(),
             agent_name: agent_name.to_string(),
-            adapter_version: None,
+            adapter_version,
         },
         session: CodingAgentSession {
             id: coding_agent_session_id(agent_id, source_session_id),
@@ -219,9 +258,9 @@ fn bounded_text_to(value: &str, max: usize) -> String {
     format!("{}{suffix}", &value[..end])
 }
 
-fn queue_then_mark(record: &QueueRecord, lock: &SessionLock) -> Result<()> {
+fn queue_then_mark(dir: &Path, record: &QueueRecord, lock: &SessionLock) -> Result<()> {
     ordered_commit(
-        || queue::enqueue(record).map(|_| ()),
+        || queue::enqueue_at(dir, record).map(|_| ()),
         || lock.mark_captured(std::slice::from_ref(&record.event.turn.id)),
     )
 }

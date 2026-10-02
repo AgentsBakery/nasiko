@@ -161,6 +161,8 @@ pub fn snapshot(raw: &str) -> Result<SessionSnapshot> {
         session_id,
         title: None,
         turns,
+        adapter_version: None,
+        scoped_turns: Vec::new(),
     })
 }
 
