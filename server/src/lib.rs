@@ -19,6 +19,7 @@ pub mod catalog;
 pub mod chat;
 pub mod coding_agent_otlp;
 pub mod coding_agent_telemetry;
+pub mod coding_agent_usage;
 pub mod context_selection;
 pub mod flows;
 pub mod github;
