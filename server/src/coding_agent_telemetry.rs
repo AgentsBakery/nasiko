@@ -16,6 +16,7 @@ use uuid::Uuid;
 use crate::auth::Claims;
 use crate::chat::external_turn::{PersistExternalTurnError, persist_external_turn};
 use crate::chat::models::{ExternalTurn, MessageUsage};
+use crate::coding_agent_usage;
 use crate::mcp::ApiResponse;
 use crate::state::AppState;
 
@@ -133,12 +134,12 @@ async fn process_event(
     }
 
     // Pricing acquires its own database connection. Do not hold the write
-    // transaction while looking up rates: a saturated pool would deadlock.
-    let cost = if event.capture_policy == CapturePolicy::Content {
-        price_turn(&state.pricing, event).await
-    } else {
-        None
-    };
+    // transaction while looking up rates: a saturated pool would deadlock. The
+    // server session id is only known after the agent lookup inside the
+    // transaction, so the rollup is priced now and re-keyed below.
+    let mut rollup = coding_agent_usage::rollup_for_event(event, &event.session.id);
+    coding_agent_usage::price_rollup(&state.pricing, event, &mut rollup).await;
+    let cost = coding_agent_usage::reported_cost_for_chat(&rollup);
     let mut tx = state.db.begin().await?;
     let agent_id: Option<Uuid> = sqlx::query_scalar(
         r#"SELECT id FROM agents
@@ -158,6 +159,7 @@ async fn process_event(
         )));
     };
     let server_session_id = scoped_session_id(agent_id, &event.session.source_id);
+    rollup.assign_session(event, &server_session_id);
     // A scoped (subagent/teammate) turn never names the session: its context is
     // the subagent's, not the user's conversation.
     let is_main_turn = event.turn.agent_scope.is_none();
@@ -238,6 +240,9 @@ async fn process_event(
         tx.commit().await?;
         return Ok(CodingAgentEventStatus::Duplicate);
     }
+    // Exactly one usage row per newly accepted receipt, in the same
+    // transaction, so the rollup can never miss or double-count a receipt.
+    coding_agent_usage::insert_rollup(&mut tx, user_id, &event.event_id, &rollup).await?;
 
     // Replays must never rename a session; only newly accepted receipts can upgrade it.
     // Scoped turns never rename it either (Pitfall 5: subagent context is not the
@@ -319,64 +324,6 @@ fn scoped_session_id(agent_id: Uuid, source_session_id: &str) -> String {
         format!("{agent_id}\0{source_session_id}").as_bytes(),
     )
     .to_string()
-}
-
-/// Cost the turn through the platform's pricing engine.
-///
-/// Coding-agent turns carried no cost at all, so a session that spent hundreds
-/// of dollars showed a blank in the chat view while the observability page,
-/// pricing the same spans, showed the real figure. The counts here are the
-/// agent's own and exact, so this is a lookup rather than an estimate.
-///
-/// Priced per call rather than per turn: a turn can switch models mid-way (a
-/// sub-agent on a cheaper tier), and pricing the summed tokens against one
-/// model's rate would charge the whole turn at whichever model happened to be
-/// reported. Failure is non-fatal — an unpriced turn is worth keeping.
-async fn price_turn(
-    pricing: &nasiko_pricing::PricingEngine,
-    event: &CodingAgentEventV1,
-) -> Option<(rust_decimal::Decimal, bool)> {
-    if event.turn.llm_calls.is_empty() {
-        return None;
-    }
-    let mut total = nasiko_pricing::CostBreakdown::default();
-    for call in &event.turn.llm_calls {
-        let context = call
-            .accounting
-            .as_ref()
-            .map(|a| nasiko_pricing::PricingContext {
-                cache_creation_5m: a.cache_creation_5m_tokens,
-                cache_creation_1h: a.cache_creation_1h_tokens,
-                speed: a.speed.as_deref(),
-                service_tier: a.service_tier.as_deref(),
-                inference_geo: a.inference_geo.as_deref(),
-                conflicting_observations: a.conflicting_observations,
-            })
-            .unwrap_or_default();
-        let priced = pricing
-            .price_with_context(
-                Some(&call.provider),
-                &call.model,
-                nasiko_pricing::RawUsage {
-                    input: call.input_tokens,
-                    output: call.output_tokens,
-                    cache_read: call.cache_read_tokens,
-                    cache_creation: call.cache_creation_tokens,
-                    total: None,
-                },
-                // Coding-agent transcripts report the prompt disjoint from the
-                // cache counts, which is Anthropic's convention and what the
-                // adapters normalize the others to.
-                nasiko_pricing::PromptConvention::Exclusive,
-                call.started_at,
-                context,
-            )
-            .await;
-        total.add(priced.cost);
-    }
-    // Retain legitimate zero costs and round to the engine's micro-dollar precision.
-    let cost = rust_decimal::Decimal::from_f64_retain(total.total_usd)?;
-    Some((cost.round_dp(6), total.estimated))
 }
 
 /// `chat_messages` usage columns are `INTEGER`; a long coding-agent session can
@@ -503,12 +450,22 @@ mod tests {
         }
     }
 
+    /// The cost ingest stores on the chat message: the rollup's reported figure.
+    async fn reported_chat_cost(
+        pricing: &nasiko_pricing::PricingEngine,
+        event: &CodingAgentEventV1,
+    ) -> Option<(rust_decimal::Decimal, bool)> {
+        let mut rollup = coding_agent_usage::rollup_for_event(event, "scoped-session");
+        coding_agent_usage::price_rollup(pricing, event, &mut rollup).await;
+        coding_agent_usage::reported_cost_for_chat(&rollup)
+    }
+
     #[tokio::test]
     async fn mixed_model_turns_keep_four_classes_and_sum_each_calls_cost() {
         let event = event();
         let pricing = nasiko_pricing::PricingEngine::offline();
         let turn = external_turn(&event, "scoped-session");
-        let (cost, estimated) = price_turn(&pricing, &event).await.unwrap();
+        let (cost, estimated) = reported_chat_cost(&pricing, &event).await.unwrap();
         let usage = turn.assistant_usage.unwrap();
         assert_eq!(usage.input_tokens, Some(2000));
         assert_eq!(usage.output_tokens, Some(1000));
@@ -555,11 +512,11 @@ mod tests {
             call.cache_creation_tokens = 0;
         }
         assert_eq!(
-            price_turn(&pricing, &event).await.unwrap().0,
+            reported_chat_cost(&pricing, &event).await.unwrap().0,
             rust_decimal::Decimal::ZERO
         );
         event.turn.llm_calls.clear();
-        assert_eq!(price_turn(&pricing, &event).await, None);
+        assert_eq!(reported_chat_cost(&pricing, &event).await, None);
     }
 
     #[test]

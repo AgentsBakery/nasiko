@@ -9,6 +9,7 @@ const DEFAULT_ALERTS_MONITORS_SECS: u64 = 60;
 const DEFAULT_ALERTS_SPIKE_SECS: u64 = 300;
 const DEFAULT_ALERTS_SPIKE_SIGMA: f64 = 3.0;
 const DEFAULT_ALERTS_SPIKE_FLOOR_USD: f64 = 5.0;
+const DEFAULT_CODING_AGENT_USAGE_BACKFILL_SECS: u64 = 30;
 
 /// Alerting and notification settings (nested in [`Config::alerts`]).
 ///
@@ -296,6 +297,10 @@ pub struct Config {
     pub container_hours_poll_secs: u64,
     /// Alerting workers, thresholds and notification URL policy.
     pub alerts: AlertsConfig,
+    /// Interval in seconds for the coding-agent usage-rollup backfill, which
+    /// fills `coding_agent_turn_usage` for receipts stored before it existed.
+    /// 0 disables.
+    pub coding_agent_usage_backfill_secs: u64,
 
     // ─── Trace Materializer ─────────────────────────────────────────────────
     /// Poll interval in seconds for the trace-usage materializer. 0 disables.
@@ -544,6 +549,10 @@ impl Config {
                 .filter(|s| !s.is_empty()),
             container_hours_poll_secs: env_parse("CONTAINER_HOURS_POLL_SECS", 60),
             alerts: AlertsConfig::from_env(),
+            coding_agent_usage_backfill_secs: env_parse(
+                "CODING_AGENT_USAGE_BACKFILL_SECS",
+                DEFAULT_CODING_AGENT_USAGE_BACKFILL_SECS,
+            ),
             trace_usage_sync_secs: env_parse("TRACE_USAGE_SYNC_SECS", 120),
             trace_usage_overlap_secs: env_parse("TRACE_USAGE_OVERLAP_SECS", 600),
             trace_usage_batch_size: env_parse("TRACE_USAGE_BATCH_SIZE", 50),

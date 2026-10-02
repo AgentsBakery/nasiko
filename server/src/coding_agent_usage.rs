@@ -18,6 +18,11 @@ use nasiko_types::{
     CodingAgentToolCallStatus,
 };
 use rust_decimal::Decimal;
+use sqlx::{PgPool, Postgres, Transaction};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::MissedTickBehavior;
+use uuid::Uuid;
 
 /// Correction tag for legacy Codex receipts whose input included cache reads.
 pub const CODEX_INCLUSIVE_INPUT_CORRECTION: &str = "codex_inclusive_input_v1";
@@ -315,6 +320,221 @@ pub fn reported_cost_for_chat(rollup: &TurnUsageRollup) -> Option<(Decimal, bool
     rollup
         .reported_cost_usd
         .map(|cost| (cost, rollup.cost_estimated.unwrap_or(false)))
+}
+
+impl TurnUsageRollup {
+    /// Re-key the rollup to the server session the receipt is stored under.
+    ///
+    /// Ingest prices the rollup before its write transaction, when the server
+    /// session id (which needs the agent lookup) is not yet known.
+    pub fn assign_session(&mut self, event: &CodingAgentEventV1, server_session_id: &str) {
+        self.session_id = server_session_id.to_owned();
+        self.trace_id = trace_id_for_server_session(event, server_session_id);
+    }
+}
+
+// ─── persistence ────────────────────────────────────────────────────────────
+
+fn saturating_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn saturating_i32(value: u32) -> i32 {
+    i32::try_from(value).unwrap_or(i32::MAX)
+}
+
+/// Insert the rollup row for a receipt. Idempotent: an existing row wins.
+pub async fn insert_rollup(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+    event_id: &str,
+    rollup: &TurnUsageRollup,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"INSERT INTO coding_agent_turn_usage
+             (user_id, event_id, session_id, trace_id, source_agent_id, capture_policy,
+              adapter_version, agent_kind, scope_agent_id, agent_type, parent_tool_call_id,
+              parent_agent_id, spawn_depth, description, agent_display_name, started_at,
+              ended_at, llm_calls, tool_calls, input_tokens, output_tokens,
+              cache_read_tokens, cache_creation_tokens, reported_input_tokens, cost_usd,
+              reported_cost_usd, cost_estimated, output_incomplete, spawned_agent_call_ids,
+              named_agent_call_ids, correction)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+                   $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31)
+           ON CONFLICT (user_id, event_id) DO NOTHING"#,
+    )
+    .bind(user_id)
+    .bind(event_id)
+    .bind(&rollup.session_id)
+    .bind(&rollup.trace_id)
+    .bind(&rollup.source_agent_id)
+    .bind(rollup.capture_policy)
+    .bind(rollup.adapter_version.map(saturating_i32))
+    .bind(rollup.agent_kind)
+    .bind(&rollup.scope_agent_id)
+    .bind(&rollup.agent_type)
+    .bind(&rollup.parent_tool_call_id)
+    .bind(&rollup.parent_agent_id)
+    .bind(rollup.spawn_depth.map(saturating_i32))
+    .bind(&rollup.description)
+    .bind(&rollup.agent_display_name)
+    .bind(rollup.started_at)
+    .bind(rollup.ended_at)
+    .bind(saturating_i32(rollup.llm_calls))
+    .bind(saturating_i32(rollup.tool_calls))
+    .bind(saturating_i64(rollup.input_tokens))
+    .bind(saturating_i64(rollup.output_tokens))
+    .bind(saturating_i64(rollup.cache_read_tokens))
+    .bind(saturating_i64(rollup.cache_creation_tokens))
+    .bind(saturating_i64(rollup.reported_input_tokens))
+    .bind(rollup.cost_usd)
+    .bind(rollup.reported_cost_usd)
+    .bind(rollup.cost_estimated)
+    .bind(rollup.output_incomplete)
+    .bind(&rollup.spawned_agent_call_ids)
+    .bind(&rollup.named_agent_call_ids)
+    .bind(rollup.correction)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+// ─── backfill ───────────────────────────────────────────────────────────────
+
+/// Receipts per backfill tick.
+const BACKFILL_BATCH: i64 = 200;
+
+/// Receipts with neither a rollup nor a recorded failure, oldest first.
+///
+/// The payload is projected in SQL so large content never leaves Postgres:
+/// prompt and response are dropped, and each tool call loses its arguments,
+/// output, raw text and error. Only a string `arguments.name` survives, because
+/// the rollup's named-vs-unnamed spawn split reads it. Every JSON operation is
+/// guarded by `jsonb_typeof` so a malformed payload decodes to an error in Rust
+/// (and is recorded as a failure) instead of failing the whole query.
+const BACKFILL_SELECT: &str = r#"
+SELECT e.user_id, e.event_id, e.session_id,
+       CASE
+         WHEN jsonb_typeof(e.payload) <> 'object' THEN e.payload
+         WHEN jsonb_typeof(e.payload #> '{turn,tool_calls}') = 'array' THEN
+           jsonb_set(
+             e.payload #- '{turn,prompt}' #- '{turn,response}',
+             '{turn,tool_calls}',
+             (SELECT COALESCE(jsonb_agg(
+                       CASE WHEN jsonb_typeof(tc) = 'object' THEN
+                         (tc - 'arguments' - 'output' - 'raw' - 'error')
+                         || CASE WHEN jsonb_typeof(tc #> '{arguments,name}') = 'string'
+                                 THEN jsonb_build_object('arguments',
+                                        jsonb_build_object('name', tc #> '{arguments,name}'))
+                                 ELSE '{}'::jsonb END
+                       ELSE tc END
+                       ORDER BY ord), '[]'::jsonb)
+              FROM jsonb_array_elements(e.payload #> '{turn,tool_calls}')
+                   WITH ORDINALITY AS t(tc, ord)))
+         ELSE e.payload #- '{turn,prompt}' #- '{turn,response}'
+       END AS payload
+FROM coding_agent_telemetry_events e
+LEFT JOIN coding_agent_turn_usage u
+       ON u.user_id = e.user_id AND u.event_id = e.event_id
+LEFT JOIN coding_agent_usage_backfill_failures f
+       ON f.user_id = e.user_id AND f.event_id = e.event_id
+WHERE u.event_id IS NULL AND f.event_id IS NULL AND e.received_at <= $2
+ORDER BY e.received_at, e.user_id, e.event_id
+LIMIT $1"#;
+
+/// Record a receipt the backfill cannot roll up, so later ticks skip it.
+async fn record_backfill_failure(
+    db: &PgPool,
+    user_id: Uuid,
+    event_id: &str,
+    error: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"INSERT INTO coding_agent_usage_backfill_failures (user_id, event_id, error)
+           VALUES ($1, $2, $3)
+           ON CONFLICT (user_id, event_id) DO NOTHING"#,
+    )
+    .bind(user_id)
+    .bind(event_id)
+    .bind(error)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// Whether an insert failed on the row's own data (a data exception, SQLSTATE
+/// class 22, or an integrity violation, class 23), so retrying cannot help.
+fn is_permanent_row_error(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(|db_error| db_error.code())
+        .is_some_and(|code| code.starts_with("22") || code.starts_with("23"))
+}
+
+/// Fill rollups for up to `limit` receipts received at or before `now` that
+/// have none (history stored before migration 0050). Returns the rows filled.
+///
+/// Read-only on `coding_agent_telemetry_events`. Each receipt is priced
+/// outside any transaction and inserted in its own short one, so the tick
+/// never holds a write transaction while pricing takes a pool connection.
+/// Receipts that cannot be decoded or stored are recorded in
+/// `coding_agent_usage_backfill_failures` and skipped from then on, so one bad
+/// row cannot stall the queue. Transient database errors propagate.
+pub async fn tick_usage_backfill(
+    db: &PgPool,
+    pricing: &PricingEngine,
+    limit: i64,
+    now: DateTime<Utc>,
+) -> Result<usize, sqlx::Error> {
+    let pending: Vec<(Uuid, String, String, serde_json::Value)> = sqlx::query_as(BACKFILL_SELECT)
+        .bind(limit)
+        .bind(now)
+        .fetch_all(db)
+        .await?;
+    let mut filled = 0;
+    for (user_id, event_id, session_id, payload) in pending {
+        let event: CodingAgentEventV1 = match serde_json::from_value(payload) {
+            Ok(event) => event,
+            Err(error) => {
+                // The serde message can quote payload values; it goes only to
+                // the admin-side failure table, never to the log.
+                tracing::warn!(%user_id, %event_id, "tick_usage_backfill: undecodable receipt skipped");
+                record_backfill_failure(db, user_id, &event_id, &error.to_string()).await?;
+                continue;
+            }
+        };
+        let mut rollup = rollup_for_event(&event, &session_id);
+        price_rollup(pricing, &event, &mut rollup).await;
+        let mut tx = db.begin().await?;
+        match insert_rollup(&mut tx, user_id, &event_id, &rollup).await {
+            Ok(()) => {
+                tx.commit().await?;
+                filled += 1;
+            }
+            Err(error) if is_permanent_row_error(&error) => {
+                tx.rollback().await?;
+                tracing::warn!(%user_id, %event_id, %error, "tick_usage_backfill: rollup rejected by database");
+                record_backfill_failure(db, user_id, &event_id, &error.to_string()).await?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(filled)
+}
+
+/// Backfill loop: one bounded batch per interval. Missed ticks are skipped and
+/// a failed tick is logged and retried on the next one; the loop never exits.
+pub async fn run_usage_backfill(db: PgPool, pricing: Arc<PricingEngine>, every: Duration) {
+    let mut interval = tokio::time::interval(every);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        match tick_usage_backfill(&db, &pricing, BACKFILL_BATCH, Utc::now()).await {
+            Ok(0) => {}
+            Ok(filled) => tracing::info!(filled, "run_usage_backfill: filled usage rollups"),
+            Err(error) => tracing::warn!(%error, "run_usage_backfill: tick failed"),
+        }
+    }
 }
 
 #[cfg(test)]

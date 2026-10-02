@@ -376,6 +376,18 @@ impl AppState {
         // tick_* functions directly.
         crate::alerts::spawn_workers(state.db.clone(), state.config.alerts.clone());
 
+        // Usage-rollup backfill: receipts stored before coding_agent_turn_usage
+        // existed get their per-receipt rollup (and the legacy Codex
+        // correction) in bounded batches. New receipts are rolled up at ingest,
+        // so this only drains history. 0 disables; tests drive the tick.
+        if state.config.coding_agent_usage_backfill_secs > 0 {
+            tokio::spawn(crate::coding_agent_usage::run_usage_backfill(
+                state.db.clone(),
+                state.pricing.clone(),
+                std::time::Duration::from_secs(state.config.coding_agent_usage_backfill_secs),
+            ));
+        }
+
         // Trace-usage materializer: reads recent traces from Tempo, extracts
         // FinOps metrics, and upserts into trace_usage so dashboard queries
         // hit Postgres instead of Tempo. 0 disables.

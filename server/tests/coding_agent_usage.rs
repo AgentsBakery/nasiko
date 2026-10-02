@@ -111,7 +111,7 @@ fn spawn_call(id: &str, arguments: Value) -> CodingAgentToolCall {
         started_at: None,
         ended_at: None,
         duration_ms: None,
-        association: CodingAgentToolAssociation::Exact,
+        association: CodingAgentToolAssociation::Turn,
         timestamp_quality: CodingAgentTimestampQuality::Unknown,
     }
 }
