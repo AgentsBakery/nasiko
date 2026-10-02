@@ -112,3 +112,9 @@ test('sessionsFromResponse returns the sessions array or []', () => {
   assert.deepEqual(M.sessionsFromResponse({ available: false }), []);
   assert.deepEqual(M.sessionsFromResponse(undefined), []);
 });
+
+test('toSessionRow carries the corrected flag only when the server set it', () => {
+  assert.equal(M.toSessionRow({ ...fullSummary(), usage_corrected: true }).usageCorrected, true);
+  assert.equal(M.toSessionRow(fullSummary()).usageCorrected, false);
+  assert.equal(M.toSessionRow({ ...fullSummary(), usage_corrected: 'true' }).usageCorrected, false);
+});
