@@ -733,6 +733,7 @@ impl Entry {
                 service_tier: usage.service_tier.clone(),
                 inference_geo: usage.inference_geo.clone(),
                 conflicting_observations: false,
+                output_tokens_final: None,
             }),
             started_at,
             ended_at,

@@ -44,6 +44,7 @@ fn event(session: &str, turn: &str, policy: CapturePolicy) -> CodingAgentEventV1
         source: CodingAgentSource {
             agent_id: "claude".into(),
             agent_name: "coding-agent".into(),
+            adapter_version: None,
         },
         session: CodingAgentSession {
             id: coding_agent_session_id("claude", session),
@@ -69,6 +70,7 @@ fn event(session: &str, turn: &str, policy: CapturePolicy) -> CodingAgentEventV1
                 ended_at,
             }],
             tool_calls: vec![],
+            agent_scope: None,
         },
         capture_policy: policy,
     }

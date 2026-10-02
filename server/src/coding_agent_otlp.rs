@@ -644,6 +644,7 @@ mod tests {
             source: CodingAgentSource {
                 agent_id: "claude".into(),
                 agent_name: "coding-agent".into(),
+                adapter_version: None,
             },
             session: CodingAgentSession {
                 id: coding_agent_session_id("claude", "session"),
@@ -672,6 +673,7 @@ mod tests {
                     })
                     .collect(),
                 tool_calls: vec![],
+                agent_scope: None,
             },
             capture_policy: policy,
         }

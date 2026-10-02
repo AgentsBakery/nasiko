@@ -356,6 +356,7 @@ mod tests {
                 source: CodingAgentSource {
                     agent_id: "claude".into(),
                     agent_name: "claude-code".into(),
+                    adapter_version: None,
                 },
                 session: CodingAgentSession {
                     id: "claude:session".into(),
@@ -370,6 +371,7 @@ mod tests {
                     ended_at: at,
                     llm_calls: vec![],
                     tool_calls: vec![],
+                    agent_scope: None,
                 },
                 capture_policy: CapturePolicy::MetadataOnly,
             },

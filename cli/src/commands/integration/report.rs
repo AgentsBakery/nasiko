@@ -123,6 +123,7 @@ fn canonical_event(
         source: CodingAgentSource {
             agent_id: agent_id.to_string(),
             agent_name: agent_name.to_string(),
+            adapter_version: None,
         },
         session: CodingAgentSession {
             id: coding_agent_session_id(agent_id, source_session_id),
@@ -181,6 +182,7 @@ fn canonical_event(
                     timestamp_quality: tool.timestamp_quality,
                 })
                 .collect(),
+            agent_scope: None,
         },
         capture_policy: if capture_content {
             CapturePolicy::Content
