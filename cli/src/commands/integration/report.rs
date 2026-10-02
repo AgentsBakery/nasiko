@@ -402,6 +402,7 @@ mod tests {
             Some("Claude session title"),
             &turn,
             false,
+            None,
         );
         let second = canonical_event(
             "claude",
@@ -410,6 +411,7 @@ mod tests {
             Some("Claude session title"),
             &turn,
             false,
+            None,
         );
         assert_eq!(first.event_id, second.event_id);
         assert_eq!(first, second);
@@ -430,7 +432,8 @@ mod tests {
                 "same",
                 Some("Claude session title"),
                 &turn,
-                false
+                false,
+                None
             )
             .event_id
         );
@@ -441,6 +444,7 @@ mod tests {
             Some("Claude session title"),
             &turn,
             true,
+            None,
         );
         assert_eq!(
             content.turn.tool_calls[0].arguments,
@@ -451,6 +455,122 @@ mod tests {
             Some("Claude session title")
         );
         assert!(content.validate().is_ok());
+    }
+
+    #[test]
+    fn canonical_event_carries_the_adapter_marker_only_when_set() {
+        let turn = turn("marked", true);
+        let marked = canonical_event(
+            "codex",
+            "codex",
+            "s",
+            None,
+            &turn,
+            false,
+            Some(nasiko_types::CODEX_ADAPTER_VERSION_EXCLUSIVE_INPUT),
+        );
+        assert_eq!(
+            marked.source.adapter_version,
+            Some(nasiko_types::CODEX_ADAPTER_VERSION_EXCLUSIVE_INPUT)
+        );
+        assert_eq!(
+            serde_json::to_value(&marked).unwrap()["source"]["adapter_version"],
+            1
+        );
+
+        let legacy = canonical_event("codex", "codex", "s", None, &turn, false, None);
+        let encoded = serde_json::to_value(&legacy).unwrap();
+        assert!(encoded["source"].get("adapter_version").is_none());
+    }
+
+    // ─── run_in: capability cache priming ──────────────────────────────────
+
+    const COMPLETE_TRANSCRIPT: &str = concat!(
+        "{\"type\":\"user\",\"uuid\":\"u\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"message\":{\"content\":\"hello\"}}\n",
+        "{\"type\":\"assistant\",\"uuid\":\"a\",\"parentUuid\":\"u\",\"timestamp\":\"2026-01-01T00:00:01Z\",\"message\":{\"model\":\"test\",\"content\":\"done\",\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n",
+    );
+    const INCOMPLETE_TRANSCRIPT: &str = "{\"type\":\"user\",\"uuid\":\"u\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"message\":{\"content\":\"hello\"}}\n";
+    const BOUND_URL: &str = "https://bound.example";
+
+    /// An installed Claude integration whose state lives entirely in `dir`.
+    fn installed(dir: &std::path::Path) -> QueueDestination {
+        let principal_id = uuid::Uuid::new_v4();
+        let state = IntegrationState {
+            agents: std::collections::HashMap::from([(
+                "claude".to_string(),
+                super::super::state::AgentState {
+                    agent_name: "claude-code".into(),
+                    capture_content: false,
+                    hook_version: 3,
+                    binding: Some(super::super::state::InstallationBinding {
+                        cluster_name: "bound".into(),
+                        cluster_url: BOUND_URL.into(),
+                        principal_id,
+                    }),
+                },
+            )]),
+        };
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::to_string(&state).unwrap(),
+        )
+        .unwrap();
+        QueueDestination {
+            cluster_name: "bound".into(),
+            cluster_url: BOUND_URL.into(),
+            principal_id,
+        }
+    }
+
+    fn cache_empty_features(dir: &std::path::Path, destination: &QueueDestination) {
+        std::fs::write(
+            dir.join("capabilities.json"),
+            serde_json::json!({"destinations": {
+                format!("{}|{}", destination.cluster_url, destination.principal_id):
+                    {"features": [], "fetched_at": "2026-01-01T00:00:00Z"}
+            }})
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    fn report_once(dir: &std::path::Path, transcript: &str) -> usize {
+        let path = dir.join("session.jsonl");
+        std::fs::write(&path, transcript).unwrap();
+        let raw = serde_json::json!({"session_id": "s", "transcript_path": path}).to_string();
+        let spawned = Cell::new(0);
+        run_in(Agent::Claude, &raw, Instant::now(), dir, &mut || {
+            spawned.set(spawned.get() + 1);
+            Ok(())
+        })
+        .unwrap();
+        spawned.get()
+    }
+
+    #[test]
+    fn report_without_cache_spawns_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        installed(dir.path());
+        // First report queues the turn: the early capability spawn plus the
+        // usual post-queue spawn (sync's lock makes the second harmless).
+        assert_eq!(report_once(dir.path(), COMPLETE_TRANSCRIPT), 2);
+        // Nothing left to queue; only the missing cache triggers a sync.
+        assert_eq!(report_once(dir.path(), COMPLETE_TRANSCRIPT), 1);
+    }
+
+    #[test]
+    fn report_without_cache_and_no_completed_turns_spawns_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        installed(dir.path());
+        assert!(report_once(dir.path(), INCOMPLETE_TRANSCRIPT) >= 1);
+    }
+
+    #[test]
+    fn report_with_cache_and_nothing_queued_does_not_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = installed(dir.path());
+        cache_empty_features(dir.path(), &destination);
+        assert_eq!(report_once(dir.path(), INCOMPLETE_TRANSCRIPT), 0);
     }
 
     #[test]

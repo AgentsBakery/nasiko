@@ -739,7 +739,8 @@ mod tests {
                     input: 10,
                     output: 4,
                     cache_read: 2
-                })
+                }),
+                SnapshotOptions::default()
             )
             .is_none()
         );
@@ -752,6 +753,7 @@ mod tests {
                 output: 9,
                 cache_read: 5,
             }),
+            SnapshotOptions::default(),
         )
         .unwrap();
         let turn = &snapshot.turns[0];
@@ -776,9 +778,36 @@ mod tests {
     fn complete_events_remain_replayable_for_delivery_retries() {
         let mut pending = PendingTurn::default();
         let at = DateTime::from_timestamp(10, 0).unwrap();
-        assert!(apply_event(&mut pending, &payload("UserPromptSubmit"), at, None).is_none());
-        assert!(apply_event(&mut pending, &payload("Stop"), at, None).is_some());
-        assert!(apply_event(&mut pending, &payload("Stop"), at, None).is_some());
+        assert!(
+            apply_event(
+                &mut pending,
+                &payload("UserPromptSubmit"),
+                at,
+                None,
+                SnapshotOptions::default()
+            )
+            .is_none()
+        );
+        assert!(
+            apply_event(
+                &mut pending,
+                &payload("Stop"),
+                at,
+                None,
+                SnapshotOptions::default()
+            )
+            .is_some()
+        );
+        assert!(
+            apply_event(
+                &mut pending,
+                &payload("Stop"),
+                at,
+                None,
+                SnapshotOptions::default()
+            )
+            .is_some()
+        );
     }
 
     #[test]
@@ -797,14 +826,30 @@ mod tests {
             tool_input: Some(json!({"command": "redacted"})),
             ..payload("PreToolUse")
         };
-        assert!(apply_event(&mut pending, &post, at, None).is_none());
-        assert!(apply_event(&mut pending, &pre, at, None).is_none());
+        assert!(apply_event(&mut pending, &post, at, None, SnapshotOptions::default()).is_none());
+        assert!(apply_event(&mut pending, &pre, at, None, SnapshotOptions::default()).is_none());
         assert_eq!(
             pending.tool_calls[0].status,
             CodingAgentToolCallStatus::Succeeded
         );
-        assert!(apply_event(&mut pending, &payload("UserPromptSubmit"), at, None).is_none());
-        let snapshot = apply_event(&mut pending, &payload("Stop"), at, None).unwrap();
+        assert!(
+            apply_event(
+                &mut pending,
+                &payload("UserPromptSubmit"),
+                at,
+                None,
+                SnapshotOptions::default()
+            )
+            .is_none()
+        );
+        let snapshot = apply_event(
+            &mut pending,
+            &payload("Stop"),
+            at,
+            None,
+            SnapshotOptions::default(),
+        )
+        .unwrap();
         assert_eq!(snapshot.turns[0].tool_calls[0].id, "native-1");
         assert_eq!(
             snapshot.turns[0].tool_calls[0].association,
@@ -821,9 +866,25 @@ mod tests {
             tool_name: Some("shell".into()),
             ..payload("PreToolUse")
         };
-        assert!(apply_event(&mut pending, &payload("UserPromptSubmit"), at, None).is_none());
-        assert!(apply_event(&mut pending, &pre, at, None).is_none());
-        let snapshot = apply_event(&mut pending, &payload("Stop"), at, None).unwrap();
+        assert!(
+            apply_event(
+                &mut pending,
+                &payload("UserPromptSubmit"),
+                at,
+                None,
+                SnapshotOptions::default()
+            )
+            .is_none()
+        );
+        assert!(apply_event(&mut pending, &pre, at, None, SnapshotOptions::default()).is_none());
+        let snapshot = apply_event(
+            &mut pending,
+            &payload("Stop"),
+            at,
+            None,
+            SnapshotOptions::default(),
+        )
+        .unwrap();
         assert_eq!(
             snapshot.turns[0].tool_calls[0].status,
             CodingAgentToolCallStatus::Unknown
@@ -844,6 +905,7 @@ mod tests {
             &failed,
             DateTime::from_timestamp(10, 0).unwrap(),
             None,
+            SnapshotOptions::default(),
         );
         assert_eq!(
             pending.tool_calls[0].status,
@@ -888,6 +950,106 @@ not-json
                 cache_read: 8
             })
         );
+    }
+
+    /// Drive one real Codex turn through `snapshot_in`: the transcript holds
+    /// cumulative `{input 10, cached 3}` at prompt time and `{input 21,
+    /// cached 8}` at Stop, so Codex's own per-turn delta is input 11 of which
+    /// 5 were cached.
+    fn codex_fixture_turn(options: SnapshotOptions) -> SessionSnapshot {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("rollout.jsonl");
+        let spool = dir.path().join("spool");
+        let line = |input: u64, cached: u64, output: u64| {
+            format!(
+                r#"{{"type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{input},"cached_input_tokens":{cached},"output_tokens":{output}}}}}}}}}"#
+            )
+        };
+        let event = |name: &str| {
+            json!({
+                "session_id": "s",
+                "turn_id": "t",
+                "hook_event_name": name,
+                "model": "gpt-5-codex",
+                "prompt": "Build it",
+                "last_assistant_message": "Built",
+                "transcript_path": transcript,
+            })
+            .to_string()
+        };
+        std::fs::write(&transcript, format!("{}\n", line(10, 3, 4))).unwrap();
+        let started = snapshot_in(&event("UserPromptSubmit"), &spool, options).unwrap();
+        assert!(started.turns.is_empty());
+        std::fs::write(
+            &transcript,
+            format!("{}\n{}\n", line(10, 3, 4), line(21, 8, 7)),
+        )
+        .unwrap();
+        snapshot_in(&event("Stop"), &spool, options).unwrap()
+    }
+
+    #[test]
+    fn codex_exclusive_input_matches_codex_totals() {
+        let snapshot = codex_fixture_turn(SnapshotOptions {
+            codex_exclusive_input: true,
+            capture_subagents: false,
+        });
+        let call = &snapshot.turns[0].calls[0];
+        assert_eq!(call.input_tokens + call.cache_read_tokens, 11);
+        assert_eq!(call.input_tokens, 6);
+        assert_eq!(call.cache_read_tokens, 5);
+        assert_eq!(call.cache_creation_tokens, 0);
+        assert_eq!(call.output_tokens, 3);
+        assert_eq!(
+            snapshot.adapter_version,
+            Some(nasiko_types::CODEX_ADAPTER_VERSION_EXCLUSIVE_INPUT)
+        );
+    }
+
+    #[test]
+    fn codex_legacy_shape_without_capability() {
+        let snapshot = codex_fixture_turn(SnapshotOptions::default());
+        let call = &snapshot.turns[0].calls[0];
+        assert_eq!(call.input_tokens, 11);
+        assert_eq!(call.cache_read_tokens, 5);
+        assert_eq!(call.output_tokens, 3);
+        assert_eq!(snapshot.adapter_version, None);
+    }
+
+    #[test]
+    fn codex_exclusive_input_never_underflows() {
+        let mut pending = PendingTurn::default();
+        let at = DateTime::from_timestamp(10, 0).unwrap();
+        let options = SnapshotOptions {
+            codex_exclusive_input: true,
+            capture_subagents: false,
+        };
+        let zero = TokenUsage {
+            input: 0,
+            output: 0,
+            cache_read: 0,
+        };
+        apply_event(
+            &mut pending,
+            &payload("UserPromptSubmit"),
+            at,
+            Some(zero),
+            options,
+        );
+        let snapshot = apply_event(
+            &mut pending,
+            &payload("Stop"),
+            at,
+            Some(TokenUsage {
+                input: 2,
+                output: 1,
+                cache_read: 5,
+            }),
+            options,
+        )
+        .unwrap();
+        assert_eq!(snapshot.turns[0].calls[0].input_tokens, 0);
+        assert_eq!(snapshot.turns[0].calls[0].cache_read_tokens, 5);
     }
 
     #[test]
