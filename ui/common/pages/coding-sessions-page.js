@@ -18,6 +18,7 @@ import { loadCss } from '/common/utils/css.js';
 const styles = await loadCss(new URL('./coding-sessions-page.css', import.meta.url));
 import { escAttr, escHtml } from '/common/utils/escape.js';
 import { showToast } from '../utils/toast.js';
+import '../design-system/app-badge/app-badge.js';
 import '../design-system/app-button/app-button.js';
 import '../design-system/app-empty-state/app-empty-state.js';
 import '../design-system/app-switch/app-switch.js';
@@ -29,6 +30,7 @@ import { navigate as routerNavigate } from '../core/router.js';
 import {
   isUnavailable, nextOffset, sessionsFromResponse, toSessionRow,
 } from '/common/utils/coding-sessions.js';
+import { CORRECTED_HINT } from '/common/utils/coding-agent-breakdown.js';
 
 document.adoptedStyleSheets = [...document.adoptedStyleSheets, styles];
 
@@ -127,7 +129,14 @@ class CodingSessionsPage extends HTMLElement {
       { key: 'duration', label: 'Duration', render: textCell },
       { key: 'traces', label: 'Traces', render: textCell },
       { key: 'tokens', label: 'Tokens', render: textCell },
-      { key: 'cost', label: 'Cost', render: textCell },
+      {
+        key: 'cost',
+        label: 'Cost',
+        // Legacy Codex figures were adjusted on read; say so next to the number.
+        render: (v, r) => `${textCell(v)}${r.usageCorrected
+          ? ` <app-badge variant="info" title="${escAttr(CORRECTED_HINT)}">Corrected</app-badge>`
+          : ''}`,
+      },
     ];
     table.dataFn = async () => ({ data: this.#rows });
   }

@@ -102,6 +102,7 @@ import { authService } from '/common/services/auth-service.js';
 import { markerAnomalies } from '/common/utils/alerts.js';
 import { insightsRequestBody, insightsViewModel } from '/common/utils/finops-insights.js';
 import { errorStateHtml } from '/common/design-system/app-empty-state/error-state.js';
+import { CORRECTED_HINT } from '/common/utils/coding-agent-breakdown.js';
 
 document.adoptedStyleSheets = [...document.adoptedStyleSheets, styles];
 
@@ -322,6 +323,8 @@ class TokenopsPage extends HTMLElement {
   #agents = [];
   #summary = {};
   #kpis = null;
+  /** Legacy Codex usage in scope was corrected on read (`data.usage_corrected`). */
+  #usageCorrected = false;
   #attributions = [];
   /** `agent` | `workflow` — which shape `#attributions` and the sort list are in. */
   #attrView = 'agent';
@@ -401,7 +404,11 @@ class TokenopsPage extends HTMLElement {
 
     this.innerHTML = `
       <div class="page-head">
-        <h1 class="title-page">TokenOps</h1>
+        <div class="head-title">
+          <h1 class="title-page">TokenOps</h1>
+          <app-badge variant="info" id="corrected-badge" hidden
+            title="${escAttr(CORRECTED_HINT)}">Corrected</app-badge>
+        </div>
         <div class="head-actions">
           <app-button variant="tertiary" size="md" id="budgets-btn">Budgets</app-button>
           <app-button variant="tertiary" size="md" id="alerts-btn">Alerts</app-button>
@@ -658,6 +665,7 @@ class TokenopsPage extends HTMLElement {
     // same icon, same wording shape, same Retry as every other failure.
     const strip = this.querySelector('#kpi-strip');
     strip.removeAttribute('aria-busy');
+    /** @type {HTMLElement|null} */ (this.querySelector('#corrected-badge'))?.toggleAttribute('hidden', true);
     strip.innerHTML = errorStateHtml("Couldn't load usage data");
     strip.querySelector('[data-retry]')?.addEventListener('click', () => this.#load());
 
@@ -823,6 +831,7 @@ class TokenopsPage extends HTMLElement {
     if (id !== this.#loadId) return;
     this.#summary = data.summary || {};
     this.#kpis = data.kpis || null;
+    this.#usageCorrected = data.usage_corrected === true;
     const rawRows = data.attributions?.rows ?? data.agents ?? [];
     this.#attributions = rawRows.map((r) => this.#normalizeRow(r));
     // "Nothing deployed yet" is the first-run screen; "deployed but idle" is
@@ -999,6 +1008,11 @@ class TokenopsPage extends HTMLElement {
         sub: `${fmtTokens(cacheTok.current)} cached tokens`,
         ...deltaChip(cacheSave.change_pct, 'up') },
     ];
+
+    // Shown only when the server says some figure in scope was corrected;
+    // nothing otherwise, so an uncorrected dashboard reads as before.
+    const badge = /** @type {HTMLElement|null} */ (this.querySelector('#corrected-badge'));
+    if (badge) badge.hidden = !this.#usageCorrected;
 
     const strip = this.querySelector('#kpi-strip');
     strip.removeAttribute('aria-busy');

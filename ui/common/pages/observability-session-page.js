@@ -13,6 +13,13 @@
  *       `call('fetchObservabilityTrace', traceId)`     → GET /api/observability/trace/{id}
  *       `call('fetchSpanDetail', traceId, spanId)`     → GET /api/observability/span/{trace_id}/{span_id}
  *       `call('fetchChatSession', sessionId)`          → GET /api/chat/sessions/{id} (chat transcript)
+ *       `call('fetchCodingSessionAgents', sessionId)`  → GET /api/coding-sessions/{id}/agents
+ *         (per-agent breakdown; fetched by <coding-agent-breakdown> itself, from
+ *         Postgres, so it renders even when the trace backend is down)
+ *
+ * Subagent and teammate traces are labelled from their root-span attributes
+ * (`scopedTurnLabel`) so they never read as the user's question, and corrected
+ * legacy Codex figures carry a "Corrected" badge wherever their cost shows.
  */
 import { loadCss } from '/common/utils/css.js';
 const styles = await loadCss(new URL('./observability-session-page.css', import.meta.url));
@@ -33,6 +40,10 @@ import { renderMarkdown } from '/common/utils/markdown.js';
 import { call } from '../core/data-sources.js';
 import '/common/features/agent-steps.js';
 import { errorStateHtml } from '/common/design-system/app-empty-state/error-state.js';
+import '/common/features/coding-agent-breakdown.js';
+import {
+  CORRECTED_HINT, isCorrected, scopedTurnKind, scopedTurnLabel,
+} from '/common/utils/coding-agent-breakdown.js';
 
 
 document.adoptedStyleSheets = [...document.adoptedStyleSheets, styles];
@@ -137,6 +148,7 @@ function foldTraceInto(turn, root, traceId) {
   turn.cacheReadTokens = addCounts(turn.cacheReadTokens, root.cache_read_tokens);
   turn.cacheCreationTokens = addCounts(turn.cacheCreationTokens, root.cache_creation_tokens);
   turn.cost = addCounts(turn.cost, root.trace?.cost_summary?.total?.cost);
+  turn.corrected = turn.corrected || isCorrected(root);
   // Max, not sum: the folded trace usually overlaps the one it belongs to
   // (same wall clock, different exporter), so summing double-counts.
   turn.durationMs = root.latency_ms == null ? turn.durationMs
@@ -154,6 +166,21 @@ const fmtMs = (ms) => {
   if (ms == null) return '—';
   return ms >= 1000 ? `${(ms / 1000).toFixed(2)}s` : `${Math.round(ms)}ms`;
 };
+
+/// The "Corrected" badge for legacy Codex figures adjusted on read. Constant
+/// markup: the hint is ours, escaped anyway for the attribute context.
+const correctedBadgeHtml = () =>
+  `<app-badge variant="info" class="corrected-badge" title="${escAttr(CORRECTED_HINT)}">Corrected</app-badge>`;
+
+/// A stat-row item whose figure was corrected: `app-stat-row` draws only text,
+/// so the label travels in the value and the explanation in the tooltip.
+const markCorrected = (item, corrected) => (corrected
+  ? {
+    ...item,
+    value: `${item.value} · Corrected`,
+    hint: item.hint ? `${CORRECTED_HINT}\n\n${item.hint}` : CORRECTED_HINT,
+  }
+  : item);
 
 class ObservabilitySessionPage extends HTMLElement {
   #initialized = false;
@@ -177,6 +204,9 @@ class ObservabilitySessionPage extends HTMLElement {
   #focusTraceId = '';        // ?trace_id= — preselect this trace
   #pollTimer = null;
   #pollDeadline = 0;
+  /// Whether any trace of the selected turn came back corrected from the trace
+  /// view (`fetchObservabilityTrace`), on top of the turn's own flags.
+  #traceCorrected = false;
 
   connectedCallback() {
     if (this.#initialized) return;
@@ -199,6 +229,11 @@ class ObservabilitySessionPage extends HTMLElement {
         </button>
       </div>
       <app-stat-row id="kpi-strip" variant="chips" loading="6"></app-stat-row>
+      <!-- Fetches its own data from Postgres: independent of the trace backend
+           and of fetchObservabilitySession, so it is placed once here and only
+           its session-id changes (#enter). Hides itself for non-coding
+           sessions and on 404. -->
+      <coding-agent-breakdown id="agent-breakdown"></coding-agent-breakdown>
       <section class="turn-strip" id="turn-strip" aria-label="Session turns"></section>
       <div class="panes">
         <section class="pane" id="traces-pane" aria-label="Traces"></section>
@@ -270,6 +305,8 @@ class ObservabilitySessionPage extends HTMLElement {
     this.#selected = null;
     this.#collapsed.clear();
     this.#tracesState = 'loading';
+    this.#traceCorrected = false;
+    this.querySelector('#agent-breakdown').setAttribute('session-id', this.#sessionId);
 
     this.querySelector('#page-title').textContent = this.#sessionId;
     const chip = this.querySelector('.page-head .id-chip');
@@ -404,7 +441,10 @@ class ObservabilitySessionPage extends HTMLElement {
   /// for BYO-key agents, whose messages carry no trace id.
   #firstQuestion() {
     const msg = this.#messages.find((m) => m.role === 'user')?.content;
-    return this.#plainText(msg || this.#session?.traces?.[0]?.root_span?.input?.value);
+    // A subagent's or teammate's prompt is not the user's question.
+    const mainTrace = (this.#session?.traces ?? [])
+      .find((t) => scopedTurnLabel(t?.root_span?.attributes) === null);
+    return this.#plainText(msg || mainTrace?.root_span?.input?.value);
   }
 
   // ── KPI strip ────────────────────────────────────────────────────────────
@@ -443,12 +483,15 @@ class ObservabilitySessionPage extends HTMLElement {
       cacheRead: s.cache_read_tokens,
       cacheCreation: s.cache_creation_tokens,
     });
+    const corrected = isCorrected(s);
     strip.items = [
       { label: 'Total tokens', value: fmtInt(pills?.total ?? null), hint: pills?.totalHint },
-      { label: 'Input tokens', value: fmtInt(pills?.input ?? null), hint: pills?.inputHint },
+      markCorrected(
+        { label: 'Input tokens', value: fmtInt(pills?.input ?? null), hint: pills?.inputHint },
+        corrected),
       { label: 'Output tokens', value: fmtInt(pills?.output ?? null), hint: pills?.outputHint },
       { label: 'Cache tokens', value: fmtInt(pills?.cache ?? null), hint: pills?.cacheHint },
-      { label: 'Total cost', value: fmtUsd(whole(cost.total?.cost)) },
+      markCorrected({ label: 'Total cost', value: fmtUsd(whole(cost.total?.cost)) }, corrected),
       // P50 here and on the session list, so the same session reads the same
       // number on both screens. `latency_avg` is served alongside it.
       { label: 'Latency P50', value: fmtMs(s.latency_p50) },
@@ -490,6 +533,9 @@ class ObservabilitySessionPage extends HTMLElement {
       const pair = byTrace.get(entry.trace_id);
       // `||` not `??`: the server serializes "no content" as an empty
       // string, which must fall through to the next source.
+      // Subagent/teammate traces are labelled from their root-span attributes:
+      // their input is the delegated task, not something the user asked.
+      const scopedLabel = scopedTurnLabel(root.attributes);
       const question = this.#plainText(pair?.user?.content || root.input?.value);
       const answer = this.#plainText(pair?.assistant?.content || root.output?.value);
       const prev = this.#turns[this.#turns.length - 1];
@@ -498,7 +544,9 @@ class ObservabilitySessionPage extends HTMLElement {
       // proxy-only hop). Fold it into the turn before it so the reader sees
       // one chat entry with both traces under its root, not an empty second
       // entry — or, with no previous turn yet, hold it for the next one.
-      if (!question && !answer) {
+      // A scoped trace is always its own turn: it has a label even when content
+      // capture was off, and folding it would hide who did the work.
+      if (!scopedLabel && !question && !answer) {
         if (prev) {
           foldTraceInto(prev, root, entry.trace_id);
         } else {
@@ -515,6 +563,9 @@ class ObservabilitySessionPage extends HTMLElement {
         traceIds: [],
         question,
         answer,
+        scopedLabel,
+        scopedKind: scopedTurnKind(root.attributes),
+        corrected: isCorrected(root) || isCorrected(pair?.assistant),
         startTime: root.start_time,
         // Coding-agent turns carry the steps they took on the message itself.
         toolCalls: pair?.assistant?.metadata?.coding_agent?.tool_calls ?? null,
@@ -551,6 +602,9 @@ class ObservabilitySessionPage extends HTMLElement {
         traceIds: [],
         question: '',
         answer: '',
+        scopedLabel: null,
+        scopedKind: null,
+        corrected: false,
         startTime: null,
         toolCalls: null,
         totalTokens: null,
@@ -610,7 +664,7 @@ class ObservabilitySessionPage extends HTMLElement {
     const total = this.#turns.length;
     const items = this.#turns.map((t, i) => ({
       id: String(i),
-      label: `${i + 1}. ${(t.question || '(no question recorded)')
+      label: `${i + 1}. ${(t.scopedLabel || t.question || '(no question recorded)')
         .replace(/\s+/g, ' ').trim().slice(0, TURN_LABEL_CHARS)}`,
     }));
 
@@ -640,8 +694,13 @@ class ObservabilitySessionPage extends HTMLElement {
                  question whose second line is the paragraph break spent one of
                  them on whitespace — a one-line question with a gap under it.
                  The detail pane below keeps the text as written. -->
+            ${turn.scopedLabel ? `<div class="turn-scoped">
+              <span class="turn-scoped-label">${escHtml(turn.scopedLabel)}</span>
+              <app-badge variant="neutral">${escHtml(turn.scopedKind ?? 'unknown')}</app-badge>
+            </div>` : ''}
             <div class="turn-question msg-clamp">${escHtml(
-              (turn.question || 'No question recorded for this turn').replace(/\n\s*\n/g, '\n'))}</div>
+              (turn.question || (turn.scopedLabel ? 'No task text recorded' : 'No question recorded for this turn'))
+                .replace(/\n\s*\n/g, '\n'))}</div>
           </div>
         </div>
         <div class="turn-line">
@@ -659,6 +718,7 @@ class ObservabilitySessionPage extends HTMLElement {
         </div>
         <div class="turn-meta">
           <app-stat-row variant="chips" id="turn-metrics"></app-stat-row>
+          ${turn.corrected ? correctedBadgeHtml() : ''}
           <span class="turn-time">${escHtml(this.#fmtDate(turn.startTime))}</span>
         </div>
       </div>
@@ -680,7 +740,7 @@ class ObservabilitySessionPage extends HTMLElement {
       { label: 'Input tokens', value: fmtInt(turnPills?.input ?? null), hint: turnPills?.inputHint },
       { label: 'Output tokens', value: fmtInt(turnPills?.output ?? null), hint: turnPills?.outputHint },
       { label: 'Cache tokens', value: fmtInt(turnPills?.cache ?? null), hint: turnPills?.cacheHint },
-      { label: 'Cost', value: fmtUsd(turn.cost) },
+      markCorrected({ label: 'Cost', value: fmtUsd(turn.cost) }, turn.corrected),
       { label: 'Duration', value: fmtMs(turn.durationMs) },
     ];
     // A whole answer can run to thousands of characters; without this the strip
@@ -697,6 +757,7 @@ class ObservabilitySessionPage extends HTMLElement {
    */
   async #loadTurnTrace() {
     const turn = this.#turn();
+    this.#traceCorrected = false;
     if (!turn) {
       this.#tree = [];
       this.#renderTraces();
@@ -721,6 +782,7 @@ class ObservabilitySessionPage extends HTMLElement {
     // asked sits at the top and every span hangs beneath it, matching
     // `NAM → dept  session.run` in the design. A turn that folded in a
     // message-less trace roots that trace's spans here too.
+    this.#traceCorrected = details.some((detail) => isCorrected(detail));
     const roots = details.flatMap((detail, i) =>
       (detail?.spans ?? []).map((node) => ({ node, traceId: turn.traceIds[i] })));
 
@@ -731,7 +793,7 @@ class ObservabilitySessionPage extends HTMLElement {
     const seen = new Set();
     this.#tree = [{
       id: TURN_ROOT_ID,
-      label: this.#sessionId,
+      label: turn.scopedLabel || this.#sessionId,
       meta: 'session.run',
       icon: 'trace',
       // Wall-clock for the whole turn, not the sum of its parts: spans overlap.
@@ -817,7 +879,7 @@ class ObservabilitySessionPage extends HTMLElement {
         aria-label="Copy trace ID">
         <span class="id-chip__text">${escHtml(traceId)}</span>
         <span class="id-chip__icon">${icons.copy('', 14)}</span>
-      </button>` : ''}</h2>`;
+      </button>` : ''}${traceId && this.#traceCorrected ? ` ${correctedBadgeHtml()}` : ''}</h2>`;
   }
 
   #renderTraces() {
@@ -888,12 +950,12 @@ class ObservabilitySessionPage extends HTMLElement {
     }
     pane.innerHTML = `
       <div class="detail-head">
-        <h3>${escHtml(this.#sessionId)}</h3>
+        <h3>${escHtml(turn.scopedLabel || this.#sessionId)}</h3>
         <app-badge variant="info">session.run</app-badge>
       </div>
-      <div class="detail-section-title">User</div>
+      <div class="detail-section-title">${turn.scopedLabel ? 'Task' : 'User'}</div>
       <div class="msg-block"><div class="msg-content msg-clamp">${escHtml(
-        turn.question || 'No question recorded for this turn')}</div></div>
+        turn.question || (turn.scopedLabel ? 'No task text recorded' : 'No question recorded for this turn'))}</div></div>
       <div class="detail-section-title">Assistant</div>
       <div class="msg-block"><div class="msg-content msg-clamp md-body">${turn.answer
         ? renderMarkdown(turn.answer)
@@ -908,7 +970,8 @@ class ObservabilitySessionPage extends HTMLElement {
         })).map(([k, v, hint]) => `
         <dt${hint ? ` title="${escAttr(hint)}"` : ''}>${escHtml(k)}</dt>
         <dd${hint ? ` title="${escAttr(hint)}"` : ''}>${escHtml(v)}</dd>`).join('')}
-        <dt>Cost</dt><dd>${escHtml(fmtUsd(turn.cost))}</dd>
+        <dt>Cost</dt><dd>${escHtml(fmtUsd(turn.cost))}${
+          turn.corrected || this.#traceCorrected ? ` ${correctedBadgeHtml()}` : ''}</dd>
         <dt>Duration</dt><dd>${escHtml(fmtMs(turn.durationMs))}</dd>
       </dl>
     `;
@@ -1036,12 +1099,13 @@ class ObservabilitySessionPage extends HTMLElement {
       })),
       ['Input cost', fmtUsd(cost.prompt?.cost), ''],
       ['Output cost', fmtUsd(cost.completion?.cost), ''],
-      ['Total cost', fmtUsd(cost.total?.cost), ''],
+      ['Total cost', fmtUsd(cost.total?.cost), '', isCorrected(s)],
       ['Latency', fmtMs(s.latency_ms), ''],
     ];
-    return `<dl class="usage-grid">${rows.map(([k, v, hint]) => `
+    return `<dl class="usage-grid">${rows.map(([k, v, hint, corrected]) => `
       <dt${hint ? ` title="${escAttr(hint)}"` : ''}>${escHtml(k)}</dt>
-      <dd${hint ? ` title="${escAttr(hint)}"` : ''}>${escHtml(v)}</dd>`).join('')}</dl>`;
+      <dd${hint ? ` title="${escAttr(hint)}"` : ''}>${escHtml(v)}${
+        corrected ? ` ${correctedBadgeHtml()}` : ''}</dd>`).join('')}</dl>`;
   }
 
   /**

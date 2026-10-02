@@ -266,6 +266,18 @@ export function scopedTurnLabel(rootAttrs) {
 }
 
 /**
+ * Kind of a scoped (subagent/teammate) trace from its root span attributes:
+ * 'subagent', 'teammate', 'unknown' for another scoped kind, null for main.
+ * @param {unknown} rootAttrs
+ * @returns {'subagent'|'teammate'|'unknown'|null}
+ */
+export function scopedTurnKind(rootAttrs) {
+  const kind = parseAttributes(rootAttrs)[KIND_ATTRIBUTE];
+  if (typeof kind !== 'string' || kind === '' || kind === 'main') return null;
+  return kind === 'subagent' || kind === 'teammate' ? kind : 'unknown';
+}
+
+/**
  * True only when the server flagged the figures as corrected (the flag is
  * omitted when false on session, trace, span and chat payloads).
  * @param {any} x

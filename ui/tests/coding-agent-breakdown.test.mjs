@@ -223,3 +223,11 @@ test('isCorrected is true only for a literal true flag', () => {
 test('CORRECTED_HINT explains the correction', () => {
   assert.match(M.CORRECTED_HINT, /^Corrected: Codex cached input was counted twice/);
 });
+
+test('scopedTurnKind returns the scoped kind or null', () => {
+  assert.equal(M.scopedTurnKind({ 'coding_agent.agent.kind': 'subagent' }), 'subagent');
+  assert.equal(M.scopedTurnKind('{"coding_agent.agent.kind":"teammate"}'), 'teammate');
+  assert.equal(M.scopedTurnKind({ 'coding_agent.agent.kind': 'other' }), 'unknown');
+  assert.equal(M.scopedTurnKind({ 'coding_agent.agent.kind': 'main' }), null);
+  assert.equal(M.scopedTurnKind(null), null);
+});

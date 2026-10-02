@@ -1,0 +1,103 @@
+/* <coding-agent-breakdown> — per-agent table on the session detail page.
+   Design tokens only; the table scrolls sideways on narrow widths rather than
+   squeezing twelve columns into the viewport. */
+
+@scope (coding-agent-breakdown) {
+
+:scope {
+  display: block;
+  margin: var(--s-16) 0;
+  font-size: var(--font-size-sm);
+}
+
+.cab-title {
+  margin: 0 0 var(--s-8);
+  font-size: var(--font-size-base);
+  font-weight: 600;
+  color: var(--fg-primary);
+}
+
+.cab-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-4) var(--s-8);
+  margin: 0 0 var(--s-12);
+  color: var(--fg-secondary);
+}
+
+.cab-scroll {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: thin;
+  border: var(--bw-1) solid var(--border-primary);
+  border-radius: var(--r-8);
+}
+
+.cab-table {
+  width: 100%;
+  border-collapse: collapse;
+  border-spacing: 0;
+  background: var(--bg-base);
+}
+
+.cab-table thead { background: var(--bg-group); }
+
+.cab-table th,
+.cab-table td {
+  padding: var(--s-8) var(--s-12);
+  text-align: left;
+  white-space: nowrap;
+  border-bottom: var(--bw-1) solid var(--border-primary);
+  vertical-align: middle;
+}
+
+.cab-table thead th {
+  font-weight: 600;
+  font-size: var(--font-size-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--fg-secondary);
+}
+
+.cab-table tbody th { font-weight: 500; color: var(--fg-primary); }
+
+.cab-table tfoot th,
+.cab-table tfoot td {
+  font-weight: 600;
+  border-bottom: none;
+  background: var(--bg-group);
+}
+
+.cab-table .num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.cab-agent > * + * { margin-left: var(--s-6); }
+
+.cab-runs,
+.cab-when { color: var(--fg-secondary); }
+
+.cab-intent {
+  display: inline-block;
+  max-width: 24rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: bottom;
+}
+
+.cab-hidden {
+  color: var(--fg-secondary);
+  font-style: italic;
+  cursor: help;
+}
+
+.cab-hidden-tag { font-size: var(--font-size-xs); }
+
+.cab-note {
+  margin: var(--s-8) 0 0;
+  font-size: var(--font-size-xs);
+  color: var(--fg-secondary);
+}
+
+}

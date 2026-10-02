@@ -248,6 +248,21 @@
 
   .turn-answer { color: var(--color-text-muted); }
 
+  /* A subagent's or teammate's turn: who did it, above the delegated task. */
+  .turn-scoped {
+    display: flex;
+    align-items: center;
+    gap: var(--s-8);
+    margin-bottom: var(--s-4);
+  }
+
+  .turn-scoped-label {
+    font-weight: 600;
+    color: var(--color-text-main);
+  }
+
+  .corrected-badge { vertical-align: middle; }
+
   /* Rendered markdown inside the answer: the shared .md-body sheet
      (/common/styles/markdown.css) owns the block styles; this only stops the
      first and last block adding margin the flex row already spaces. */
