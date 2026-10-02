@@ -3,17 +3,19 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use nasiko_types::{
-    CodingAgentTimestampQuality, CodingAgentToolAssociation, CodingAgentToolCallStatus,
+    CLAUDE_ADAPTER_VERSION_SUBAGENTS, CodingAgentTimestampQuality, CodingAgentToolAssociation,
+    CodingAgentToolCallStatus,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::super::catalog::{self, AgentSpec, Support};
 use super::super::launcher;
 use super::super::model::{LlmCall, SessionSnapshot, SnapshotOptions, ToolCall, Turn};
+use super::claude_subagents::{self, SubagentFileProgress, SubagentScan};
 
 pub const INSTALL_VERSION: u32 = 3;
 pub const SPEC: AgentSpec = AgentSpec {
@@ -176,12 +178,14 @@ fn write_settings(path: &Path, settings: &Value) -> Result<()> {
         .with_context(|| format!("failed to write {}", path.display()))
 }
 
-// `_options.capture_subagents` is honoured once subagent transcripts are
-// parsed (plan 04-06); until then Claude always produces the v1.0 shape.
+/// With `options.capture_subagents` the snapshot carries the marker
+/// `CLAUDE_ADAPTER_VERSION_SUBAGENTS` ("this CLI captures subagents", which the
+/// server's capture status relies on) and the transcript path the report scans
+/// with `subagent_scan` once it holds the session lock.
 pub fn snapshot(
     raw: &str,
     report_deadline: Instant,
-    _options: SnapshotOptions,
+    options: SnapshotOptions,
 ) -> Result<SessionSnapshot> {
     let payload: HookPayload = serde_json::from_str(raw).with_context(|| {
         format!(
@@ -207,12 +211,37 @@ pub fn snapshot(
                 title: session_title(&content, &payload.session_id),
                 session_id: payload.session_id,
                 turns,
-                adapter_version: None,
+                adapter_version: options
+                    .capture_subagents
+                    .then_some(CLAUDE_ADAPTER_VERSION_SUBAGENTS),
                 scoped_turns: Vec::new(),
+                subagent_transcript: options
+                    .capture_subagents
+                    .then(|| payload.transcript_path.clone()),
             });
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Finished subagent runs of the session whose main transcript is
+/// `transcript_path`. The transcript is re-read so terminal signals written
+/// after the snapshot count; `main_turns` supplies the call ids never reported twice.
+pub fn subagent_scan(
+    transcript_path: &Path,
+    main_turns: &[Turn],
+    deadline: Instant,
+    progress: &BTreeMap<String, SubagentFileProgress>,
+) -> Result<SubagentScan> {
+    let content = std::fs::read_to_string(transcript_path)
+        .with_context(|| format!("failed to read transcript {}", transcript_path.display()))?;
+    Ok(claude_subagents::scan_subagents(
+        transcript_path,
+        &content,
+        main_turns,
+        deadline,
+        progress,
+    ))
 }
 
 fn preview(raw: &str) -> String {
@@ -621,17 +650,9 @@ pub(super) struct Entry {
     #[serde(rename = "lastPrompt")]
     last_prompt: Option<String>,
     /// Claude-injected user records (system reminders, coordinator resumes).
-    #[allow(
-        dead_code,
-        reason = "read by subagent capture, wired by the next 04-06 commit"
-    )]
     #[serde(rename = "isMeta", default)]
     pub(super) is_meta: bool,
     /// `{"kind": ...}`; kept untyped so an unexpected shape never drops the record.
-    #[allow(
-        dead_code,
-        reason = "read by subagent capture, wired by the next 04-06 commit"
-    )]
     pub(super) origin: Option<Value>,
 }
 

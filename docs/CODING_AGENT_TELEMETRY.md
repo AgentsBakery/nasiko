@@ -90,3 +90,73 @@ CLIs. Figures shown exclude the duplicate."
    replay of the same identity is a `duplicate`. The reverse is `rejected`, not
    `duplicate`: a stored marked receipt followed by an unmarked replay, for example after
    the capability flips during a downgrade.
+
+## Subagent capture (Claude Code)
+
+When the destination advertises both `agent_scope` and `adapter_version` (cached by
+`nasiko agents sync`, never probed from the hook), the Claude Code hook reports the work
+of subagents as well as the main agent. Without both features, nothing changes: no scoped
+events are sent and Claude receipts carry no marker.
+
+**What is captured.** Claude Code writes each subagent's transcript next to the session,
+at `<session>/subagents/agent-<agentId>.jsonl`, with `agent-<agentId>.meta.json`
+alongside it. Each run segment becomes its own event in the parent session. A run segment
+is the first prompt or a later coordinator resume. The event has
+`turn.id = subagent:<agentId>:<segment uuid>` and `turn.agent_scope` set, and it carries
+the subagent's own LLM calls (tokens by class), tool calls and timestamps. Linkage:
+
+- `parent_tool_call_id` is the `toolUseId` of the `Agent` call that spawned the run
+  (`Task` in older versions).
+- `parent_agent_id` is set when that call is in another subagent's transcript (nested
+  subagents); `spawn_depth` comes from the meta.
+
+**Marker.** Claude receipts carry `source.adapter_version = 1`
+(`CLAUDE_ADAPTER_VERSION_SUBAGENTS`) only while subagent capture is active. The server
+uses it to say whether subagents were captured for a session.
+
+**Intent and content policy.**
+
+| Field | Metadata-only (`--no-content`) | Content capture |
+|---|---|---|
+| `agent_scope.kind`, `agent_type` | sent | sent |
+| `parent_tool_call_id`, `parent_agent_id`, `spawn_depth` | sent | sent |
+| `agent_scope.description` (task text), `agent_scope.name` | not sent | sent |
+| `turn.prompt`, `turn.response` (handback report or last text) | not sent | sent |
+| tool arguments, output, raw, error | not sent | sent |
+| `session.title` | never sent on a scoped event | never sent on a scoped event |
+
+**Output tokens are a lower bound.** Subagent transcripts often keep only the
+start-of-stream usage snapshot for a call (`stop_reason: null` on every record; Claude
+Code issues #97763 and #84223). Input and cache classes are correct, but output and
+therefore cost are undercounted. Such calls carry
+`accounting.output_tokens_final = false`, and views show them as minimums. Output is never
+estimated from text length.
+
+**No double counting.**
+
+- Calls already present in the main transcript are excluded.
+- A call that appears in several subagent files (forks, nested copies) is reported once.
+- Parent-side summaries are never read as usage: `toolUseResult.usage`, `totalTokens`
+  and `<subagent_tokens>` describe the final call's context, not the run.
+
+**When a run is reported.** Receipts are immutable, so a run segment is sent only after
+a terminal signal:
+
+- a later segment exists, or
+- the main transcript has a `<task-notification>` for the agent with status
+  `completed`, `failed`, `killed` or `stopped`, or
+- the spawning `Agent` call's result is `completed` or an error.
+
+A run that is still going is deferred and retried on the next Stop. A fully captured
+transcript whose size has not changed is not re-read (watermark `subagent_files`).
+Discovery reads regular files with `agent-<id>` names only, skips symlinks, and is capped
+at 500 agents and 64 MiB per transcript.
+
+**Known gaps.**
+
+- A subagent that is still running when the user quits is not captured until a later
+  Stop in the same session sees its terminal signal. Without one, it is never captured
+  (SessionEnd handling is Phase 5).
+- Agent teams: teammates are not captured yet. Metas without `toolUseId`, or with
+  `taskKind: "in_process_teammate"`, are skipped. A named subagent that has a `toolUseId`
+  is still captured as a subagent. Split-pane teammates appear as separate sessions.

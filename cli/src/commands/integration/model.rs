@@ -5,6 +5,7 @@ use nasiko_types::{
     CodingAgentTimestampQuality, CodingAgentToolAssociation, CodingAgentToolCallStatus,
 };
 use serde_json::Value;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct LlmCall {
@@ -64,17 +65,17 @@ pub struct SessionSnapshot {
     /// `None` keeps the v1.0 meaning of the adapter's token fields.
     pub adapter_version: Option<u32>,
     /// Turns run by a subagent or teammate, reported with `turn.agent_scope`.
-    /// Empty until subagent capture lands; unscoped turns stay in `turns`.
-    #[allow(dead_code, reason = "emitted by Claude subagent capture (plan 04-06)")]
+    /// Unscoped turns stay in `turns`. Filled by the report once it holds the
+    /// session lock (see `subagent_transcript`).
     pub scoped_turns: Vec<ScopedTurn>,
+    /// Claude main transcript whose subagent runs the report scans. Set only
+    /// when subagent capture is active; the scan needs the session's watermark,
+    /// so it runs in the report under the lock rather than here.
+    pub subagent_transcript: Option<PathBuf>,
 }
 
 /// A turn attributed to a non-root agent inside the session.
 #[derive(Debug, Clone)]
-#[allow(
-    dead_code,
-    reason = "filled and read by Claude subagent capture (plan 04-06)"
-)]
 pub struct ScopedTurn {
     pub turn: Turn,
     pub scope: nasiko_types::CodingAgentScope,
@@ -88,6 +89,5 @@ pub struct SnapshotOptions {
     /// Report Codex fresh input exclusive of cached input, with the marker.
     pub codex_exclusive_input: bool,
     /// Capture Claude subagent/teammate turns as scoped turns.
-    #[allow(dead_code, reason = "read by Claude subagent capture (plan 04-06)")]
     pub capture_subagents: bool,
 }

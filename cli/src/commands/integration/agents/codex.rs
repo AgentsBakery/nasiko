@@ -287,6 +287,7 @@ fn snapshot_in(raw: &str, spool_dir: &Path, options: SnapshotOptions) -> Result<
         turns: Vec::new(),
         adapter_version: None,
         scoped_turns: Vec::new(),
+        subagent_transcript: None,
     }))
 }
 
@@ -450,6 +451,7 @@ fn apply_event(
             .codex_exclusive_input
             .then_some(CODEX_ADAPTER_VERSION_EXCLUSIVE_INPUT),
         scoped_turns: Vec::new(),
+        subagent_transcript: None,
         turns: vec![Turn {
             uuid: payload.turn_id.clone(),
             prompt,

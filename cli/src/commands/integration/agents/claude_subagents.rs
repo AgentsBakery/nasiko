@@ -30,8 +30,6 @@
 //! when `toolUseId` is absent or `taskKind == "in_process_teammate"`. A `name`
 //! alone never excludes an ordinary subagent; it is kept as content.
 
-#![allow(dead_code, reason = "wired into report by the next 04-06 commit")]
-
 use chrono::{DateTime, Utc};
 use nasiko_types::{
     CODING_AGENT_ID_MAX_BYTES, CODING_AGENT_NAME_MAX_BYTES,

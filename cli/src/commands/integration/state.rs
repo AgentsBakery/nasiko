@@ -11,13 +11,15 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+use super::agents::claude_subagents::SubagentFileProgress;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstallationBinding {
@@ -94,6 +96,9 @@ pub struct SessionProgress {
     pub exported_turn_ids: HashSet<String>,
     pub uploaded_turn_ids: HashSet<String>,
     pub captured_turn_ids: HashSet<String>,
+    /// Claude subagent transcripts by agentId: size, reported call ids, and
+    /// whether every run was captured (unchanged complete files are not re-read).
+    pub subagent_files: BTreeMap<String, SubagentFileProgress>,
     /// A count-only file cannot be mapped safely after transcript edits. Its
     /// first ID-aware run deliberately replays complete turns once.
     pub migrated_legacy_counts: bool,
@@ -157,6 +162,7 @@ impl SessionLock {
                 exported_turn_ids: None,
                 uploaded_turn_ids: None,
                 captured_turn_ids: None,
+                subagent_files: None,
             };
             write_watermark_path(&watermark_path, &conservative)?;
         }
@@ -224,11 +230,28 @@ impl SessionLock {
                 .into_iter()
                 .collect(),
             migrated_legacy_counts,
+            subagent_files: current.subagent_files.unwrap_or_default(),
         })
     }
 
     pub fn mark_captured(&self, turn_ids: &[String]) -> Result<()> {
         self.mark(turn_ids, |watermark| &mut watermark.captured_turn_ids)
+    }
+
+    /// Replace the progress of the given subagent files; others are kept.
+    pub fn mark_subagent_files(
+        &self,
+        files: &BTreeMap<String, SubagentFileProgress>,
+    ) -> Result<()> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        let mut watermark = read_watermark_path(&self.watermark_path);
+        let known = watermark.subagent_files.get_or_insert_with(BTreeMap::new);
+        for (agent_id, progress) in files {
+            known.insert(agent_id.clone(), progress.clone());
+        }
+        write_watermark_path(&self.watermark_path, &watermark)
     }
 
     fn mark(
@@ -297,6 +320,8 @@ struct Watermark {
     uploaded_turn_ids: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     captured_turn_ids: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    subagent_files: Option<BTreeMap<String, SubagentFileProgress>>,
 }
 
 // ─── Paths ───────────────────────────────────────────────────────────────────
@@ -523,6 +548,34 @@ mod tests {
             guard.progress().unwrap().captured_turn_ids,
             HashSet::from(["b".to_string(), "d".to_string()])
         );
+    }
+
+    #[test]
+    fn subagent_file_progress_round_trips_and_survives_turn_marks() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = test_lock(dir.path());
+        // A watermark written before subagent capture still reads.
+        std::fs::write(
+            dir.path().join("session.json"),
+            r#"{"exported_turn_ids":[],"uploaded_turn_ids":[],"captured_turn_ids":["a"]}"#,
+        )
+        .unwrap();
+        assert!(guard.progress().unwrap().subagent_files.is_empty());
+
+        let file = SubagentFileProgress {
+            size: 42,
+            call_ids: vec!["provider:x".into()],
+            spawn_tool_use_ids: Vec::new(),
+            complete: true,
+        };
+        guard
+            .mark_subagent_files(&BTreeMap::from([("a1".to_string(), file.clone())]))
+            .unwrap();
+        guard.mark_captured(&["b".to_string()]).unwrap();
+
+        let progress = guard.progress().unwrap();
+        assert_eq!(progress.subagent_files.get("a1"), Some(&file));
+        assert!(progress.captured_turn_ids.contains("b"));
     }
 
     #[test]

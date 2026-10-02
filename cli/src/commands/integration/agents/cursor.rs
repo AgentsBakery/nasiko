@@ -163,6 +163,7 @@ pub fn snapshot(raw: &str) -> Result<SessionSnapshot> {
         turns,
         adapter_version: None,
         scoped_turns: Vec::new(),
+        subagent_transcript: None,
     })
 }
 

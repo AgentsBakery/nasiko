@@ -7,17 +7,19 @@ use nasiko_types::{
     CodingAgentLlmCall, CodingAgentSession, CodingAgentSource, CodingAgentToolCall,
     CodingAgentTurn, coding_agent_event_id, coding_agent_session_id,
 };
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use super::agents::Agent;
+use super::agents::claude;
+use super::agents::claude_subagents::ScannedFile;
 use super::capabilities;
-use super::model::{SnapshotOptions, Turn};
+use super::model::{ScopedTurn, SnapshotOptions, Turn};
 use super::queue::{self, QueueDestination, QueueRecord};
-use super::state::{self, IntegrationState, SessionLock};
+use super::state::{self, IntegrationState, SessionLock, SessionProgress};
 
 const REPORT_BUDGET: Duration = Duration::from_secs(9);
 
@@ -68,7 +70,7 @@ fn run_in(
     }
     let options =
         SnapshotOptions::from_capabilities(&capabilities::load_cached_at(dir, &destination));
-    let snapshot = agent.snapshot(raw, deadline, options)?;
+    let mut snapshot = agent.snapshot(raw, deadline, options)?;
     let lock = state::lock_session_in(
         dir,
         spec.id,
@@ -81,7 +83,10 @@ fn run_in(
             "session {} — no completed turns; deferred",
             snapshot.session_id
         ));
-        return Ok(());
+        // A subagent run can finish while the main turn is still open.
+        if snapshot.subagent_transcript.is_none() {
+            return Ok(());
+        }
     }
     let progress = lock.progress()?;
     if progress.migrated_legacy_counts {
@@ -119,18 +124,182 @@ fn run_in(
         queue_then_mark(dir, &record, &lock)?;
         queued += 1;
     }
+
+    let mut scanned_files = BTreeMap::new();
+    if let Some(transcript) = &snapshot.subagent_transcript {
+        match claude::subagent_scan(
+            transcript,
+            &snapshot.turns,
+            deadline,
+            &progress.subagent_files,
+        ) {
+            Ok(scan) => {
+                snapshot.scoped_turns = scan.scoped_turns;
+                scanned_files = scan.files;
+            }
+            Err(error) => log(&format!(
+                "session {} — subagent scan skipped: {error:#}",
+                snapshot.session_id
+            )),
+        }
+    }
+    let source = EventSource {
+        agent_id: spec.id,
+        agent_name: &agent_state.agent_name,
+        session_id: &snapshot.session_id,
+        capture_content: agent_state.capture_content,
+        adapter_version: snapshot.adapter_version,
+    };
+    let scoped = queue_scoped_turns(
+        ScopedQueue {
+            dir,
+            lock: &lock,
+            destination: &destination,
+            progress: &progress,
+            deadline,
+        },
+        &source,
+        &snapshot.scoped_turns,
+        &scanned_files,
+    )?;
     drop(lock);
 
-    if queued > 0 {
+    if queued + scoped.queued > 0 {
         spawn()?;
     }
-    if !pending.is_empty() {
+    if !pending.is_empty() || scoped.queued + scoped.rejected > 0 {
         log(&format!(
-            "session {} — queued {queued} completed turn(s) for {}; quarantined {rejected}",
-            snapshot.session_id, destination.cluster_name
+            "session {} — queued {queued} completed turn(s) and {} subagent run(s) for {}; quarantined {}",
+            snapshot.session_id,
+            scoped.queued,
+            destination.cluster_name,
+            rejected + scoped.rejected
         ));
     }
     Ok(())
+}
+
+/// Identity and policy shared by every event of one report.
+struct EventSource<'a> {
+    agent_id: &'a str,
+    agent_name: &'a str,
+    session_id: &'a str,
+    capture_content: bool,
+    adapter_version: Option<u32>,
+}
+
+/// Where scoped events are committed during one report.
+struct ScopedQueue<'a> {
+    dir: &'a Path,
+    lock: &'a SessionLock,
+    destination: &'a QueueDestination,
+    progress: &'a SessionProgress,
+    deadline: Instant,
+}
+
+#[derive(Debug, Default)]
+struct ScopedOutcome {
+    queued: usize,
+    rejected: usize,
+}
+
+/// Queue finished subagent runs not yet captured, exactly like main turns
+/// (invalid events are quarantined and marked), then record per-file progress.
+/// Runs left when the deadline passes stay unmarked for the next Stop.
+fn queue_scoped_turns(
+    target: ScopedQueue<'_>,
+    source: &EventSource<'_>,
+    scoped_turns: &[ScopedTurn],
+    scanned_files: &BTreeMap<String, ScannedFile>,
+) -> Result<ScopedOutcome> {
+    let mut outcome = ScopedOutcome::default();
+    let mut captured_now: HashSet<&str> = HashSet::new();
+    for scoped in scoped_turns {
+        if target
+            .progress
+            .captured_turn_ids
+            .contains(&scoped.turn.uuid)
+        {
+            continue;
+        }
+        if Instant::now() >= target.deadline {
+            break;
+        }
+        let record = QueueRecord::new(
+            target.destination.clone(),
+            scoped_canonical_event(source, scoped),
+        );
+        if let Err(error) = record.event.validate() {
+            queue::reject_invalid_at(target.dir, &record, &error)?;
+            target
+                .lock
+                .mark_captured(std::slice::from_ref(&record.event.turn.id))?;
+            outcome.rejected += 1;
+            log(&format!(
+                "session {} turn {} — quarantined invalid subagent event: {error}",
+                source.session_id, record.event.turn.id
+            ));
+        } else {
+            queue_then_mark(target.dir, &record, target.lock)?;
+            outcome.queued += 1;
+        }
+        captured_now.insert(&scoped.turn.uuid);
+    }
+
+    let captured =
+        |id: &str| captured_now.contains(id) || target.progress.captured_turn_ids.contains(id);
+    let mut updates = BTreeMap::new();
+    for (agent_id, scanned) in scanned_files {
+        let previous = target.progress.subagent_files.get(agent_id);
+        let mut file = previous.cloned().unwrap_or_default();
+        file.size = scanned.size;
+        file.spawn_tool_use_ids = scanned.spawn_tool_use_ids.clone();
+        let mut all_captured = true;
+        for scoped in scoped_turns
+            .iter()
+            .filter(|s| &s.scope.agent_id == agent_id)
+        {
+            if !captured(&scoped.turn.uuid) {
+                all_captured = false;
+                continue;
+            }
+            for call in &scoped.turn.calls {
+                if !file.call_ids.contains(&call.uuid) {
+                    file.call_ids.push(call.uuid.clone());
+                }
+            }
+        }
+        file.complete = scanned.all_terminal && all_captured;
+        if previous != Some(&file) {
+            updates.insert(agent_id.clone(), file);
+        }
+    }
+    target.lock.mark_subagent_files(&updates)?;
+    Ok(outcome)
+}
+
+/// A subagent run as its own event in the parent session. Intent (description,
+/// name) is content: sent only with content capture, like prompt and tools.
+/// Scoped events never carry the session title.
+fn scoped_canonical_event(source: &EventSource<'_>, scoped: &ScopedTurn) -> CodingAgentEventV1 {
+    let mut event = canonical_event(
+        source.agent_id,
+        source.agent_name,
+        source.session_id,
+        None,
+        &scoped.turn,
+        source.capture_content,
+        source.adapter_version,
+    );
+    // A resume record can be blank; present scoped content must be nonblank.
+    event.turn.prompt = event.turn.prompt.filter(|prompt| !prompt.trim().is_empty());
+    let mut scope = scoped.scope.clone();
+    if !source.capture_content {
+        scope.description = None;
+        scope.name = None;
+    }
+    event.turn.agent_scope = Some(scope);
+    event
 }
 
 fn destination_from_state(agent_state: &super::state::AgentState) -> Result<QueueDestination> {
