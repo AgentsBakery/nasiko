@@ -58,6 +58,20 @@ async fn setup(server: &common::TestServer, sources: &[&str]) -> Uuid {
     user_id
 }
 
+/// A second real user (the auth layer rejects tokens for unknown users).
+async fn seed_user(server: &common::TestServer, username: &str, is_superuser: bool) -> String {
+    sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO users (username, email, is_superuser) VALUES ($1, $2, $3) RETURNING id",
+    )
+    .bind(username)
+    .bind(format!("{username}@test.local"))
+    .bind(is_superuser)
+    .fetch_one(&server.db)
+    .await
+    .unwrap()
+    .to_string()
+}
+
 /// One receipt; `offset_secs` orders turns in time.
 fn event(
     source: &str,
@@ -627,7 +641,7 @@ async fn other_user_gets_identical_404() {
     let main = main_turn("s", "turn-1", MARKED, 0);
     ingest(&server, owner, &[&main]).await;
     let session_id = server_session(&server, &main).await;
-    let other = Uuid::new_v4().to_string();
+    let other = seed_user(&server, "other-user", false).await;
 
     let (status, not_yours) = fetch_raw(common::as_member(
         server.client.get(agents_url(&server, &session_id)),
@@ -662,10 +676,11 @@ async fn superuser_sees_any_session() {
     let main = main_turn("s", "turn-1", MARKED, 0);
     ingest(&server, owner, &[&main]).await;
     let session_id = server_session(&server, &main).await;
+    let root = seed_user(&server, "root", true).await;
 
     let (status, body) = fetch_raw(common::as_superuser(
         server.client.get(agents_url(&server, &session_id)),
-        &Uuid::new_v4().to_string(),
+        &root,
         "root",
     ))
     .await;

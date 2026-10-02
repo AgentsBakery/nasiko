@@ -53,6 +53,7 @@ use crate::state::AppState;
         crate::catalog::routes::create,
         crate::catalog::routes::register_coding_agent,
         crate::coding_agent_telemetry::capabilities,
+        crate::coding_sessions::get_session_agents,
         crate::catalog::routes::list,
         crate::catalog::routes::get_one,
         crate::catalog::routes::update,
@@ -288,6 +289,7 @@ use crate::state::AppState;
         (name = "usage", description = "Per-user token usage and cost reporting"),
         (name = "observability", description = "Sessions, traces, spans, agent logs, and FinOps reporting"),
         (name = "coding-agent-telemetry", description = "Coding-agent telemetry ingest and feature negotiation"),
+        (name = "coding-sessions", description = "Per-agent usage breakdown and capture status of coding sessions"),
         (name = "llm-router", description = "LLM routing presets, provider/model catalog, and tier→model registry"),
     ),
 )]

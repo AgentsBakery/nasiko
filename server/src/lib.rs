@@ -20,6 +20,7 @@ pub mod chat;
 pub mod coding_agent_otlp;
 pub mod coding_agent_telemetry;
 pub mod coding_agent_usage;
+pub mod coding_sessions;
 pub mod context_selection;
 pub mod flows;
 pub mod github;
@@ -306,6 +307,7 @@ where
         .merge(chat::router())
         .merge(context_selection::router())
         .merge(coding_agent_telemetry::router())
+        .merge(coding_sessions::router())
         .merge(maf::router())
         .merge(secrets::router())
         .merge(llm_configs::router())
