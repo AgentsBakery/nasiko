@@ -47,8 +47,13 @@ const fetchSpanDetail = async (traceId, spanId) => {
   return fetchApi(`/observability/span/${encodeURIComponent(traceId)}/${encodeURIComponent(spanId)}`);
 };
 
+// Per-agent breakdown of a coding session (Postgres rollup, no Tempo).
+const fetchCodingSessionAgents = async (sessionId) => {
+  return fetchApi(`/coding-sessions/${encodeURIComponent(sessionId)}/agents`);
+};
+
 registerAll({
   fetchTraceDetail, fetchObservabilitySessions, fetchObservabilitySession,
   fetchResourceStats, fetchAgentResourceStats, fetchObservabilityTrace,
-  fetchSpanDetail,
+  fetchSpanDetail, fetchCodingSessionAgents,
 }, { replace: true });

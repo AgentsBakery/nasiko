@@ -23,6 +23,7 @@ const SESSION_DETAIL_PATH = '/observability-session';
  * @property {string} p99
  * @property {string} cost
  * @property {string} href
+ * @property {boolean} usageCorrected Legacy Codex figures were corrected.
  */
 
 /**
@@ -55,6 +56,7 @@ export function toSessionRow(summary) {
     p99: fmtDuration(s.trace_latency_ms_p99),
     cost: fmtCurrency(s.cost_summary?.total?.cost),
     href: sessionDetailHref(sessionId),
+    usageCorrected: s.usage_corrected === true,
   };
 }
 
