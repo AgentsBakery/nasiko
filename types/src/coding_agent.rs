@@ -13,6 +13,26 @@ pub const CODING_AGENT_SESSION_TITLE_MAX_BYTES: usize = 512;
 pub const CODING_AGENT_CONTENT_MAX_BYTES: usize = 1_048_576;
 pub const CODING_AGENT_LLM_CALLS_MAX: usize = 1_000;
 pub const CODING_AGENT_TOOL_CALLS_MAX: usize = 2_000;
+/// Maximum UTF-8 byte length of a content-captured agent-scope description (task intent).
+pub const CODING_AGENT_SCOPE_DESCRIPTION_MAX_BYTES: usize = 1024;
+/// Capability slug: the server accepts `turn.agent_scope` (scoped subagent/teammate turns).
+pub const CODING_AGENT_FEATURE_AGENT_SCOPE: &str = "agent_scope";
+/// Capability slug: the server stores `source.adapter_version` receipt markers.
+pub const CODING_AGENT_FEATURE_ADAPTER_VERSION: &str = "adapter_version";
+/// Every additive v1 feature this build understands, advertised by the capabilities endpoint.
+/// A CLI sends a new shape only when the destination server lists its slug here.
+pub const CODING_AGENT_TELEMETRY_FEATURES: &[&str] = &[
+    CODING_AGENT_FEATURE_AGENT_SCOPE,
+    CODING_AGENT_FEATURE_ADAPTER_VERSION,
+];
+/// Codex receipts carrying this marker report `input_tokens` exclusive of cached input.
+/// Receipts without a marker use the legacy inclusive numbers and are corrected at read time.
+pub const CODEX_ADAPTER_VERSION_EXCLUSIVE_INPUT: u32 = 1;
+/// Claude receipts carrying this marker come from a CLI that captures subagent transcripts.
+pub const CLAUDE_ADAPTER_VERSION_SUBAGENTS: u32 = 1;
+/// Reserved: set only by a CLI that also captures in-process teammates. Implies subagent
+/// capture, because markers are ordered (`2 >= CLAUDE_ADAPTER_VERSION_SUBAGENTS`).
+pub const CLAUDE_ADAPTER_VERSION_TEAMMATES: u32 = 2;
 const EVENT_NAMESPACE: Uuid = Uuid::from_u128(0xe8c6fef8_5fe4_4dc2_9b48_47466355ced7);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,6 +86,57 @@ pub struct CodingAgentEventBatchResponse {
 pub struct CodingAgentSource {
     pub agent_id: String,
     pub agent_name: String,
+    /// Adapter semantics marker. Absent means the legacy adapter semantics of the
+    /// original v1.0 CLI; it is not part of the event identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_version: Option<u32>,
+}
+
+/// Feature negotiation payload served by `GET /api/telemetry/coding-agent/capabilities`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodingAgentCapabilities {
+    /// The event version the server validates; stays `CODING_AGENT_EVENT_VERSION`.
+    pub event_version: u32,
+    /// Additive feature slugs the server accepts (see `CODING_AGENT_TELEMETRY_FEATURES`).
+    pub features: Vec<String>,
+}
+
+/// Which agent inside a coding-agent session produced a turn.
+/// A turn without a scope is main-agent work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodingAgentScope {
+    pub kind: CodingAgentScopeKind,
+    /// Native agent id (Claude `agentId`), bounded by `CODING_AGENT_ID_MAX_BYTES`.
+    pub agent_id: String,
+    /// Subagent or teammate type (`Explore`, `general-purpose`, a custom name). Metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
+    /// Native tool-call id of the Agent/Task call that spawned this agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_tool_call_id: Option<String>,
+    /// For nested agents, the spawning agent's id. Absent means spawned by the main agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_depth: Option<u32>,
+    /// Task description or teammate assignment. Content: rejected under metadata-only capture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Teammate display name. Treated as content: rejected under metadata-only capture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// Kind of a scoped agent. There is deliberately no `Main` variant: an absent scope
+/// already means the main agent, and two encodings of one fact would diverge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodingAgentScopeKind {
+    Subagent,
+    Teammate,
+    /// Any kind a newer CLI sends that this build does not know.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +185,10 @@ pub struct CodingAgentCallAccounting {
     pub inference_geo: Option<String>,
     #[serde(default)]
     pub conflicting_observations: bool,
+    /// `Some(false)` when the transcript only held the start-of-stream usage snapshot,
+    /// so `output_tokens` is a lower bound. Absent means unknown (legacy semantics).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens_final: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,6 +259,10 @@ pub struct CodingAgentTurn {
     pub llm_calls: Vec<CodingAgentLlmCall>,
     #[serde(default)]
     pub tool_calls: Vec<CodingAgentToolCall>,
+    /// Which agent did this work. Absent means the main agent, which is how every
+    /// event from an older CLI is read; nothing is reclassified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_scope: Option<CodingAgentScope>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -278,7 +357,9 @@ impl CodingAgentEventV1 {
         {
             return Err("metadata-only events must not contain prompt or response content".into());
         }
-        if self.capture_policy == CapturePolicy::Content
+        if let Some(scope) = &self.turn.agent_scope {
+            self.validate_agent_scope(scope)?;
+        } else if self.capture_policy == CapturePolicy::Content
             && (self
                 .turn
                 .prompt
@@ -440,6 +521,80 @@ impl CodingAgentEventV1 {
             .map_err(|error| format!("coding-agent event could not be serialized: {error}"))?;
         if json_contains_nul(&payload) {
             return Err("coding-agent event must not contain NUL characters".into());
+        }
+        Ok(())
+    }
+}
+
+impl CodingAgentEventV1 {
+    /// Rules that apply only to scoped (subagent/teammate) turns. A scoped turn may lack
+    /// a prompt or response (a subagent's run segment need not end in a final answer),
+    /// but present content must be nonempty. Intent text is content and is rejected
+    /// under metadata-only capture, like `session.title`.
+    fn validate_agent_scope(&self, scope: &CodingAgentScope) -> Result<(), String> {
+        if scope.agent_id.trim().is_empty() {
+            return Err("turn.agent_scope.agent_id must not be empty".into());
+        }
+        for (name, value, max) in [
+            (
+                "turn.agent_scope.agent_id",
+                Some(scope.agent_id.as_str()),
+                CODING_AGENT_ID_MAX_BYTES,
+            ),
+            (
+                "turn.agent_scope.agent_type",
+                scope.agent_type.as_deref(),
+                CODING_AGENT_NAME_MAX_BYTES,
+            ),
+            (
+                "turn.agent_scope.parent_tool_call_id",
+                scope.parent_tool_call_id.as_deref(),
+                CODING_AGENT_ID_MAX_BYTES,
+            ),
+            (
+                "turn.agent_scope.parent_agent_id",
+                scope.parent_agent_id.as_deref(),
+                CODING_AGENT_ID_MAX_BYTES,
+            ),
+            (
+                "turn.agent_scope.name",
+                scope.name.as_deref(),
+                CODING_AGENT_NAME_MAX_BYTES,
+            ),
+            (
+                "turn.agent_scope.description",
+                scope.description.as_deref(),
+                CODING_AGENT_SCOPE_DESCRIPTION_MAX_BYTES,
+            ),
+        ] {
+            if value.is_some_and(|value| value.len() > max) {
+                return Err(format!("{name} must be at most {max} bytes"));
+            }
+        }
+        for (name, value) in [
+            ("turn.agent_scope.description", scope.description.as_deref()),
+            ("turn.agent_scope.name", scope.name.as_deref()),
+        ] {
+            let Some(value) = value else { continue };
+            if value.trim().is_empty() {
+                return Err(format!("{name} must not be empty"));
+            }
+            if value.contains('\0') {
+                return Err("coding-agent event must not contain NUL characters".into());
+            }
+        }
+        if self.capture_policy == CapturePolicy::MetadataOnly
+            && (scope.description.is_some() || scope.name.is_some())
+        {
+            return Err("metadata-only events must not contain agent scope content".into());
+        }
+        if self.capture_policy == CapturePolicy::Content
+            && [self.turn.prompt.as_deref(), self.turn.response.as_deref()]
+                .into_iter()
+                .flatten()
+                .any(|content| content.trim().is_empty())
+        {
+            return Err("scoped content events must not contain blank prompt or response".into());
         }
         Ok(())
     }
