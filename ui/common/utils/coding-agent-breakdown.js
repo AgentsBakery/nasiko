@@ -155,7 +155,9 @@ export function toBreakdownRows(data) {
       key: String(row.key ?? ''),
       label: rowLabel(row),
       kindBadge: KNOWN_KINDS.has(row.kind) ? row.kind : 'unknown',
-      runsSuffix: runs > 1 ? `×${runs} runs` : '',
+      // A main-agent "run" is one user turn; for subagents and teammates it is
+      // a resumed run of the same agent.
+      runsSuffix: runs > 1 ? `×${runs} ${row.kind === 'main' ? 'turns' : 'runs'}` : '',
       intent: intentCell(row),
       startedAt: row.started_at ?? null,
       endedAt: row.ended_at ?? null,

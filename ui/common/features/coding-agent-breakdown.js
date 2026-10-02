@@ -133,16 +133,16 @@ class CodingAgentBreakdown extends HTMLElement {
             <tr>
               <th scope="col">Agent</th>
               <th scope="col">Intent</th>
-              <th scope="col">Started</th>
-              <th scope="col">Ended</th>
+              <th scope="col" class="num">Cost</th>
+              <th scope="col" class="num">Share</th>
               <th scope="col" class="num">LLM calls</th>
               <th scope="col" class="num">Tool calls</th>
               <th scope="col" class="num">Input</th>
               <th scope="col" class="num">Cache read</th>
               <th scope="col" class="num">Cache write</th>
               <th scope="col" class="num">Output</th>
-              <th scope="col" class="num">Cost</th>
-              <th scope="col" class="num">Share</th>
+              <th scope="col">Started</th>
+              <th scope="col">Ended</th>
             </tr>
           </thead>
           <tbody>
@@ -150,16 +150,17 @@ class CodingAgentBreakdown extends HTMLElement {
           </tbody>
           <tfoot>
             <tr>
-              <th scope="row" colspan="4">Total${totals.usage_corrected === true ? ` ${correctedBadge()}` : ''}</th>
+              <th scope="row" colspan="2">Total${totals.usage_corrected === true ? ` ${correctedBadge()}` : ''}</th>
+              <td class="num">${escHtml(lowerBound(
+                totals.cost_usd == null ? EM_DASH : fmtCurrency(totals.cost_usd), totalsIncomplete))}</td>
+              <td class="num">${escHtml(this.#totalShare(data))}</td>
               <td class="num">${escHtml(fmtNumber(totals.llm_calls))}</td>
               <td class="num">${escHtml(fmtNumber(totals.tool_calls))}</td>
               <td class="num">${escHtml(fmtNumber(t.input))}</td>
               <td class="num">${escHtml(fmtNumber(t.cache_read))}</td>
               <td class="num">${escHtml(fmtNumber(t.cache_creation))}</td>
               <td class="num">${escHtml(lowerBound(fmtNumber(t.output), totalsIncomplete))}</td>
-              <td class="num">${escHtml(lowerBound(
-                totals.cost_usd == null ? EM_DASH : fmtCurrency(totals.cost_usd), totalsIncomplete))}</td>
-              <td class="num">${escHtml(this.#totalShare(data))}</td>
+              <td colspan="2"></td>
             </tr>
           </tfoot>
         </table>
@@ -189,16 +190,16 @@ class CodingAgentBreakdown extends HTMLElement {
           ${r.corrected ? correctedBadge() : ''}
         </th>
         <td>${intent}</td>
-        <td class="cab-when">${escHtml(fmtWhen(r.startedAt))}</td>
-        <td class="cab-when">${escHtml(fmtWhen(r.endedAt))}</td>
+        <td class="num">${escHtml(r.cost)}</td>
+        <td class="num">${escHtml(r.share)}</td>
         <td class="num">${escHtml(fmtNumber(r.llmCalls))}</td>
         <td class="num">${escHtml(fmtNumber(r.toolCalls))}</td>
         <td class="num">${escHtml(fmtNumber(r.tokens.input))}</td>
         <td class="num">${escHtml(fmtNumber(r.tokens.cache_read))}</td>
         <td class="num">${escHtml(fmtNumber(r.tokens.cache_creation))}</td>
         <td class="num">${escHtml(r.output)}</td>
-        <td class="num">${escHtml(r.cost)}</td>
-        <td class="num">${escHtml(r.share)}</td>
+        <td class="cab-when">${escHtml(fmtWhen(r.startedAt))}</td>
+        <td class="cab-when">${escHtml(fmtWhen(r.endedAt))}</td>
       </tr>`;
   }
 }

@@ -44,7 +44,7 @@
 
 .cab-table th,
 .cab-table td {
-  padding: var(--s-8) var(--s-12);
+  padding: var(--s-8);
   text-align: left;
   white-space: nowrap;
   border-bottom: var(--bw-1) solid var(--border-primary);
@@ -80,7 +80,7 @@
 
 .cab-intent {
   display: inline-block;
-  max-width: 24rem;
+  max-width: 16rem;
   overflow: hidden;
   text-overflow: ellipsis;
   vertical-align: bottom;

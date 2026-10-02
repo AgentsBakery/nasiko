@@ -74,6 +74,12 @@ test('toBreakdownRows adds a runs suffix only for more than one run', () => {
   assert.equal(rows[1].runsSuffix, '×3 runs');
 });
 
+test('toBreakdownRows calls main-agent runs turns', () => {
+  const rows = M.toBreakdownRows(payload([{ ...mainRow(), runs: 2 }, subRow()]));
+  assert.equal(rows[0].runsSuffix, '×2 turns');
+  assert.equal(rows[1].runsSuffix, '×3 runs');
+});
+
 test('toBreakdownRows keeps tokens as numbers and formats share', () => {
   const rows = M.toBreakdownRows(payload([mainRow(), subRow(), teammateRow()]));
   assert.deepEqual(rows[0].tokens, { input: 1000, output: 200, cache_read: 5000, cache_creation: 300 });
