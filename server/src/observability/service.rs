@@ -366,6 +366,7 @@ fn build_span_tree(
             provider: first_str_attr(&s.attributes, &["gen_ai.system", "gen_ai.provider.name"]),
             span_annotation_summaries: vec![],
             children: vec![],
+            usage_corrected: false,
         }
     };
 
@@ -634,6 +635,11 @@ pub struct TraceDetail {
     pub root_spans: RootSpansWrapper,
     pub spans: Vec<SpanNode>,
     pub span_lookup: HashMap<String, SpanNode>,
+    /// True when the figures exclude the legacy Codex cached-input double
+    /// count (`observability::codex_correction`). Omitted when false, so
+    /// uncorrected responses are unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub usage_corrected: bool,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -697,6 +703,11 @@ pub struct SpanNode {
     // recurses infinitely and overflows the stack at startup.
     #[schema(no_recursion)]
     pub children: Vec<SpanNode>,
+    /// True when the figures exclude the legacy Codex cached-input double
+    /// count (`observability::codex_correction`). Omitted when false, so
+    /// uncorrected responses are unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub usage_corrected: bool,
 }
 
 // span/{trace_id}/{span_id}
@@ -763,6 +774,11 @@ pub struct SpanDetail {
     #[schema(value_type = Vec<Object>)]
     pub document_evaluations: Vec<Value>,
     pub project: SpanProjectRef,
+    /// True when the figures exclude the legacy Codex cached-input double
+    /// count (`observability::codex_correction`). Omitted when false, so
+    /// uncorrected responses are unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub usage_corrected: bool,
 }
 
 // agent/{agent_id}/stats
@@ -1880,7 +1896,11 @@ impl ObservabilityService {
         };
 
         let num_spans = trace.spans.len();
-        let (root_nodes, span_lookup) = build_span_tree(&trace.spans);
+        let (mut root_nodes, mut span_lookup) = build_span_tree(&trace.spans);
+        let delta = self.trace_correction(trace_id).await;
+        for node in root_nodes.iter_mut().chain(span_lookup.values_mut()) {
+            codex_correction::correct_span_node(node, delta.as_ref());
+        }
 
         let root_edges: Vec<RootSpanEdge> = root_nodes
             .iter()
@@ -1894,36 +1914,50 @@ impl ObservabilityService {
             })
             .collect();
 
-        Ok(TraceDetailResponse {
-            data: TraceDetailData {
-                trace: TraceDetail {
-                    id: trace_id.to_string(),
-                    project_session_id: Some(project_session_id),
-                    num_spans,
-                    latency_ms: trace_latency_ms,
-                    cost_summary: NestedCostSummary {
-                        total: CostOnly {
-                            cost: cost.total_usd,
-                        },
-                        prompt: CostOnly {
-                            cost: cost.prompt_usd,
-                        },
-                        completion: CostOnly {
-                            cost: cost.completion_usd,
-                        },
-                        cache_read: CostOnly {
-                            cost: cost.cache_read_usd,
-                        },
-                        cache_creation: CostOnly {
-                            cost: cost.cache_creation_usd,
-                        },
-                    },
-                    root_spans: RootSpansWrapper { edges: root_edges },
-                    spans: root_nodes,
-                    span_lookup,
+        let mut detail = TraceDetail {
+            id: trace_id.to_string(),
+            project_session_id: Some(project_session_id),
+            num_spans,
+            latency_ms: trace_latency_ms,
+            cost_summary: NestedCostSummary {
+                total: CostOnly {
+                    cost: cost.total_usd,
+                },
+                prompt: CostOnly {
+                    cost: cost.prompt_usd,
+                },
+                completion: CostOnly {
+                    cost: cost.completion_usd,
+                },
+                cache_read: CostOnly {
+                    cost: cost.cache_read_usd,
+                },
+                cache_creation: CostOnly {
+                    cost: cost.cache_creation_usd,
                 },
             },
+            root_spans: RootSpansWrapper { edges: root_edges },
+            spans: root_nodes,
+            span_lookup,
+            usage_corrected: false,
+        };
+        codex_correction::correct_trace_detail(&mut detail, delta.as_ref());
+
+        Ok(TraceDetailResponse {
+            data: TraceDetailData { trace: detail },
         })
+    }
+
+    /// The legacy Codex correction for one already-authorized trace. An overlay
+    /// failure degrades to `None` (uncorrected, unflagged) and is logged.
+    async fn trace_correction(&self, trace_id: &str) -> Option<codex_correction::Delta> {
+        match codex_correction::load_for_traces(&self.db, &[trace_id.to_owned()]).await {
+            Ok(overlay) => overlay.trace(trace_id).copied(),
+            Err(e) => {
+                tracing::warn!(%trace_id, error = %e, "trace_correction: codex correction overlay unavailable");
+                None
+            }
+        }
     }
 
     // ── 4. span/{trace_id}/{span_id} ─────────────────────────────────────────
@@ -2028,85 +2062,84 @@ impl ObservabilityService {
         };
 
         let status = status_code_str(span.status_code).to_string();
+        let delta = self.trace_correction(trace_id).await;
 
-        Ok(SpanDetailResponse {
-            data: SpanDetailData {
-                span: SpanDetail {
-                    id: encode_span_id(&span.span_id),
-                    span_id: span.span_id.clone(),
-                    trace: SpanTraceRef {
-                        id: encode_trace_id(trace_id),
-                        trace_id: trace_id.to_string(),
-                    },
-                    name: span_display_name(span),
-                    span_kind,
-                    code: status.clone(),
-                    status_code: status,
-                    status_message: span.status_message.clone(),
-                    start_time: Some(fmt_ts(span.started_at)),
-                    end_time: span.ended_at.map(fmt_ts),
-                    parent_id: span.parent_span_id.clone(),
-                    latency_ms: span.duration_ms.map(|d| d as f64),
-                    token_count_total: usage.total_tokens,
-                    provider: first_str_attr(
-                        &span.attributes,
-                        &["gen_ai.system", "gen_ai.provider.name"],
-                    ),
-                    model: model
-                        .or_else(|| first_str_attr(&span.attributes, &["gen_ai.response.model"])),
-                    cache_read_tokens: usage.cache_read_tokens,
-                    cache_creation_tokens: usage.cache_creation_tokens,
-                    cost_summary: FullCostSummary {
-                        total: CostWithTokens {
-                            cost: details.cost.total_usd,
-                            tokens: usage.total_tokens,
-                        },
-                        prompt: CostWithTokens {
-                            cost: details.cost.prompt_usd,
-                            tokens: usage.input_tokens,
-                        },
-                        completion: CostWithTokens {
-                            cost: details.cost.completion_usd,
-                            tokens: usage.output_tokens,
-                        },
-                        cache_read: CostWithTokens {
-                            cost: details.cost.cache_read_usd,
-                            tokens: usage.cache_read_tokens,
-                        },
-                        cache_creation: CostWithTokens {
-                            cost: details.cost.cache_creation_usd,
-                            tokens: usage.cache_creation_tokens,
-                        },
-                    },
-                    input: ContentField {
-                        value: input_value,
-                        mime_type: input_mime,
-                        parsed_value: input_parsed,
-                    },
-                    output: ContentField {
-                        value: output_value,
-                        mime_type: output_mime,
-                        parsed_value: output_parsed,
-                    },
-                    attributes: unflatten_attrs(&span.attributes),
-                    // Tempo already parses these (oss/observability/src/tempo.rs);
-                    // they used to be dropped on the floor here, which left the
-                    // "Metadata & events" tab with nothing to render.
-                    events: span
-                        .events
-                        .iter()
-                        .map(|e| serde_json::to_value(e).unwrap_or(Value::Null))
-                        .collect(),
-                    span_annotations: vec![],
-                    span_annotation_summaries: vec![],
-                    document_retrieval_metrics: vec![],
-                    document_evaluations: vec![],
-                    project: SpanProjectRef {
-                        id: String::new(),
-                        annotation_configs: serde_json::json!({ "edges": [], "configs": [] }),
-                    },
+        let mut span_detail = SpanDetail {
+            id: encode_span_id(&span.span_id),
+            span_id: span.span_id.clone(),
+            trace: SpanTraceRef {
+                id: encode_trace_id(trace_id),
+                trace_id: trace_id.to_string(),
+            },
+            name: span_display_name(span),
+            span_kind,
+            code: status.clone(),
+            status_code: status,
+            status_message: span.status_message.clone(),
+            start_time: Some(fmt_ts(span.started_at)),
+            end_time: span.ended_at.map(fmt_ts),
+            parent_id: span.parent_span_id.clone(),
+            latency_ms: span.duration_ms.map(|d| d as f64),
+            token_count_total: usage.total_tokens,
+            provider: first_str_attr(&span.attributes, &["gen_ai.system", "gen_ai.provider.name"]),
+            model: model.or_else(|| first_str_attr(&span.attributes, &["gen_ai.response.model"])),
+            cache_read_tokens: usage.cache_read_tokens,
+            cache_creation_tokens: usage.cache_creation_tokens,
+            cost_summary: FullCostSummary {
+                total: CostWithTokens {
+                    cost: details.cost.total_usd,
+                    tokens: usage.total_tokens,
+                },
+                prompt: CostWithTokens {
+                    cost: details.cost.prompt_usd,
+                    tokens: usage.input_tokens,
+                },
+                completion: CostWithTokens {
+                    cost: details.cost.completion_usd,
+                    tokens: usage.output_tokens,
+                },
+                cache_read: CostWithTokens {
+                    cost: details.cost.cache_read_usd,
+                    tokens: usage.cache_read_tokens,
+                },
+                cache_creation: CostWithTokens {
+                    cost: details.cost.cache_creation_usd,
+                    tokens: usage.cache_creation_tokens,
                 },
             },
+            input: ContentField {
+                value: input_value,
+                mime_type: input_mime,
+                parsed_value: input_parsed,
+            },
+            output: ContentField {
+                value: output_value,
+                mime_type: output_mime,
+                parsed_value: output_parsed,
+            },
+            attributes: unflatten_attrs(&span.attributes),
+            // Tempo already parses these (oss/observability/src/tempo.rs);
+            // they used to be dropped on the floor here, which left the
+            // "Metadata & events" tab with nothing to render.
+            events: span
+                .events
+                .iter()
+                .map(|e| serde_json::to_value(e).unwrap_or(Value::Null))
+                .collect(),
+            span_annotations: vec![],
+            span_annotation_summaries: vec![],
+            document_retrieval_metrics: vec![],
+            document_evaluations: vec![],
+            project: SpanProjectRef {
+                id: String::new(),
+                annotation_configs: serde_json::json!({ "edges": [], "configs": [] }),
+            },
+            usage_corrected: false,
+        };
+        codex_correction::correct_span_detail(&mut span_detail, delta.as_ref());
+
+        Ok(SpanDetailResponse {
+            data: SpanDetailData { span: span_detail },
         })
     }
 

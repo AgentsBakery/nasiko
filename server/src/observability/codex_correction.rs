@@ -16,7 +16,9 @@ use std::collections::{HashMap, HashSet};
 use serde_json::Value;
 use sqlx::PgPool;
 
-use super::service::{RootSpanEntry, SessionDetail, SessionSummary};
+use super::service::{
+    RootSpanEntry, SessionDetail, SessionSummary, SpanDetail, SpanNode, TraceDetail,
+};
 
 /// The legacy double count on one trace or one session: what to subtract from
 /// the reported figures. `cache_read_tokens` is the cached input of the
@@ -271,6 +273,57 @@ pub fn correct_root_entry(entry: &mut RootSpanEntry, delta: Option<&Delta>) {
     entry.usage_corrected = true;
 }
 
+// ─── trace and span views ───────────────────────────────────────────────────
+//
+// A legacy Codex trace has one LLM span per call, and the correction removed
+// exactly that call's cached input, so a span's token delta is its own cached
+// input (capped by the trace delta) and its cost delta is the trace cost delta
+// split by cached-input share. The turn root span carries the trace rollup and
+// therefore takes the whole delta. The split is exact in practice.
+
+/// Correct one span-tree node and its children. Spans without cached input
+/// (tool calls) and every span of an uncorrected trace stay untouched.
+/// `SpanNode` carries tokens only, so only tokens change here.
+pub fn correct_span_node(node: &mut SpanNode, delta: Option<&Delta>) {
+    let Some(delta) = delta else { return };
+    let input_delta = node.cache_read_tokens.min(delta.input_tokens);
+    if input_delta > 0 {
+        node.input_tokens = apply_tokens(node.input_tokens, input_delta);
+        node.token_count_total = apply_tokens(node.token_count_total, input_delta);
+        node.usage_corrected = true;
+    }
+    for child in &mut node.children {
+        correct_span_node(child, Some(delta));
+    }
+}
+
+/// Subtract a trace's delta from its cost totals and flag the trace.
+pub fn correct_trace_detail(detail: &mut TraceDetail, delta: Option<&Delta>) {
+    let Some(delta) = delta else { return };
+    let costs = &mut detail.cost_summary;
+    costs.total.cost = apply_cost(costs.total.cost, delta.cost_usd);
+    costs.prompt.cost = apply_cost(costs.prompt.cost, delta.cost_usd);
+    detail.usage_corrected = true;
+}
+
+/// Correct one span's usage: its cached input comes off the prompt tokens and
+/// its cached-input share of the trace cost delta comes off the cost.
+pub fn correct_span_detail(span: &mut SpanDetail, delta: Option<&Delta>) {
+    let Some(delta) = delta else { return };
+    let input_delta = span.cache_read_tokens.min(delta.input_tokens);
+    let cost_delta = delta.cost_usd * span_share(span.cache_read_tokens, delta.cache_read_tokens);
+    if input_delta == 0 && cost_delta == 0.0 {
+        return;
+    }
+    span.token_count_total = apply_tokens(span.token_count_total, input_delta);
+    let costs = &mut span.cost_summary;
+    costs.total.tokens = apply_tokens(costs.total.tokens, input_delta);
+    costs.total.cost = apply_cost(costs.total.cost, cost_delta);
+    costs.prompt.tokens = apply_tokens(costs.prompt.tokens, input_delta);
+    costs.prompt.cost = apply_cost(costs.prompt.cost, cost_delta);
+    span.usage_corrected = true;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,6 +539,184 @@ mod tests {
         let cost = r.trace.cost_summary["total"]["cost"].as_f64().unwrap();
         assert!((cost - 0.006).abs() < 1e-12);
         assert!(r.usage_corrected);
+    }
+
+    // ── trace and span appliers ─────────────────────────────────────────────
+
+    use crate::observability::service::{
+        CostOnly, NestedCostSummary, RootSpansWrapper, SpanProjectRef, SpanTraceRef,
+    };
+
+    fn node(span_id: &str, input: u64, cache_read: u64, children: Vec<SpanNode>) -> SpanNode {
+        SpanNode {
+            id: span_id.into(),
+            span_id: span_id.into(),
+            name: span_id.into(),
+            span_kind: "internal".into(),
+            status_code: "OK".into(),
+            start_time: None,
+            end_time: None,
+            parent_id: None,
+            latency_ms: None,
+            token_count_total: input + 50 + cache_read,
+            input_tokens: input,
+            output_tokens: 50,
+            cache_read_tokens: cache_read,
+            cache_creation_tokens: 0,
+            model: None,
+            operation: None,
+            provider: None,
+            span_annotation_summaries: vec![],
+            children,
+            usage_corrected: false,
+        }
+    }
+
+    /// A legacy turn with two LLM calls (600 + 200 cached) and one tool span.
+    fn legacy_tree() -> SpanNode {
+        node(
+            "root",
+            1000,
+            800,
+            vec![
+                node("llm-1", 700, 600, vec![]),
+                node("llm-2", 300, 200, vec![]),
+                node("tool", 0, 0, vec![]),
+            ],
+        )
+    }
+
+    #[test]
+    fn correct_span_node_removes_each_spans_cached_input() {
+        let mut tree = legacy_tree();
+        correct_span_node(&mut tree, Some(&delta()));
+        assert_eq!(tree.input_tokens, 200);
+        assert_eq!(tree.token_count_total, 1050);
+        assert!(tree.usage_corrected);
+        assert_eq!(tree.children[0].input_tokens, 100);
+        assert_eq!(tree.children[1].input_tokens, 100);
+        assert!(tree.children[0].usage_corrected);
+        let tool = &tree.children[2];
+        assert_eq!(json(tool), json(&node("tool", 0, 0, vec![])));
+    }
+
+    #[test]
+    fn spans_of_uncorrected_traces_are_byte_identical() {
+        let mut tree = legacy_tree();
+        let before = json(&tree);
+        correct_span_node(&mut tree, None);
+        assert_eq!(json(&tree), before);
+        assert!(!before.contains("usage_corrected"));
+    }
+
+    fn costs(total: f64, prompt: f64) -> NestedCostSummary {
+        NestedCostSummary {
+            total: CostOnly { cost: total },
+            prompt: CostOnly { cost: prompt },
+            completion: CostOnly { cost: 0.002 },
+            cache_read: CostOnly { cost: 0.002 },
+            cache_creation: CostOnly { cost: 0.0 },
+        }
+    }
+
+    fn trace_detail() -> TraceDetail {
+        TraceDetail {
+            id: "t".into(),
+            project_session_id: Some("s".into()),
+            num_spans: 4,
+            latency_ms: None,
+            cost_summary: costs(0.01, 0.006),
+            root_spans: RootSpansWrapper { edges: vec![] },
+            spans: vec![],
+            span_lookup: HashMap::new(),
+            usage_corrected: false,
+        }
+    }
+
+    #[test]
+    fn correct_trace_detail_drops_totals_by_the_trace_delta() {
+        let mut t = trace_detail();
+        let before = json(&t);
+        correct_trace_detail(&mut t, None);
+        assert_eq!(json(&t), before);
+
+        correct_trace_detail(&mut t, Some(&delta()));
+        assert!((t.cost_summary.total.cost - 0.006).abs() < 1e-12);
+        assert!((t.cost_summary.prompt.cost - 0.002).abs() < 1e-12);
+        assert!((t.cost_summary.cache_read.cost - 0.002).abs() < 1e-12);
+        assert!(t.usage_corrected);
+    }
+
+    fn span_detail(input: u64, cache_read: u64, prompt_cost: f64) -> SpanDetail {
+        SpanDetail {
+            id: "s".into(),
+            span_id: "s".into(),
+            trace: SpanTraceRef {
+                id: "t".into(),
+                trace_id: "t".into(),
+            },
+            name: "chat".into(),
+            span_kind: "client".into(),
+            status_code: "OK".into(),
+            code: "OK".into(),
+            status_message: String::new(),
+            start_time: None,
+            end_time: None,
+            parent_id: None,
+            latency_ms: None,
+            token_count_total: input + 50 + cache_read,
+            provider: None,
+            model: None,
+            cache_read_tokens: cache_read,
+            cache_creation_tokens: 0,
+            cost_summary: FullCostSummary {
+                total: cost(prompt_cost + 0.001, input + 50 + cache_read),
+                prompt: cost(prompt_cost, input),
+                completion: cost(0.001, 50),
+                cache_read: cost(0.0, cache_read),
+                cache_creation: cost(0.0, 0),
+            },
+            input: content(),
+            output: content(),
+            attributes: Value::Null,
+            events: vec![],
+            span_annotations: vec![],
+            span_annotation_summaries: vec![],
+            document_retrieval_metrics: vec![],
+            document_evaluations: vec![],
+            project: SpanProjectRef {
+                id: String::new(),
+                annotation_configs: Value::Null,
+            },
+            usage_corrected: false,
+        }
+    }
+
+    #[test]
+    fn correct_span_detail_splits_cost_by_cached_share() {
+        // 600 of the trace's 800 cached tokens: 3/4 of the 0.004 cost delta.
+        let mut span = span_detail(700, 600, 0.005);
+        correct_span_detail(&mut span, Some(&delta()));
+        assert_eq!(span.cost_summary.prompt.tokens, 100);
+        assert_eq!(span.token_count_total, 750);
+        assert_eq!(span.cost_summary.total.tokens, 750);
+        assert!((span.cost_summary.prompt.cost - 0.002).abs() < 1e-12);
+        assert!((span.cost_summary.total.cost - 0.003).abs() < 1e-12);
+        assert_eq!(span.cost_summary.cache_read.tokens, 600);
+        assert!(span.usage_corrected);
+    }
+
+    #[test]
+    fn correct_span_detail_leaves_uncached_and_uncorrected_spans() {
+        for (mut span, delta) in [
+            (span_detail(0, 0, 0.0), Some(delta())),
+            (span_detail(700, 600, 0.005), None),
+        ] {
+            let before = json(&span);
+            correct_span_detail(&mut span, delta.as_ref());
+            assert_eq!(json(&span), before);
+            assert!(!before.contains("usage_corrected"));
+        }
     }
 
     #[test]
