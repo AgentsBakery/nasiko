@@ -17,8 +17,10 @@ const fetchTraceDetail = async (traceId) => {
 
 // Paged: every row costs the server one trace-store lookup, so asking for the
 // whole history is what made Execution history slow to appear.
-const fetchObservabilitySessions = async (limit = 25, offset = 0) => {
+const fetchObservabilitySessions = async (limit = 25, offset = 0, { codingOnly = false } = {}) => {
   const params = new URLSearchParams({ limit, offset });
+  // Filtered on the server: client-side filtering would break offset paging.
+  if (codingOnly) params.set('coding_only', 'true');
   return fetchApi(`/observability/session/list?${params}`);
 };
 
