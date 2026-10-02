@@ -1,10 +1,205 @@
 //! Per-destination cache of the telemetry features a Nasiko server supports.
+//!
+//! Why a cache rather than a probe at report time:
+//!
+//! - The Stop/report hook runs inside a 9 s budget and must work offline, so it
+//!   never touches the network. It reads this file; `install` primes it and
+//!   every `sync` refreshes it.
+//! - A new event shape is sent only when the destination advertised it. A
+//!   missing, stale, or unreadable cache therefore means "no features" and the
+//!   CLI keeps sending the v1.0 shapes every server accepts.
+//! - The Codex exclusive-input fix and its `source.adapter_version` marker are
+//!   gated on the same feature, so a receipt without the marker always carries
+//!   inclusive Codex input and the server's legacy correction stays valid.
+//!
+//! Entries are keyed by normalized cluster URL plus principal so capabilities
+//! learned for one cluster or account never shape events bound for another.
+
+use anyhow::Result;
+use chrono::{DateTime, Utc};
+use nasiko_types::{CODING_AGENT_EVENT_VERSION, CodingAgentCapabilities};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use super::queue::QueueDestination;
+use super::state::{self, InstallationBinding};
+use crate::config::Config;
+
+const CACHE_FILE: &str = "capabilities.json";
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Features one destination server accepts. Unknown slugs are kept but inert:
+/// only slugs this build checks via [`Capabilities::supports`] change behaviour.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Capabilities {
+    features: BTreeSet<String>,
+}
+
+impl Capabilities {
+    /// The v1.0 baseline: an old server, or nothing known yet.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))] // read by the report hook (next commit)
+    pub fn supports(&self, feature: &str) -> bool {
+        self.features.contains(feature)
+    }
+
+    /// A server validating a different event version gets the v1.0 baseline:
+    /// its feature slugs may not mean what this build thinks they mean.
+    pub fn from_server(capabilities: &CodingAgentCapabilities) -> Self {
+        if capabilities.event_version != CODING_AGENT_EVENT_VERSION {
+            return Self::none();
+        }
+        Self {
+            features: capabilities.features.iter().cloned().collect(),
+        }
+    }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct CacheFile {
+    #[serde(default)]
+    destinations: BTreeMap<String, CacheEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CacheEntry {
+    features: Vec<String>,
+    fetched_at: DateTime<Utc>,
+}
+
+/// Result of one probe, so callers can tell the user why nothing was cached.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Probe {
+    /// The cache now reflects the server (an empty set for an old server).
+    Updated,
+    /// The probe failed; the previous cache entry, if any, is unchanged.
+    Unavailable(String),
+}
+
+#[allow(dead_code)] // read by the report hook (next commit)
+pub fn load_cached(destination: &QueueDestination) -> Capabilities {
+    load_cached_at(&state::integrations_dir(), destination)
+}
+
+/// Whether any probe result (even "no features") is cached for the destination.
+#[allow(dead_code)] // read by the report hook (next commit)
+pub fn has_cache(destination: &QueueDestination) -> bool {
+    has_cache_at(&state::integrations_dir(), destination)
+}
+
+/// Prime the cache right after install so the first Stop already uses the
+/// server's features. Never fails install: an unreachable server leaves no
+/// cache and the first report spawns a background sync that fills it.
+pub fn prime_after_install(binding: &InstallationBinding) -> Result<()> {
+    let config = crate::config::load()?;
+    prime_after_install_at(&state::integrations_dir(), &config, binding)
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // read by the report hook (next commit)
+pub(super) fn load_cached_at(dir: &Path, destination: &QueueDestination) -> Capabilities {
+    read_cache(dir)
+        .destinations
+        .get(&cache_key(destination))
+        .map(|entry| Capabilities {
+            features: entry.features.iter().cloned().collect(),
+        })
+        .unwrap_or_default()
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // read by the report hook (next commit)
+pub(super) fn has_cache_at(dir: &Path, destination: &QueueDestination) -> bool {
+    read_cache(dir)
+        .destinations
+        .contains_key(&cache_key(destination))
+}
+
+/// Probe the server and update the cache in `dir`. Probe failures keep the
+/// previous entry and return `Ok(Probe::Unavailable)`; only a cache write
+/// failure errs.
+pub(super) fn refresh_at(
+    dir: &Path,
+    client: &crate::api::Client,
+    destination: &QueueDestination,
+) -> Result<Probe> {
+    let capabilities = match client.get_coding_agent_capabilities() {
+        Ok(Some(capabilities)) => Capabilities::from_server(&capabilities),
+        Ok(None) => Capabilities::none(),
+        Err(error) => return Ok(Probe::Unavailable(format!("{error:#}"))),
+    };
+    let mut cache = read_cache(dir);
+    cache.destinations.insert(
+        cache_key(destination),
+        CacheEntry {
+            features: capabilities.features.into_iter().collect(),
+            fetched_at: Utc::now(),
+        },
+    );
+    state::atomic_write(
+        &cache_path(dir),
+        serde_json::to_string_pretty(&cache)?.as_bytes(),
+    )?;
+    Ok(Probe::Updated)
+}
+
+fn prime_after_install_at(
+    dir: &Path,
+    config: &Config,
+    binding: &InstallationBinding,
+) -> Result<()> {
+    let destination = QueueDestination {
+        cluster_name: binding.cluster_name.clone(),
+        cluster_url: binding.cluster_url.clone(),
+        principal_id: binding.principal_id,
+    };
+    let cluster = match super::sync::validate_destination(config, &destination) {
+        Ok(cluster) => cluster,
+        Err(error) => {
+            eprintln!(
+                "note: telemetry capabilities not checked yet ({error}); the next sync will check them."
+            );
+            return Ok(());
+        }
+    };
+    let client = crate::api::Client::from_cluster_entry_with_timeout(cluster, Some(PROBE_TIMEOUT));
+    if let Probe::Unavailable(error) = refresh_at(dir, &client, &destination)? {
+        eprintln!(
+            "note: telemetry capabilities not checked yet ({error}); the next sync will check them."
+        );
+    }
+    Ok(())
+}
+
+fn cache_key(destination: &QueueDestination) -> String {
+    format!(
+        "{}|{}",
+        super::sync::normalize_url(&destination.cluster_url),
+        destination.principal_id
+    )
+}
+
+fn cache_path(dir: &Path) -> PathBuf {
+    dir.join(CACHE_FILE)
+}
+
+/// Unreadable or corrupt caches read as empty: the safe answer is "no features".
+fn read_cache(dir: &Path) -> CacheFile {
+    std::fs::read_to_string(cache_path(dir))
+        .ok()
+        .and_then(|content| serde_json::from_str(&content).ok())
+        .unwrap_or_default()
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{ClusterEntry, Config};
     use std::collections::HashMap;
+    use uuid::Uuid;
 
     fn destination(url: &str, principal_id: Uuid) -> QueueDestination {
         QueueDestination {

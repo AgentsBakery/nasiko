@@ -5,10 +5,11 @@ use nasiko_types::{
     CODING_AGENT_BATCH_MAX_EVENTS, CodingAgentEventBatchRequest, CodingAgentEventStatus,
 };
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
 
+use super::capabilities;
 use super::queue::{self, DeliveryState, QueueDestination, QueueRecord};
 use crate::config::{ClusterEntry, Config};
 
@@ -34,7 +35,7 @@ pub fn run() -> Result<()> {
             continue;
         }
         quiescent_scans = 0;
-        let retry = sync_records(&config, records)?;
+        let retry = sync_records(&config, records, &super::state::integrations_dir())?;
         if !retry || started.elapsed() >= Duration::from_secs(300) {
             break;
         }
@@ -43,7 +44,13 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-fn sync_records(config: &Config, records: Vec<(PathBuf, QueueRecord)>) -> Result<bool> {
+/// `capabilities_dir` holds the capability cache refreshed once per destination
+/// group; tests pass a temp dir so they never touch the real `~/.nasiko`.
+fn sync_records(
+    config: &Config,
+    records: Vec<(PathBuf, QueueRecord)>,
+    capabilities_dir: &Path,
+) -> Result<bool> {
     let mut retry = false;
     let mut attempted_delivery = false;
     let mut groups: BTreeMap<(String, String, Uuid), Vec<(PathBuf, QueueRecord)>> = BTreeMap::new();
@@ -87,6 +94,18 @@ fn sync_records(config: &Config, records: Vec<(PathBuf, QueueRecord)>) -> Result
             cluster,
             Some(Duration::from_secs(10)),
         );
+        // A failed probe keeps the previous cache; it must never hold up delivery.
+        match capabilities::refresh_at(capabilities_dir, &client, &destination) {
+            Ok(capabilities::Probe::Updated) => {}
+            Ok(capabilities::Probe::Unavailable(error)) => eprintln!(
+                "warning: telemetry capabilities probe for '{}' failed: {error}",
+                destination.cluster_name
+            ),
+            Err(error) => eprintln!(
+                "warning: could not cache telemetry capabilities for '{}': {error:#}",
+                destination.cluster_name
+            ),
+        }
         attempted_delivery = true;
         for batch in records.chunks(CODING_AGENT_BATCH_MAX_EVENTS) {
             retry |= deliver_batch(&client, batch)?;
@@ -189,7 +208,7 @@ fn reject(path: &std::path::Path, record: &QueueRecord, error: String) -> Result
     queue::quarantine(path, &record).map(|_| ())
 }
 
-fn validate_destination<'a>(
+pub(super) fn validate_destination<'a>(
     config: &'a Config,
     destination: &QueueDestination,
 ) -> Result<&'a ClusterEntry, String> {
@@ -234,7 +253,7 @@ fn validate_destination<'a>(
     Ok(cluster)
 }
 
-fn normalize_url(url: &str) -> &str {
+pub(super) fn normalize_url(url: &str) -> &str {
     url.trim_end_matches('/')
 }
 

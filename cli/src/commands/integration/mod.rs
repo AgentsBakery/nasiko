@@ -81,6 +81,7 @@ pub fn install(options: InstallOptions<'_>) -> Result<()> {
         registration.agent_name
     );
 
+    let binding = registration.binding.clone();
     let artifacts = agent.install()?;
     let (script, registration) = persist_installed_artifacts(
         artifacts,
@@ -97,6 +98,12 @@ pub fn install(options: InstallOptions<'_>) -> Result<()> {
 
     println!("Installed hook              {}", tildify(&script));
     println!("Installed integration       {}", tildify(&registration));
+    // Without a primed cache the first Stop would send legacy, unmarked turns.
+    if let Err(error) = capabilities::prime_after_install(&binding) {
+        eprintln!(
+            "note: telemetry capabilities not checked yet ({error:#}); the next sync will check them."
+        );
+    }
     println!(
         "\nStart a new {} session, then: nasiko observe sessions",
         spec.display_name

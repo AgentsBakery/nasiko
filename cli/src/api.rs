@@ -1,5 +1,7 @@
 use anyhow::{Context, Result, bail};
-use nasiko_types::{CodingAgentEventBatchRequest, CodingAgentEventBatchResponse};
+use nasiko_types::{
+    CodingAgentCapabilities, CodingAgentEventBatchRequest, CodingAgentEventBatchResponse,
+};
 use nasiko_utils::display::opt_dash;
 use serde::{Deserialize, Serialize};
 use tabled::Tabled;
@@ -338,6 +340,28 @@ impl Client {
             .with_context(|| format!("invalid coding-agent batch response from {url}"))?;
         unwrap_data(envelope)
             .with_context(|| format!("invalid coding-agent batch response from {url}"))
+    }
+
+    /// Probe which additive telemetry features the server accepts. No spinner:
+    /// this runs from background sync and install, never interactively.
+    /// `Ok(None)` on 404/405 means the server predates the endpoint.
+    pub(crate) fn get_coding_agent_capabilities(&self) -> Result<Option<CodingAgentCapabilities>> {
+        let url = self.api_url("/telemetry/coding-agent/capabilities");
+        let mut resp = self
+            .auth_get(&url)
+            .call()
+            .context("cannot reach control plane")?;
+        if matches!(resp.status().as_u16(), 404 | 405) {
+            return Ok(None);
+        }
+        check_status(&mut resp, &url)?;
+        let envelope: serde_json::Value = resp
+            .body_mut()
+            .read_json()
+            .with_context(|| format!("invalid coding-agent capabilities response from {url}"))?;
+        unwrap_data(envelope)
+            .map(Some)
+            .with_context(|| format!("invalid coding-agent capabilities response from {url}"))
     }
 
     pub fn delete(&self, path: &str) -> Result<()> {

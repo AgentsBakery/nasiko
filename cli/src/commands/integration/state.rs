@@ -341,7 +341,7 @@ fn create_parent_dir(path: &std::path::Path) -> Result<()> {
         .with_context(|| format!("failed to create {}", parent.display()))
 }
 
-fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
+pub(super) fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
     create_parent_dir(path)?;
