@@ -157,6 +157,41 @@ at 500 agents and 64 MiB per transcript.
 - A subagent that is still running when the user quits is not captured until a later
   Stop in the same session sees its terminal signal. Without one, it is never captured
   (SessionEnd handling is Phase 5).
-- Agent teams: teammates are not captured yet. Metas without `toolUseId`, or with
-  `taskKind: "in_process_teammate"`, are skipped. A named subagent that has a `toolUseId`
-  is still captured as a subagent. Split-pane teammates appear as separate sessions.
+- Agent teams are not captured. See the next section.
+
+## Agent teams (Claude Code, experimental)
+
+Agent teams are not captured. The on-disk layout of team sessions could not be checked
+against a real team run, and guessing at it could misreport teammates as subagents and
+distort per-agent totals. Until a verified layout exists, Nasiko reports team activity as
+missing, not as zero.
+
+**What is captured.**
+
+- The lead session's own calls, tokens and cost, as for any Claude Code session.
+- Ordinary subagents the lead spawns, as described above. A subagent meta with a `name`
+  and a `toolUseId` is still a subagent.
+
+**What is explicitly not captured.**
+
+- In-process teammates. A subagent meta with `taskKind: "in_process_teammate"`, or
+  without a `toolUseId`, is skipped: no turns, calls, tokens or cost are reported from it,
+  and it is never counted as a subagent. The session's team status is `not_captured` with
+  reason `agent_teams_unsupported`.
+- Assigned task text. Teammate names, task subjects and task descriptions are not sent.
+  The CLI does not read the team config (`~/.claude/teams/...`) or the shared task list
+  (`~/.claude/tasks/...`).
+- Split-pane teammates. Each one runs as its own top-level Claude Code session and is
+  reported as a separate Nasiko session. These sessions are not linked to the lead:
+  Claude Code records no reliable link, and the upstream request to record teammate
+  session ids was closed as not planned.
+- Team lifetime. Claude Code deletes the team config when the session ends, so it cannot
+  be read later to rebuild team membership.
+- The deprecated `team_name` hook field is not used.
+
+**What the session page shows.** Claude Code sessions reported by the Nasiko CLI always
+read "Agent teams: not captured (not supported yet)" (`capture.teams` is `not_captured`,
+reason `agent_teams_unsupported`), because the CLI never sends teammate rows. Other
+sources read "Agent teams: not applicable". The `no_activity` status ("no team activity")
+is reserved for a future CLI that can capture teammates and saw none; no current CLI
+produces it.

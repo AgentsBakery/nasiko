@@ -26,9 +26,13 @@
 //! with `accounting.output_tokens_final = Some(false)`. A call with a final
 //! observation leaves the flag absent, which already means final.
 //!
-//! Teammates are not captured here yet (Plan 08): a meta is teammate-shaped only
-//! when `toolUseId` is absent or `taskKind == "in_process_teammate"`. A `name`
-//! alone never excludes an ordinary subagent; it is kept as content.
+//! Agent-team teammates are not captured: their on-disk layout could not be
+//! verified against a real session, so reporting them would risk misclassifying
+//! them as subagents (see "Agent teams" in docs/CODING_AGENT_TELEMETRY.md). A meta
+//! is teammate-shaped when `toolUseId` is absent or `taskKind ==
+//! "in_process_teammate"`; such files are skipped and the session's team status
+//! stays "not captured". A `name` alone never excludes an ordinary subagent; it
+//! is kept as content.
 
 use chrono::{DateTime, Utc};
 use nasiko_types::{
@@ -1342,6 +1346,63 @@ mod tests {
         assert_eq!(named.name.as_deref(), Some("researcher"));
         let read: Vec<_> = scan.files.keys().map(String::as_str).collect();
         assert_eq!(read, ["named", "ok"]);
+    }
+
+    /// Pins the agent-teams "not captured" decision: teammate files are skipped
+    /// without error, contribute no turns, calls or watermark entries, and never
+    /// turn into subagents, even when the main transcript reports them finished.
+    #[test]
+    fn teammate_shaped_meta_is_never_reported() {
+        let fixture = Fixture::new();
+        let run = simple_run("s1", 10, "req");
+        let teammates = ["tm-kind", "tm-kind-linked", "tm-nolink", "tm-named"];
+        let main = main_with_spawn("Agent", "toolu_sub")
+            + &foreground_completed("toolu_sub", 30)
+            + &teammates
+                .iter()
+                .map(|id| notification_op(40, id, "completed"))
+                .collect::<String>();
+        // In-process teammate marker without a spawn link.
+        fixture.agent(
+            "tm-kind",
+            json!({"agentType": "general-purpose", "name": "name-1",
+                   "taskKind": TEAMMATE_TASK_KIND}),
+            &run.replace("req-", "k-"),
+        );
+        // The marker wins even when a toolUseId is present.
+        let mut linked = meta("toolu_team");
+        linked["taskKind"] = json!(TEAMMATE_TASK_KIND);
+        fixture.agent("tm-kind-linked", linked, &run.replace("req-", "kl-"));
+        // No toolUseId at all: no reliable linkage to a spawning call.
+        fixture.agent(
+            "tm-nolink",
+            json!({"agentType": "general-purpose", "description": "task"}),
+            &run.replace("req-", "nl-"),
+        );
+        // Named and unlinked.
+        fixture.agent(
+            "tm-named",
+            json!({"agentType": "general-purpose", "name": "name-2"}),
+            &run.replace("req-", "nm-"),
+        );
+        // A named ordinary subagent (name AND toolUseId) is still a subagent.
+        let mut named = meta("toolu_sub");
+        named["name"] = json!("researcher");
+        fixture.agent("sub", named, &run);
+
+        let scan = fixture.scan(&main);
+
+        let reported: Vec<_> = scan
+            .scoped_turns
+            .iter()
+            .map(|s| (s.scope.agent_id.as_str(), s.scope.kind))
+            .collect();
+        assert_eq!(reported, [("sub", CodingAgentScopeKind::Subagent)]);
+        let read: Vec<_> = scan.files.keys().map(String::as_str).collect();
+        assert_eq!(read, ["sub"]);
+        // Only the subagent's two calls are reported; no teammate call leaks in.
+        let reported_calls: usize = scan.scoped_turns.iter().map(|s| s.turn.calls.len()).sum();
+        assert_eq!(reported_calls, 2);
     }
 
     #[test]
